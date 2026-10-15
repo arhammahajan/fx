@@ -253,6 +253,49 @@ describe("poisoned repository", () => {
   );
 
   test(
+    "a git command in the default shell profile runs no repository program",
+    async () => {
+      const fixture = poisonedRepository();
+      // The default `user` profile is the one the shell tool uses unless the
+      // model asks for `clean`, and it is the profile a poisoned repository
+      // must not reach either: fx runs these commands through safe git, and
+      // refuses the shapes it cannot.
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("status-default", "shell", {
+          request: { action: "run", command: "git status --short", yield_time_ms: 30_000 },
+        }),
+        fakeGatewayToolCall("status-ignored", "shell", {
+          request: { action: "run", command: "git status --short --ignored", yield_time_ms: 30_000 },
+        }),
+        fakeGatewayToolCall("log-default", "shell", {
+          request: { action: "run", command: "git log --oneline -n 2", yield_time_ms: 30_000 },
+        }),
+        fakeGatewayToolCall("fetch", "shell", {
+          request: { action: "run", command: "git fetch origin", yield_time_ms: 30_000 },
+        }),
+        fakeGatewayFinalText("inspection complete"),
+      ], { classifierResponses: [] });
+      gateways.push(gateway);
+
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Inspect the repository."],
+        { cwd: fixture.workspace, env: fxEnv(fixture, gateway), timeoutMs: TIMEOUT },
+      );
+      expect(result.code, result.stderr).toBe(0);
+      expect(result.stderr).not.toMatch(/panic|error/i);
+      expect(sentinelRuns(fixture)).toEqual([]);
+      expect(gateway.classifierRequests).toHaveLength(0);
+
+      const bodies = gateway.requests.map((request: { body: string }) => request.body);
+      expect(toolResult(bodies[1]!, "status-default")).toContain("M alpha-tracked.txt");
+      expect(toolResult(bodies[2]!, "status-ignored")).toContain("M alpha-tracked.txt");
+      expect(toolResult(bodies[3]!, "log-default")).toContain("fixture commit");
+      expect(toolResult(bodies[4]!, "fetch")).toContain("fx did not run this git command");
+    },
+    TIMEOUT,
+  );
+
+  test(
     "fx pr snapshots the repository without running its programs",
     async () => {
       const fixture = poisonedRepository();

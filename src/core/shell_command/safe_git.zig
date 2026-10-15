@@ -47,7 +47,7 @@ pub const Prepared = union(enum) {
     refused: Refusal,
 };
 
-pub const Subcommand = enum { status, diff, log, branch, rev_parse };
+pub const Subcommand = enum { status, diff, log, show, branch, rev_parse };
 
 /// Decides whether git may run in the absolute directory `cwd`: reads the
 /// repository's config as data, checks the trusted git's version once per
@@ -92,6 +92,7 @@ pub fn appendCommand(
         .status => &.{ "status", "--ignore-submodules=all" },
         .diff => &.{ "diff", "--no-ext-diff", "--no-textconv", "--ignore-submodules=all" },
         .log => &.{ "log", "--no-ext-diff", "--no-textconv", "--ignore-submodules=all" },
+        .show => &.{ "show", "--no-ext-diff", "--no-textconv", "--ignore-submodules=all" },
         .branch => &.{"branch"},
         .rev_parse => &.{"rev-parse"},
     });
