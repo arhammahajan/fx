@@ -132,6 +132,9 @@ pub const TopLevelSpec = struct {
     /// Set on a deprecated command: the spelling that replaces it. Running the
     /// command prints a warning that names it.
     replaced_by: ?[]const u8 = null,
+    /// The name help shows after `fx `, when it isn't `token`: a command
+    /// reached only through an alias, such as `--resume`.
+    help_title: ?[]const u8 = null,
 };
 
 pub const TopLevelHelpEntry = struct {
@@ -395,7 +398,7 @@ pub fn renderTopLevelCommandHelp(alloc: Allocator, registry: TopLevelRegistry, k
     defer out.deinit();
 
     try out.writer.writeAll("fx ");
-    try out.writer.writeAll(spec.token);
+    try out.writer.writeAll(spec.help_title orelse spec.token);
     try out.writer.writeAll("\n\n");
     try out.writer.writeAll(spec.summary);
     try out.writer.writeAll("\n\nUsage:\n");

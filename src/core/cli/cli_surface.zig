@@ -1005,6 +1005,8 @@ fn topLevelHelpRequest(command_catalog: CommandCatalog, args: []const [:0]const 
     if (args.len < 2) return null;
     const kind = command_specs.topLevelKindFromToken(command_catalog, args[0]) orelse return null;
     if (kind == .help) return null;
+    // `fx resume` was removed, so its help request gets the removal hint.
+    if (kind == .@"resume" and std.mem.eql(u8, args[0], "resume")) return null;
     for (args[1..]) |arg| {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) return kind;
     }

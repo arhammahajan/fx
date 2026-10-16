@@ -349,6 +349,7 @@ pub const top_level_specs = [_]TopLevelSpec{
         .kind = .@"resume",
         .token = "resume",
         .aliases = &.{ "--resume", "--continue", "-c", "-r" },
+        .help_title = "--resume",
         .hidden_from_top_level_help = true,
         .usage = "session resume [last|<id>] | -r, --resume [last|<id>] | --continue | -c",
         .summary = "Continue a saved interactive session",
@@ -356,7 +357,6 @@ pub const top_level_specs = [_]TopLevelSpec{
             .{ .flag = "-r", .description = "Short for --resume; with no value, choose a session from a picker" },
             .{ .flag = "last", .description = "Resume the most recent session" },
             .{ .flag = "<id>", .description = "Resume a session by id" },
-            .{ .flag = "--id <id>", .description = "Resume a session by exact id" },
         },
     },
     .{
