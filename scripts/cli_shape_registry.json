@@ -436,15 +436,12 @@
     }
   },
   "hand_parsed_files": {
-    "src/builtins/mcp.zig": "The /mcp confirmation word --open, typed inside a session; fx's own surface, to move onto cli_flags.",
     "src/builtins/skills.zig": "Reads a pasted npx skills add command line, another program's flags.",
-    "src/core/mcp/command_provider.zig": "The fixed fx mcp add --transport http NAME URL grammar, listed in fx mcp add's options; to move onto cli_flags.",
     "src/core/mcp/docker_run.zig": "Reads docker's --cidfile in a server's command, another program's flags.",
     "src/core/mcp_host/verbs.zig": "fx mcp verbs on the opt-in MCP-v2 engine; to move onto cli_flags when that engine becomes the default.",
     "src/core/shell_command/command_classification.zig": "Classifies shell commands the agent runs, another program's flags.",
     "src/core/shell_command/command_effect.zig": "Reads the flags of git and other commands the agent runs.",
     "src/core/shell_command/command_lex.zig": "Reads the flags of timeout, env, and other wrapper commands the agent runs.",
-    "src/core/slack/install.zig": "fx slack install takes only --json; to move onto cli_flags.",
     "src/core/terminal/shell_resolver.zig": "Checks the -i fx passes to the user's shell.",
     "src/core/tooling/command_policy.zig": "Reads the flags of git and other commands the agent runs, for permission decisions."
   }

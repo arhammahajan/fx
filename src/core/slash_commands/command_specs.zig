@@ -2338,17 +2338,19 @@ test "top-level help lines fit representative terminal widths" {
     }
 }
 
+pub const slack_options = [_]OptionDoc{.{ .flag = "--json", .description = "Emit installation metadata without credentials" }};
+
 pub const slack_install_spec: TopLevelSpec = .{
     .kind = .slack,
     .token = "slack",
     .usage = "slack <install|status|refresh> [--json]",
     .summary = "Install and manage the workspace Slack bot locally",
     .subcommands = &.{
-        .{ .usage = "install", .description = "Authorize the bot through fx.sh and save its credentials" },
-        .{ .usage = "status", .description = "Show the local installation" },
-        .{ .usage = "refresh", .description = "Renew the bot's tokens without the browser" },
+        .{ .usage = "install", .description = "Authorize the bot through fx.sh and save its credentials", .options = &slack_options },
+        .{ .usage = "status", .description = "Show the local installation", .options = &slack_options },
+        .{ .usage = "refresh", .description = "Renew the bot's tokens without the browser", .options = &slack_options },
     },
-    .options = &.{.{ .flag = "--json", .description = "Emit installation metadata without credentials" }},
+    .options = &slack_options,
     .details = &.{
         "install opens Slack authorization through fx.sh and saves the bot credentials on this computer.",
         "status shows local installation metadata; refresh renews tokens without browser authorization.",

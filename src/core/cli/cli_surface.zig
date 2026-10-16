@@ -2963,11 +2963,7 @@ fn runTopLevelMcp(
                 return usage_failure;
             }
         }
-        var tokens: std.ArrayList([]const u8) = .empty;
-        defer tokens.deinit(alloc);
-        try tokens.ensureTotalCapacity(alloc, add_args.len);
-        for (add_args) |token| tokens.appendAssumeCapacity(token);
-        const intent = mcp_command_provider.parseAddIntent(tokens.items) catch |err| {
+        const intent = mcp_command_provider.parseAddIntent(add_args) catch |err| {
             if (err == error.McpAddUsage) {
                 try writeMcpAddUsage(deps);
             } else {
@@ -3569,6 +3565,7 @@ fn writeUsageOrJsonError(
 fn parsedOptions(kind: TopLevelKind) ?[]const command_specs.OptionDoc {
     return switch (kind) {
         .status, .doctor, .models, .permissions, .credits => &builtin_commands.json_only_options,
+        .slack => &command_specs.slack_options,
         .sessions => &builtin_commands.sessions_options,
         .login => &builtin_commands.login_options,
         .usage => &builtin_commands.usage_options,
@@ -4256,6 +4253,7 @@ fn commandFailureMessage(err: anyerror) ?[]const u8 {
         error.InvalidResumeArgs,
         error.InvalidUpgradeArgs,
         error.InvalidConfigArgs,
+        error.InvalidSlackArguments,
         => "invalid arguments",
         error.UnknownConfigSetting => "unknown setting",
         error.WorkspaceConfigWrite => workspace_write_message,

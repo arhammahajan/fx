@@ -152,7 +152,15 @@ pub const mcp_scope_options = [_]command_specs.OptionDoc{
     .{ .flag = "--project", .description = "Change the project's .mcp.json, with the MCP-v2 engine", .hidden = true },
 };
 
-pub const mcp_add_options = mcp_scope_options ++ [_]command_specs.OptionDoc{
+pub const mcp_add_options = mcp_scope_options ++ mcp_transport_options;
+
+/// `/mcp auth NAME --open` confirms opening the browser.
+pub const mcp_auth_options = [_]command_specs.OptionDoc{
+    .{ .flag = "--open", .description = "Open the browser to authorize the server" },
+};
+
+/// The flag `fx mcp add` and `/mcp add` read before a server's name.
+pub const mcp_transport_options = [_]command_specs.OptionDoc{
     .{ .flag = "--transport <http>", .description = "Add a remote server: --transport http NAME URL" },
 };
 
