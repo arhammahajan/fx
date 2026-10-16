@@ -38,6 +38,7 @@ CLI_ASK = "src/core/cli/cli_ask.zig"
 CONFIG_RUNTIME = "src/core/config/config_runtime.zig"
 SETTINGS_KEYS = "src/core/config/settings_keys.zig"
 ACP_SESSIONS = "src/acp/sessions.zig"
+ACP_SERVER = "src/acp/server.zig"
 LIBFX_TYPES = "sdk/types/libfx.d.cts"
 
 JOBS = {
@@ -61,7 +62,11 @@ FLAG_LITERAL = re.compile(r'"(--?[A-Za-z0-9][A-Za-z0-9_<>-]*)=?"')
 KEY_READ = re.compile(r'\.(?:get|getPtr|contains)\("([^"]+)"\)')
 # An ACP config option as sessions.zig writes it: {\"id\":\"model\",\"name\":...
 ACP_CONFIG_ID = re.compile(r'\\"id\\":\\"([a-z_]+)\\",\\"name\\"')
+# A config option ID that session/set_config_option accepts.
+ACP_SET_ID = re.compile(r'std\.mem\.eql\(u8, config_id, "([a-z_]+)"\)')
 LIBFX_MODEL_FIELD = re.compile(r"^\s+([a-z][A-Za-z]*)\??:")
+# The libfx types a non-model run option is a field of: each provider config.
+LIBFX_PROVIDER_TYPES = ("FxGatewayProvider", "FxSubscriptionProvider", "FxCustomProvider")
 TOP_LEVEL_KEY_READ = re.compile(r'\broot\.object\.(?:get|getPtr|contains)\("([^"]+)"\)')
 SETTING_ENTRY = re.compile(r'\.name = "([^"]+)", \.where = \.([a-z_]+)')
 TEST_START = re.compile(r"^\s*test\b")
@@ -404,8 +409,10 @@ class Checker:
             if job != "setting-override" and (job is None or job in JOBS):
                 self.report(None, "names", f'run_options "{name}" names {row.get("env")}, which the registry doesn\'t list as a setting-override')
             option = row.get("libfx")
-            if option and not option.startswith("model.") and not re.search(rf"\b{re.escape(option)}\??:", libfx):
-                self.report(None, "names", f'run_options "{name}" names libfx option {option}, which {LIBFX_TYPES} doesn\'t declare')
+            if option and not option.startswith("model."):
+                for type_name in LIBFX_PROVIDER_TYPES:
+                    if option not in (interface_fields(libfx, type_name) or set()):
+                        self.report(None, "names", f'run_options "{name}" names libfx option {option}, which {type_name} in {LIBFX_TYPES} doesn\'t declare')
 
         acp_ids: dict[str, Line] = {}
         for line in self.lines(ACP_SESSIONS):
@@ -417,6 +424,15 @@ class Checker:
                 self.report(line, "names", f'ACP config option "{config_id}" needs a run_options row in {REGISTRY} naming its flag, setting, and variable')
         for config_id in sorted(named_acp - acp_ids.keys()):
             self.report(None, "names", f'run_options names ACP config option "{config_id}", which {ACP_SESSIONS} doesn\'t offer')
+        set_ids: dict[str, Line] = {}
+        for line in self.lines(ACP_SERVER):
+            for config_id in ACP_SET_ID.findall(line.text):
+                set_ids.setdefault(config_id, line)
+        for config_id, line in sorted(set_ids.items()):
+            if config_id not in named_acp:
+                self.report(line, "names", f'ACP set_config_option takes "{config_id}", which needs a run_options row in {REGISTRY}')
+        for config_id in sorted(named_acp - set_ids.keys()):
+            self.report(None, "names", f'run_options names ACP config option "{config_id}", which set_config_option in {ACP_SERVER} doesn\'t take')
 
         fields = libfx_model_fields(libfx)
         if fields is None:
@@ -429,12 +445,18 @@ class Checker:
 
 def libfx_model_fields(text: str) -> set[str] | None:
     """The fields of `FxModelOptions`, or None when the interface is missing."""
-    start = text.find("export interface FxModelOptions {")
-    if start < 0:
+    return interface_fields(text, "FxModelOptions")
+
+
+def interface_fields(text: str, name: str) -> set[str] | None:
+    """The top-level fields of TypeScript interface `name`, or None when the
+    interface is missing. A field of another interface doesn't count."""
+    match = re.search(rf"^(?:export )?interface {re.escape(name)}\b[^{{\n]*\{{", text, re.M)
+    if match is None:
         return None
-    end = text.find("\n}", start)
-    body = text[start:end].splitlines()[1:]
-    return {match.group(1) for line in body if (match := LIBFX_MODEL_FIELD.match(line))}
+    end = text.find("\n}", match.end())
+    body = text[match.end():end].splitlines()
+    return {field.group(1) for line in body if (field := LIBFX_MODEL_FIELD.match(line))}
 
 
 def main(argv: list[str] | None = None) -> int:

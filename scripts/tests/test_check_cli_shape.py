@@ -94,6 +94,12 @@ ACP_SESSIONS = r"""fn writeModelOption(w: *std.Io.Writer) !void {
 }
 """
 
+ACP_SERVER = """\
+fn handleSetConfigOption() void {
+    if (std.mem.eql(u8, config_id, "model")) {}
+}
+"""
+
 LIBFX_TYPES = """\
 export interface FxModelOptions {
   /** Model ID. */
@@ -131,6 +137,7 @@ class CheckCliShapeTests(unittest.TestCase):
             check_cli_shape.CONFIG_RUNTIME: CONFIG_RUNTIME,
             check_cli_shape.SETTINGS_KEYS: SETTINGS_KEYS,
             check_cli_shape.ACP_SESSIONS: ACP_SESSIONS,
+            check_cli_shape.ACP_SERVER: ACP_SERVER,
             check_cli_shape.LIBFX_TYPES: LIBFX_TYPES,
             "src/env.zig": ENV,
         }
@@ -340,6 +347,16 @@ class CheckCliShapeTests(unittest.TestCase):
             '}\n\nfn writeFastOption(w: *std.Io.Writer) !void {\n    try w.writeAll("{\\\"id\\\":\\\"fast\\\",\\\"name\\\":\\\"Fast\\\"}");\n}\n',
         )
         self.assertOnly(self.run_check(), "names", 'ACP config option "fast" needs a run_options row')
+
+    def test_acp_set_config_option_id_needs_a_run_options_row(self) -> None:
+        self.edit(check_cli_shape.ACP_SERVER, '"model")) {}\n', '"model")) {}\n    if (std.mem.eql(u8, config_id, "fast")) {}\n')
+        self.assertOnly(self.run_check(), "names", 'ACP set_config_option takes "fast"')
+
+    def test_libfx_options_are_read_from_their_own_interface(self) -> None:
+        text = "export interface FxEvent {\n  provider?: string;\n}\ninterface FxGatewayProvider<T> {\n  apiKey?: string;\n}\n"
+        self.assertEqual({"apiKey"}, check_cli_shape.interface_fields(text, "FxGatewayProvider"))
+        self.assertEqual({"provider"}, check_cli_shape.interface_fields(text, "FxEvent"))
+        self.assertIsNone(check_cli_shape.interface_fields(text, "FxCustomProvider"))
 
     def test_libfx_model_option_needs_a_run_options_row(self) -> None:
         self.edit(check_cli_shape.LIBFX_TYPES, "  id: string;\n", "  id: string;\n  fast?: boolean;\n")
