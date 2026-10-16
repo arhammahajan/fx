@@ -1415,7 +1415,7 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
     var options = parseAskOptions(alloc, args, deps.stdin_source, &problem) catch |err| switch (err) {
         error.MissingPrompt => {
             if (hasJsonFlag(args)) {
-                const json = try renderErrorJsonResult(alloc, @errorName(err));
+                const json = try renderErrorJsonResult(alloc, @errorName(err), output_contracts.usage_exit_code);
                 defer alloc.free(json);
                 try deps.write_stdout(deps.stdout_ctx, json);
                 return output_contracts.usage_exit_code;
@@ -1426,7 +1426,7 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
         },
         error.NoSaveResumeConflict => {
             if (hasJsonFlag(args)) {
-                const json = try renderErrorJsonResult(alloc, "InvalidAskArgs");
+                const json = try renderErrorJsonResult(alloc, "InvalidAskArgs", output_contracts.usage_exit_code);
                 defer alloc.free(json);
                 try deps.write_stdout(deps.stdout_ctx, json);
                 return output_contracts.usage_exit_code;
@@ -1437,7 +1437,7 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
         },
         error.PromptResourceLimitExceeded => {
             if (hasJsonFlag(args)) {
-                const json = try renderErrorJsonResult(alloc, @errorName(err));
+                const json = try renderErrorJsonResult(alloc, @errorName(err), 1);
                 defer alloc.free(json);
                 try deps.write_stdout(deps.stdout_ctx, json);
                 return 1;
@@ -1447,7 +1447,7 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
         },
         error.PromptInputReadFailed => {
             if (hasJsonFlag(args)) {
-                const json = try renderErrorJsonResult(alloc, @errorName(err));
+                const json = try renderErrorJsonResult(alloc, @errorName(err), 1);
                 defer alloc.free(json);
                 try deps.write_stdout(deps.stdout_ctx, json);
                 return 1;
@@ -1457,7 +1457,7 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
         },
         error.InvalidAskArgs => {
             if (hasJsonFlag(args)) {
-                const json = try renderErrorJsonResult(alloc, @errorName(err));
+                const json = try renderErrorJsonResult(alloc, @errorName(err), output_contracts.usage_exit_code);
                 defer alloc.free(json);
                 try deps.write_stdout(deps.stdout_ctx, json);
                 return output_contracts.usage_exit_code;
@@ -1468,7 +1468,7 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
         },
         error.InvalidPromptText => {
             if (hasJsonFlag(args)) {
-                const json = try renderErrorJsonResult(alloc, @errorName(err));
+                const json = try renderErrorJsonResult(alloc, @errorName(err), 1);
                 defer alloc.free(json);
                 try deps.write_stdout(deps.stdout_ctx, json);
                 return 1;
@@ -1541,7 +1541,7 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
             try deps.write_stderr(deps.stderr_ctx, "\n");
             return 1;
         }
-        const json = try renderErrorJsonResult(alloc, @errorName(err));
+        const json = try renderErrorJsonResult(alloc, @errorName(err), 1);
         defer alloc.free(json);
         try deps.write_stdout(deps.stdout_ctx, json);
         return 1;
@@ -1587,7 +1587,7 @@ fn preflightAskImages(
             if (options.json_output) {
                 const detail = try alloc.print("{s}: {s}", .{ @errorName(err), image_path });
                 defer alloc.free(detail);
-                const json = try renderErrorJsonResult(alloc, detail);
+                const json = try renderErrorJsonResult(alloc, detail, 1);
                 defer alloc.free(json);
                 try deps.write_stdout(deps.stdout_ctx, json);
             } else {
@@ -4509,9 +4509,11 @@ fn renderFinalJsonResult(alloc: Allocator, result: PromptRunResult) ![]u8 {
     return try out.toOwnedSlice();
 }
 
-fn renderErrorJsonResult(alloc: Allocator, err_name: []const u8) ![]u8 {
+/// `exit_code` is the status the process exits with, so the JSON field and the
+/// real exit status agree: 2 for a usage error, 1 otherwise.
+fn renderErrorJsonResult(alloc: Allocator, err_name: []const u8, exit_code: u8) ![]u8 {
     return renderFinalJsonResult(alloc, .{
-        .exit_code = 1,
+        .exit_code = exit_code,
         .assistant_output = &.{},
         .error_code = err_name,
     });
@@ -6281,14 +6283,14 @@ test "stdin prompt reader propagates allocation failure" {
 
 test "stdin prompt errors keep exact structured names" {
     const alloc = std.testing.allocator;
-    const overflow = try renderErrorJsonResult(alloc, "PromptResourceLimitExceeded");
+    const overflow = try renderErrorJsonResult(alloc, "PromptResourceLimitExceeded", 1);
     defer alloc.free(overflow);
     try std.testing.expectEqualStrings(
         "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"PromptResourceLimitExceeded\"}\n",
         overflow,
     );
 
-    const read_failure = try renderErrorJsonResult(alloc, "PromptInputReadFailed");
+    const read_failure = try renderErrorJsonResult(alloc, "PromptInputReadFailed", 1);
     defer alloc.free(read_failure);
     try std.testing.expectEqualStrings(
         "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"PromptInputReadFailed\"}\n",
@@ -6305,7 +6307,7 @@ test "image preparation failure has stable text and JSON contracts" {
     try std.testing.expect(askErrorNotice(error.Cancelled) == null);
     try std.testing.expect(askErrorNotice(error.TimedOut) == null);
 
-    const json = try renderErrorJsonResult(alloc, @errorName(error.ImagePreparationFailed));
+    const json = try renderErrorJsonResult(alloc, @errorName(error.ImagePreparationFailed), 1);
     defer alloc.free(json);
     try std.testing.expectEqualStrings(
         "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"ImagePreparationFailed\"}\n",
@@ -6323,6 +6325,7 @@ test "unresolved image capability has actionable text and stable JSON code" {
     const json = try renderErrorJsonResult(
         alloc,
         @errorName(error.ModelImageCapabilityUnavailable),
+        1,
     );
     defer alloc.free(json);
     try std.testing.expectEqualStrings(

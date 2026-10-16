@@ -3483,6 +3483,12 @@ describe("cli: sessions", () => {
             code: 2,
             expectedError: "InvalidAskArgs",
           },
+          {
+            args: ["ask", "--json", "--bogus", "hello"],
+            kind: "ask",
+            code: 2,
+            expectedError: "InvalidAskArgs",
+          },
         ];
 
         for (const item of cases) {
@@ -3497,6 +3503,8 @@ describe("cli: sessions", () => {
           expect(parsed.kind ?? item.kind).toBe(item.kind);
           expect(typeof parsed.error).toBe("string");
           if (item.expectedError) expect(parsed.error).toBe(item.expectedError);
+          // The JSON field reports the status the process exits with.
+          if (item.kind === "ask") expect(parsed.exit_code).toBe(item.code);
         }
       } finally {
         rmSync(root, { recursive: true, force: true });
