@@ -2392,7 +2392,15 @@ fn runNonInteractiveWithDeps(
         },
         .config => |rest| {
             var unknown_key: ?settings_keys.UnknownPart = null;
-            const opts = cli_config.parseArgs(rest, &unknown_key) catch |err| {
+            var problem: ?[]const u8 = null;
+            const opts = cli_config.parseArgs(rest, &unknown_key, &problem) catch |err| {
+                if (problem) |text| {
+                    if (argsContainJson(rest)) {
+                        try writeJsonCommandFailure(alloc, deps, "config", err, text);
+                        return usage_failure;
+                    }
+                    try writeStderrLine(alloc, deps, "fx config: {s}\n", text);
+                }
                 if (!argsContainJson(rest)) {
                     if (unknown_key) |part| {
                         const message = try settings_messages.formatUnknownPath(alloc, part);
@@ -3155,8 +3163,32 @@ fn runTopLevelMcp(
         return .handled_success;
     }
 
+    if (rest.len > 0) try writeUnknownSubcommand(alloc, deps, .mcp, rest[0]);
     try writeTopLevelUsage(cfg.command_catalog, deps, .mcp);
     return usage_failure;
+}
+
+/// Writes `fx <command>: unknown command <word>`, with the closest of the
+/// command's words, as fx does for an unknown top-level command.
+fn writeUnknownSubcommand(alloc: Allocator, deps: RunDeps, kind: TopLevelKind, word: []const u8) !void {
+    var names: [32][]const u8 = undefined;
+    var count: usize = 0;
+    for (builtin_commands.top_level_registry.specs) |spec| {
+        if (spec.kind != kind) continue;
+        for (spec.subcommands) |sub| {
+            if (count == names.len) break;
+            names[count] = sub.name();
+            count += 1;
+        }
+    }
+    var writer: std.Io.Writer.Allocating = .init(alloc);
+    defer writer.deinit();
+    try writer.writer.print("fx {s}: unknown command {s}", .{ @tagName(kind), word });
+    if (settings_messages.closest(word, names[0..count])) |suggestion| {
+        try writer.writer.print(" (did you mean {s}?)", .{suggestion});
+    }
+    try writer.writer.writeAll("\n");
+    try writeStderr(deps, writer.written());
 }
 
 /// `fx mcp` on MCP-v2: the verbs `/mcp` shares.
@@ -3520,6 +3552,10 @@ fn writeUsageOrJsonError(
     args: anytype,
 ) !void {
     if (argsContainJson(args)) {
+        if (try flagProblem(alloc, usage_kind, args)) |problem| {
+            defer alloc.free(problem);
+            return writeJsonCommandFailure(alloc, deps, output_kind, err, problem);
+        }
         try writeCommandFailure(alloc, deps, output_kind, err, .json);
     } else {
         try writeFlagFailure(alloc, deps, usage_kind, args);
@@ -3532,7 +3568,7 @@ fn writeUsageOrJsonError(
 /// absent.
 fn parsedOptions(kind: TopLevelKind) ?[]const command_specs.OptionDoc {
     return switch (kind) {
-        .status, .doctor, .models, .permissions => &builtin_commands.json_only_options,
+        .status, .doctor, .models, .permissions, .credits => &builtin_commands.json_only_options,
         .sessions => &builtin_commands.sessions_options,
         .login => &builtin_commands.login_options,
         .usage => &builtin_commands.usage_options,
@@ -3548,21 +3584,38 @@ fn parsedOptions(kind: TopLevelKind) ?[]const command_specs.OptionDoc {
     };
 }
 
-/// Writes `fx <command>: <problem>` when a flag in `args` is malformed.
+/// Writes `fx <command>: <problem>` when `flagProblem` finds one.
 fn writeFlagFailure(alloc: Allocator, deps: RunDeps, kind: TopLevelKind, args: anytype) !void {
-    const docs = parsedOptions(kind) orelse return;
-    // `fx session` reads its ID operand in dash-operand mode; report what its parser hit.
-    const failure = cli_flags.failureOf(if (kind == .session) .initDashOperands(docs, args) else .init(docs, args)) orelse return;
+    const problem = try flagProblem(alloc, kind, args) orelse return;
+    defer alloc.free(problem);
+    try writeStderrLine(alloc, deps, "fx {s}: ", @tagName(kind));
+    try writeStderr(deps, problem);
+    try writeStderr(deps, "\n");
+}
+
+/// What is wrong with the flags in `args`: a malformed flag, or a value
+/// outside the range its placeholder names, such as `--limit <1-100>`.
+/// Null when the flags are fine. The caller frees the result.
+fn flagProblem(alloc: Allocator, kind: TopLevelKind, args: anytype) !?[]u8 {
+    const docs = parsedOptions(kind) orelse return null;
+    // `fx session` and `fx config` read operands that may start with a dash,
+    // such as an ID or `-5`; report what their parsers hit.
+    const parser: cli_flags.Parser = switch (kind) {
+        .session, .config => .initDashOperands(docs, args),
+        else => .init(docs, args),
+    };
     var writer: std.Io.Writer.Allocating = .init(alloc);
     defer writer.deinit();
-    try writer.writer.print("fx {s}: ", .{@tagName(kind)});
-    try failure.write(&writer.writer);
-    switch (kind) {
-        .acp, .pr, .issue => try flag_placement.writeLaunchFlagHint(&writer.writer, @tagName(kind), failure),
-        else => {},
+    if (cli_flags.failureOf(parser)) |failure| {
+        try failure.write(&writer.writer);
+        switch (kind) {
+            .acp, .pr, .issue => try flag_placement.writeLaunchFlagHint(&writer.writer, @tagName(kind), failure),
+            else => {},
+        }
+    } else if (!try cli_flags.writeRangeFailure(&writer.writer, parser)) {
+        return null;
     }
-    try writer.writer.writeAll("\n");
-    try writeStderr(deps, writer.written());
+    return try writer.toOwnedSlice();
 }
 
 fn writeUsageCommandFailure(
@@ -4627,6 +4680,14 @@ fn runConfig(alloc: Allocator, cfg: Config, deps: RunDeps, opts: cli_config.Opti
         }
     }
 
+    // Like git config --get, a key with no value prints nothing and exits 1;
+    // JSON names the key, so a script can tell why.
+    if (opts.format == .json and opts.key != null and entries.len == 0) {
+        const message = try alloc.print("{s} isn't set", .{opts.key.?});
+        defer alloc.free(message);
+        try writeJsonCommandFailureCode(alloc, deps, "config", "ConfigKeyNotSet", message);
+        return .handled_failure;
+    }
     const text = try snapshot.render(alloc, opts.format);
     defer alloc.free(text);
     try writeFormattedOutput(deps, text, opts.format);
@@ -6654,7 +6715,7 @@ test "mcp list usage errors print the JSON failure shape when --json is present"
     try std.testing.expectEqual(usage_failure, result);
     try std.testing.expectEqualStrings("", capture.stderr.written());
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"mcp_list\",\"error\":\"invalid arguments\",\"code\":\"InvalidLocalSurfaceArgs\"}",
+        "{\"kind\":\"mcp_list\",\"error\":\"unknown flag --bogus\",\"code\":\"InvalidLocalSurfaceArgs\"}",
         std.mem.trimEnd(u8, capture.stdout.written(), "\n"),
     );
 }

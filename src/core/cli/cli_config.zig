@@ -47,18 +47,21 @@ const config_flag_ids = cli_flags.idTable(ConfigFlag, &builtin_commands.config_p
 
 /// Parses `fx config [list|get <key>|set <key> <value>|unset <key>]` and its
 /// flags. On a key that names no setting, sets `unknown_key` to the part that
-/// isn't known. Slices borrow from `args`.
+/// isn't known; on other mistakes in the words, sets `problem` to what is
+/// wrong. A value may start with a dash, as `-5` does. Slices borrow from
+/// `args`.
 pub fn parseArgs(
     args: []const [:0]const u8,
     unknown_key: *?settings_keys.UnknownPart,
+    problem: *?[]const u8,
 ) error{ InvalidConfigArgs, UnknownConfigSetting, WorkspaceConfigWrite }!Options {
     var options: Options = .{};
     var words: [3][]const u8 = undefined;
     var word_count: usize = 0;
-    var parser: cli_flags.Parser = .init(&builtin_commands.config_parse_options, args);
+    var parser: cli_flags.Parser = .initDashOperands(&builtin_commands.config_parse_options, args);
     while (parser.next() catch return error.InvalidConfigArgs) |item| switch (item) {
         .positional => |word| {
-            if (word_count == words.len) return error.InvalidConfigArgs;
+            if (word_count == words.len) return wordsProblem(problem, "takes at most a command, a key, and a value; quote a value with spaces");
             words[word_count] = word;
             word_count += 1;
         },
@@ -72,27 +75,33 @@ pub fn parseArgs(
     };
 
     if (word_count == 0) {
-        if (options.project) return error.InvalidConfigArgs;
+        if (options.project) return wordsProblem(problem, "--project goes with fx config schema");
         return options;
     }
-    options.action = std.meta.stringToEnum(Action, words[0]) orelse return error.InvalidConfigArgs;
-    if (options.project and options.action != .schema) return error.InvalidConfigArgs;
-    const expected_words: usize = switch (options.action) {
-        .list, .schema => 1,
-        .get, .unset => 2,
-        .set => 3,
-    };
-    if (word_count != expected_words) return error.InvalidConfigArgs;
+    options.action = std.meta.stringToEnum(Action, words[0]) orelse
+        return wordsProblem(problem, "the first word is list, get, set, unset, or schema");
+    if (options.project and options.action != .schema) return wordsProblem(problem, "--project goes with fx config schema");
+    switch (options.action) {
+        .list, .schema => if (word_count > 1) return wordsProblem(problem, "list and schema take no key"),
+        .get, .unset => {
+            if (word_count < 2) return wordsProblem(problem, "get and unset need a key, as in fx config get fast_mode");
+            if (word_count > 2) return wordsProblem(problem, "get and unset take one key");
+        },
+        .set => if (word_count < 3) return wordsProblem(problem, if (std.mem.findScalar(u8, words[word_count - 1], '=') != null)
+            "set takes the key and the value as two words, as in fx config set fast_mode true"
+        else
+            "set needs a key and a value, as in fx config set fast_mode true"),
+    }
     if (options.action == .list) return options;
     // The schema is already JSON and describes files, not one scope's values.
     if (options.action == .schema) {
-        if (options.scope != .all or options.show_origin or options.format == .json) return error.InvalidConfigArgs;
+        if (options.scope != .all or options.show_origin or options.format == .json) return wordsProblem(problem, "schema takes only --project");
         return options;
     }
 
     // An older name, such as `statusLine.context`, means its current one.
     const key = settings_keys.currentPath(words[1]);
-    if (key.len == 0) return error.InvalidConfigArgs;
+    if (key.len == 0) return wordsProblem(problem, "the key is empty");
     if (settings_keys.unknownPart(key)) |part| {
         unknown_key.* = part;
         return error.UnknownConfigSetting;
@@ -102,7 +111,7 @@ pub fn parseArgs(
 
     // Writes go to the profile's top level only: fx treats preferences in a
     // workspace override as legacy and removes them when it saves.
-    if (options.show_origin) return error.InvalidConfigArgs;
+    if (options.show_origin) return wordsProblem(problem, "--show-origin goes with list and get");
     if (options.scope == .workspace) return error.WorkspaceConfigWrite;
     if (options.action == .set) options.value = words[2];
     return options;
@@ -242,6 +251,11 @@ fn parseSwitch(raw: []const u8) ?bool {
     if (std.mem.eql(u8, raw, "true") or std.mem.eql(u8, raw, "on")) return true;
     if (std.mem.eql(u8, raw, "false") or std.mem.eql(u8, raw, "off")) return false;
     return null;
+}
+
+fn wordsProblem(problem: *?[]const u8, text: []const u8) error{InvalidConfigArgs} {
+    problem.* = text;
+    return error.InvalidConfigArgs;
 }
 
 /// Whether `fx config set` and `unset` change `key`.
@@ -630,7 +644,8 @@ pub fn loadFailureReason(err: anyerror) []const u8 {
 
 fn parseForTest(args: []const [:0]const u8) error{ InvalidConfigArgs, UnknownConfigSetting, WorkspaceConfigWrite }!Options {
     var unknown: ?settings_keys.UnknownPart = null;
-    return parseArgs(args, &unknown);
+    var problem: ?[]const u8 = null;
+    return parseArgs(args, &unknown, &problem);
 }
 
 test "config args default to list and take scope, origin, and json flags" {
@@ -763,7 +778,8 @@ test "every key config set writes is a plain setting in the list" {
 
 test "config get names the part of a key that isn't a setting" {
     var unknown: ?settings_keys.UnknownPart = null;
-    try std.testing.expectError(error.UnknownConfigSetting, parseArgs(&.{ "get", "statusLine.contxt" }, &unknown));
+    var problem: ?[]const u8 = null;
+    try std.testing.expectError(error.UnknownConfigSetting, parseArgs(&.{ "get", "statusLine.contxt" }, &unknown, &problem));
     try std.testing.expectEqualStrings("contxt", unknown.?.name);
     try std.testing.expectEqualStrings("status_line", unknown.?.parent.?);
 }
@@ -895,6 +911,7 @@ test "fx config set writes each key with the type the settings list gives it" {
 
 test "fx config schema takes only --project" {
     var unknown: ?settings_keys.UnknownPart = null;
+    var problem: ?[]const u8 = null;
     const plain = try parseForTest(&.{"schema"});
     try std.testing.expectEqual(Action.schema, plain.action);
     try std.testing.expect(!plain.project);
@@ -906,7 +923,25 @@ test "fx config schema takes only --project" {
         &.{ "schema", "--global" },
         &.{ "schema", "--show-origin" },
         &.{ "schema", "extra" },
-    }) |args| try std.testing.expectError(error.InvalidConfigArgs, parseArgs(args, &unknown));
+    }) |args| try std.testing.expectError(error.InvalidConfigArgs, parseArgs(args, &unknown, &problem));
+}
+
+test "fx config names what is wrong with its words" {
+    var unknown: ?settings_keys.UnknownPart = null;
+    for ([_]struct { args: []const [:0]const u8, problem: []const u8 }{
+        .{ .args = &.{ "set", "fast_mode" }, .problem = "set needs a key and a value, as in fx config set fast_mode true" },
+        .{ .args = &.{ "set", "fast_mode=true" }, .problem = "set takes the key and the value as two words, as in fx config set fast_mode true" },
+        .{ .args = &.{"get"}, .problem = "get and unset need a key, as in fx config get fast_mode" },
+        .{ .args = &.{"sett"}, .problem = "the first word is list, get, set, unset, or schema" },
+        .{ .args = &.{ "set", "theme", "--show-origin", "dark" }, .problem = "--show-origin goes with list and get" },
+    }) |case| {
+        var problem: ?[]const u8 = null;
+        try std.testing.expectError(error.InvalidConfigArgs, parseArgs(case.args, &unknown, &problem));
+        try std.testing.expectEqualStrings(case.problem, problem.?);
+    }
+    // A value may start with a dash; the value check rejects it later.
+    const negative = try parseForTest(&.{ "set", "max_agent_steps", "-5" });
+    try std.testing.expectEqualStrings("-5", negative.value.?);
 }
 
 test "every plain setting is resolved or deliberately shown from the files" {

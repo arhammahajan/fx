@@ -213,6 +213,40 @@ pub fn failureOf(start: Parser) ?Failure {
     return null;
 }
 
+/// The whole numbers a flag takes when its placeholder names a range, such as
+/// `--limit <1-100>`; null for any other placeholder.
+pub fn valueRange(doc: OptionDoc) ?struct { min: u64, max: u64 } {
+    const space = std.mem.findScalarLast(u8, doc.flag, ' ') orelse return null;
+    const placeholder = doc.flag[space + 1 ..];
+    if (placeholder.len < 5 or placeholder[0] != '<' or placeholder[placeholder.len - 1] != '>') return null;
+    const range = placeholder[1 .. placeholder.len - 1];
+    const dash = std.mem.findScalar(u8, range, '-') orelse return null;
+    return .{
+        .min = std.fmt.parseUnsigned(u64, range[0..dash], 10) catch return null,
+        .max = std.fmt.parseUnsigned(u64, range[dash + 1 ..], 10) catch return null,
+    };
+}
+
+/// Writes the first value outside its flag's range, as
+/// `--limit takes a whole number from 1 to 100, not abc`. False when every
+/// value fits, or when the arguments don't parse.
+pub fn writeRangeFailure(w: *std.Io.Writer, start: Parser) std.Io.Writer.Error!bool {
+    var parser = start;
+    while (parser.next() catch return false) |item| switch (item) {
+        .positional => {},
+        .option => |match| {
+            const doc = parser.docs[match.index];
+            const range = valueRange(doc) orelse continue;
+            const value = match.value orelse continue;
+            const number = std.fmt.parseUnsigned(u64, value, 10) catch null;
+            if (number) |n| if (n >= range.min and n <= range.max) continue;
+            try w.print("{s} takes a whole number from {d} to {d}, not {s}", .{ flagName(doc), range.min, range.max, value });
+            return true;
+        },
+    };
+    return false;
+}
+
 /// Levenshtein distance for names up to 64 bytes; null for longer names.
 pub fn editDistance(a: []const u8, b: []const u8) ?usize {
     const max = 64;

@@ -1410,17 +1410,17 @@ describe("cli: status", () => {
     async () => {
       const home = mkdtempSync(join(tmpdir(), "fx-mcp-list-json-"));
       try {
-        for (const args of [
-          ["mcp", "list", "--bogus", "--json"],
-          ["mcp", "list", "--json", "--bogus"],
-          ["mcp", "list", "extra", "--json"],
-        ]) {
-          const result = await runFx(args, { env: { HOME: home } });
+        for (const [args, error] of [
+          [["mcp", "list", "--bogus", "--json"], "unknown flag --bogus"],
+          [["mcp", "list", "--json", "--bogus"], "unknown flag --bogus"],
+          [["mcp", "list", "extra", "--json"], "invalid arguments"],
+        ] as const) {
+          const result = await runFx([...args], { env: { HOME: home } });
           expect(result.code).toBe(2);
           expect(result.stderr).toBe("");
           expect(JSON.parse(result.stdout)).toEqual({
             kind: "mcp_list",
-            error: "invalid arguments",
+            error,
             code: "InvalidLocalSurfaceArgs",
           });
         }
