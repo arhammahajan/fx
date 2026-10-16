@@ -116,8 +116,12 @@ pub fn appendCommand(
     try argv.appendSlice(arena, switch (subcommand) {
         .status => &.{ "status", "--ignore-submodules=all" },
         .diff => &.{ "diff", "--no-ext-diff", "--no-textconv", "--ignore-submodules=all" },
-        .log => &.{ "log", "--no-ext-diff", "--no-textconv", "--ignore-submodules=all" },
-        .show => &.{ "show", "--no-ext-diff", "--no-textconv", "--ignore-submodules=all" },
+        // A repository's own `format.pretty` can name a signature placeholder
+        // such as `%G?`, which makes git run the verifier its config names.
+        // Naming the format here, before any argument a caller appends, keeps
+        // that config out while an allowed `--oneline` still wins.
+        .log => &.{ "log", "--pretty=medium", "--no-ext-diff", "--no-textconv", "--ignore-submodules=all" },
+        .show => &.{ "show", "--pretty=medium", "--no-ext-diff", "--no-textconv", "--ignore-submodules=all" },
         .branch => &.{"branch"},
         .rev_parse => &.{"rev-parse"},
     });
@@ -355,6 +359,26 @@ test "safe git argv leaves out the lazy fetch option an older git lacks" {
         if (std.mem.eql(u8, arg, "log")) found_log = true;
     }
     try std.testing.expect(found_log);
+}
+
+test "safe git names a format for log and show" {
+    // A repository's `format.pretty` can request signature verification, which
+    // runs the verifier its config names, so the format is always named here.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const ready: Ready = .{ .executable = "/usr/bin/git", .filter_names = &.{}, .no_lazy_fetch = true };
+    for ([_]Subcommand{ .log, .show }) |subcommand| {
+        var argv: std.ArrayList([]const u8) = .empty;
+        try appendCommand(arena, &argv, ready, subcommand);
+        var format_index: ?usize = null;
+        var subcommand_index: ?usize = null;
+        for (argv.items, 0..) |arg, index| {
+            if (std.mem.eql(u8, arg, "--pretty=medium")) format_index = index;
+            if (std.mem.eql(u8, arg, "log") or std.mem.eql(u8, arg, "show")) subcommand_index = index;
+        }
+        try std.testing.expectEqual(subcommand_index.? + 1, format_index.?);
+    }
 }
 
 test "safe git environment keeps only fixed values and user config locations" {

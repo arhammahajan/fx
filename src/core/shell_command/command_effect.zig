@@ -1517,6 +1517,7 @@ test "planner pins git show to hardened argv and revision operands" {
         "-c",
         "log.showSignature=false",
         "show",
+        "--pretty=medium",
         "--no-ext-diff",
         "--no-textconv",
         "--ignore-submodules=all",

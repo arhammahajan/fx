@@ -354,6 +354,87 @@ describe("poisoned repository", () => {
   );
 
   test(
+    "a repository format cannot make git show run a signature verifier",
+    async () => {
+      const fixture = poisonedRepository();
+      const verifierLog = join(fixture.base, "verifier.log");
+      const verifierRuns = () =>
+        existsSync(verifierLog) ? readFileSync(verifierLog, "utf8").split("\n").filter(Boolean) : [];
+
+      // A commit that carries a signature header, so git actually asks the
+      // verifier instead of answering "no signature" on its own.
+      const tree = git(fixture, ["rev-parse", "HEAD^{tree}"]).trim();
+      const parent = git(fixture, ["rev-parse", "HEAD"]).trim();
+      const body = [
+        `tree ${tree}`,
+        `parent ${parent}`,
+        "author fixture <fixture@example.invalid> 1700000000 +0000",
+        "committer fixture <fixture@example.invalid> 1700000000 +0000",
+        "gpgsig -----BEGIN PGP SIGNATURE-----",
+        " ",
+        " iQEcBAABAgAGBQJfaketoken",
+        " -----END PGP SIGNATURE-----",
+        "",
+        "signed-looking commit",
+        "",
+      ].join("\n");
+      const hashed = Bun.spawnSync(
+        ["/bin/sh", "-c", `printf '%s' '${body}' | git hash-object -t commit -w --stdin`],
+        {
+          cwd: fixture.workspace,
+          env: {
+            PATH: process.env.PATH ?? "/usr/bin:/bin",
+            HOME: fixture.home,
+            GIT_CONFIG_NOSYSTEM: "1",
+            LC_ALL: "C",
+          },
+        },
+      );
+      const signed = hashed.stdout.toString().trim();
+      expect(signed).toMatch(/^[0-9a-f]{40}$/);
+
+      const verifier = join(fixture.base, "verifier.sh");
+      writeFileSync(verifier, `#!/bin/sh\necho "ran $0 $*" >> '${verifierLog}'\nexit 1\n`);
+      chmodSync(verifier, 0o755);
+      // `%G?` asks for verification, so git runs the configured verifier.
+      git(fixture, ["config", "format.pretty", "%G?"]);
+      git(fixture, ["config", "gpg.program", verifier]);
+
+      // The control proves the route is live: plain git starts the verifier.
+      rmSync(verifierLog, { force: true });
+      Bun.spawnSync(["git", "show", signed], {
+        cwd: fixture.workspace,
+        env: {
+          PATH: process.env.PATH ?? "/usr/bin:/bin",
+          HOME: fixture.home,
+          GIT_CONFIG_NOSYSTEM: "1",
+          LC_ALL: "C",
+        },
+      });
+      expect(verifierRuns().length).toBeGreaterThan(0);
+
+      rmSync(verifierLog, { force: true });
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("show", "shell", {
+          request: { action: "run", command: `git show ${signed}`, yield_time_ms: 30_000 },
+        }),
+        fakeGatewayFinalText("inspection complete"),
+      ], { classifierResponses: [] });
+      gateways.push(gateway);
+
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Inspect the repository."],
+        { cwd: fixture.workspace, env: fxEnv(fixture, gateway), timeoutMs: TIMEOUT },
+      );
+      expect(result.code, result.stderr).toBe(0);
+      expect(verifierRuns()).toEqual([]);
+      expect(sentinelRuns(fixture)).toEqual([]);
+      expect(gateway.classifierRequests).toHaveLength(0);
+    },
+    TIMEOUT,
+  );
+
+  test(
     "fx pr snapshots the repository without running its programs",
     async () => {
       const fixture = poisonedRepository();
