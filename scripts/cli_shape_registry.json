@@ -438,7 +438,6 @@
   "hand_parsed_files": {
     "src/builtins/skills.zig": "Reads a pasted npx skills add command line, another program's flags.",
     "src/core/mcp/docker_run.zig": "Reads docker's --cidfile in a server's command, another program's flags.",
-    "src/core/mcp_host/verbs.zig": "fx mcp verbs on the opt-in MCP-v2 engine; to move onto cli_flags when that engine becomes the default.",
     "src/core/shell_command/command_classification.zig": "Classifies shell commands the agent runs, another program's flags.",
     "src/core/shell_command/command_effect.zig": "Reads the flags of git and other commands the agent runs.",
     "src/core/shell_command/command_lex.zig": "Reads the flags of timeout, env, and other wrapper commands the agent runs.",

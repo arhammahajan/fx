@@ -19,6 +19,8 @@ const Host = @import("host.zig").Host;
 
 const Allocator = std.mem.Allocator;
 const Writer = std.Io.Writer;
+const cli_flags = @import("../cli/cli_flags.zig");
+const OptionDoc = @import("../slash_commands/command_specs.zig").OptionDoc;
 const Status = runtime_mod.Status;
 pub const Notify = runtime_mod.Notify;
 
@@ -78,47 +80,50 @@ pub fn parse(arena: Allocator, surface: Surface, args: []const []const u8) Alloc
     const dash = for (rest, 0..) |a, k| {
         if (std.mem.eql(u8, a, "--")) break k;
     } else rest.len;
+    for (rest[0..dash]) |a| if (isHelp(a)) return .{ .command = .{ .help = verb } };
+
+    // The shared parser reads arguments as the CLI receives them.
+    const words = try arena.alloc([:0]const u8, dash);
+    for (rest[0..dash], words) |a, *word| word.* = try arena.dupeSentinel(u8, a, 0);
+    const flags = verbFlags(verb, surface);
+    var parser: cli_flags.Parser = .init(flags.docs, words);
     var names: std.ArrayList([]const u8) = .empty;
     var pairs: std.ArrayList(config_file.Pair) = .empty;
-    var pair_flag: ?[]const u8 = null;
+    var pair_flag: ?Flag = null;
     var json = false;
     var project = false;
     var profile = false;
     var all = false;
     var no_browser = false;
-    var i: usize = 0;
-    while (i < dash) : (i += 1) {
-        const a = rest[i];
-        if (isHelp(a)) return .{ .command = .{ .help = verb } };
-        if (a.len == 0 or a[0] != '-') {
-            try names.append(arena, a);
-            continue;
-        }
-        const allowed = switch (verb) {
-            .list, .show => surface == .cli and std.mem.eql(u8, a, "--json"),
-            .add => std.mem.eql(u8, a, "--project") or isGlobalFlag(a) or std.mem.eql(u8, a, "--env") or std.mem.eql(u8, a, "--header"),
-            .remove => std.mem.eql(u8, a, "--project") or isGlobalFlag(a),
-            .login => std.mem.eql(u8, a, "--no-browser"),
-            .approve => std.mem.eql(u8, a, "--all"),
-            .logout, .reject => false,
+    while (true) {
+        const item = parser.next() catch {
+            var text: Writer.Allocating = .init(arena);
+            parser.failure.?.write(&text.writer) catch return error.OutOfMemory;
+            return usage(arena, verb, "{s} {s}: {s}", .{ p, @tagName(verb), text.written() });
+        } orelse break;
+        const match = switch (item) {
+            .positional => |word| {
+                try names.append(arena, word);
+                continue;
+            },
+            .option => |match| match,
         };
-        if (verb == .list and std.mem.eql(u8, a, "--connect")) return moved(arena, "{s} list --connect is now {s} show NAME.", .{ p, p });
-        if (!allowed) return usage(arena, verb, "{s} {s} has no {s} flag.", .{ p, @tagName(verb), a });
-        if (std.mem.eql(u8, a, "--env") or std.mem.eql(u8, a, "--header")) {
-            if (pair_flag) |f| if (!std.mem.eql(u8, f, a)) return usage(arena, verb, "--env is for stdio servers and --header for HTTP ones.", .{});
-            pair_flag = a;
-            i += 1;
-            const kv = if (i < dash) rest[i] else "";
-            const eq = std.mem.findScalar(u8, kv, '=') orelse 0;
-            if (eq == 0) return usage(arena, verb, "{s} needs KEY=VALUE.", .{a});
-            try pairs.append(arena, .{ .key = kv[0..eq], .value = kv[eq + 1 ..] });
-            continue;
+        switch (flags.ids[match.index]) {
+            .connect => return moved(arena, "{s} list --connect is now {s} show NAME.", .{ p, p }),
+            .json => json = true,
+            .project => project = true,
+            .global, .profile => profile = true,
+            .all => all = true,
+            .no_browser => no_browser = true,
+            .env, .header => |id| {
+                if (pair_flag) |f| if (f != id) return usage(arena, verb, "--env is for stdio servers and --header for HTTP ones.", .{});
+                pair_flag = id;
+                const kv = match.value.?;
+                const eq = std.mem.findScalar(u8, kv, '=') orelse 0;
+                if (eq == 0) return usage(arena, verb, "--{s} needs KEY=VALUE.", .{@tagName(id)});
+                try pairs.append(arena, .{ .key = kv[0..eq], .value = kv[eq + 1 ..] });
+            },
         }
-        if (std.mem.eql(u8, a, "--json")) json = true;
-        if (std.mem.eql(u8, a, "--project")) project = true;
-        if (isGlobalFlag(a)) profile = true;
-        if (std.mem.eql(u8, a, "--all")) all = true;
-        if (std.mem.eql(u8, a, "--no-browser")) no_browser = true;
     }
     if (dash < rest.len and verb != .add) return usage(arena, verb, "{s} {s} takes no command after --.", .{ p, @tagName(verb) });
     const n = names.items;
@@ -139,7 +144,7 @@ pub fn parse(arena: Allocator, surface: Surface, args: []const []const u8) Alloc
                 if (n.len > 1) return usage(arena, verb, "{s} add takes a URL or a command after --, not both.", .{p});
                 const command = rest[dash + 1 ..];
                 if (command.len == 0) return usage(arena, verb, "{s} add needs a command after --.", .{p});
-                if (pair_flag != null and std.mem.eql(u8, pair_flag.?, "--header")) return usage(arena, verb, "--header is for HTTP servers; use --env for a command.", .{});
+                if (pair_flag == .header) return usage(arena, verb, "--header is for HTTP servers; use --env for a command.", .{});
                 return .{ .command = .{ .add = .{ .name = name, .file = file, .entry = .{ .stdio = .{ .command = command[0], .args = command[1..], .env = pairs.items } } } } };
             }
             // fx knows Slack's address, as `add slack` did before.
@@ -149,7 +154,7 @@ pub fn parse(arena: Allocator, surface: Surface, args: []const []const u8) Alloc
             };
             if (!std.mem.startsWith(u8, url, "https://") and !std.mem.startsWith(u8, url, "http://"))
                 return usage(arena, verb, "'{s}' isn't a URL. A stdio server's command goes after --.", .{url});
-            if (pair_flag != null and std.mem.eql(u8, pair_flag.?, "--env")) return usage(arena, verb, "--env is for stdio servers; use --header for HTTP.", .{});
+            if (pair_flag == .env) return usage(arena, verb, "--env is for stdio servers; use --header for HTTP.", .{});
             return .{ .command = .{ .add = .{ .name = name, .file = file, .entry = .{ .http = .{ .url = url, .headers = pairs.items } } } } };
         },
         .approve => {
@@ -178,10 +183,57 @@ fn isHelp(a: []const u8) bool {
     return std.mem.eql(u8, a, "-h") or std.mem.eql(u8, a, "--help");
 }
 
-/// `--global` picks ~/.fx/mcp.json, fx's word for the profile layer.
-/// The older `--profile` still works.
-fn isGlobalFlag(a: []const u8) bool {
-    return std.mem.eql(u8, a, "--global") or std.mem.eql(u8, a, "--profile");
+const Flag = enum { json, connect, global, profile, project, env, header, no_browser, all };
+
+/// `--global` picks ~/.fx/mcp.json, fx's word for the profile layer. The
+/// older `--profile` still works.
+const scope_options = [_]OptionDoc{
+    .{ .flag = "--global", .description = "Use ~/.fx/mcp.json" },
+    .{ .flag = "--profile", .description = "Use ~/.fx/mcp.json", .hidden = true },
+    .{ .flag = "--project", .description = "Use the project's .mcp.json" },
+};
+const json_option: OptionDoc = .{ .flag = "--json", .description = "Print JSON" };
+/// `list --connect` moved to `show NAME`; it is read to say so.
+const connect_option: OptionDoc = .{ .flag = "--connect", .description = "Moved to show NAME", .hidden = true };
+const list_cli_options = [_]OptionDoc{ json_option, connect_option };
+const list_shell_options = [_]OptionDoc{connect_option};
+const show_cli_options = [_]OptionDoc{json_option};
+const add_options = scope_options ++ [_]OptionDoc{
+    .{ .flag = "--env <KEY=VALUE>", .description = "Set a stdio server's environment variable" },
+    .{ .flag = "--header <KEY=VALUE>", .description = "Send an HTTP header" },
+};
+const login_options = [_]OptionDoc{.{ .flag = "--no-browser", .description = "Print the sign-in address instead of opening it" }};
+const approve_options = [_]OptionDoc{.{ .flag = "--all", .description = "Approve every project server" }};
+
+const VerbFlags = struct { docs: []const OptionDoc, ids: []const Flag };
+
+fn verbFlagsFor(comptime docs: []const OptionDoc) VerbFlags {
+    const ids = comptime ids: {
+        var ids: [docs.len]Flag = undefined;
+        for (docs, &ids) |doc, *id| {
+            // `--no-browser` is `.no_browser`.
+            const name = cli_flags.flagName(doc)[2..];
+            var field: [name.len]u8 = undefined;
+            for (name, &field) |c, *f| f.* = if (c == '-') '_' else c;
+            const final = field;
+            id.* = @field(Flag, &final);
+        }
+        break :ids ids;
+    };
+    return .{ .docs = docs, .ids = &ids };
+}
+
+/// The flags `verb` takes on `surface`: `--json` only on the CLI.
+fn verbFlags(verb: Verb, surface: Surface) VerbFlags {
+    return switch (verb) {
+        .list => if (surface == .cli) verbFlagsFor(&list_cli_options) else verbFlagsFor(&list_shell_options),
+        .show => if (surface == .cli) verbFlagsFor(&show_cli_options) else verbFlagsFor(&.{}),
+        .add => verbFlagsFor(&add_options),
+        .remove => verbFlagsFor(&scope_options),
+        .login => verbFlagsFor(&login_options),
+        .approve => verbFlagsFor(&approve_options),
+        .logout, .reject => verbFlagsFor(&.{}),
+    };
 }
 
 fn moved(arena: Allocator, comptime fmt: []const u8, args: anytype) Allocator.Error!Parsed {
@@ -882,7 +934,7 @@ test "parse turns mistakes into usage, and old verbs into pointers" {
         .{ .args = &.{ "remove", "--project", "--profile", "x" }, .message = "Use --project or --global, not both." },
         .{ .args = &.{ "add", "--global", "--project", "web", "https://w/mcp" }, .message = "Use --project or --global, not both." },
         .{ .args = &.{ "approve", "--all", "x" }, .message = "fx mcp approve takes a NAME or --all, not both." },
-        .{ .args = &.{ "logout", "--json", "x" }, .message = "fx mcp logout has no --json flag." },
+        .{ .args = &.{ "logout", "--json", "x" }, .message = "fx mcp logout: unknown flag --json" },
         .{ .args = &.{ "show", "x", "--", "y" }, .message = "fx mcp show takes no command after --." },
     };
     for (cases) |case| {
@@ -891,7 +943,7 @@ test "parse turns mistakes into usage, and old verbs into pointers" {
     }
     try testing.expectEqualStrings("fx mcp auth is now fx mcp login NAME.", (try parseCli(a, &.{ "auth", "x" })).moved);
     try testing.expectEqualStrings("/mcp reload is gone: fx reloads after add, remove, approve, and reject.", (try parse(a, .shell, &.{"reload"})).moved);
-    try testing.expectEqualStrings("/mcp list has no --json flag.", (try parse(a, .shell, &.{ "list", "--json" })).usage.message);
+    try testing.expectEqualStrings("/mcp list: unknown flag --json", (try parse(a, .shell, &.{ "list", "--json" })).usage.message);
 }
 
 test "status words follow commands.md, held states first" {

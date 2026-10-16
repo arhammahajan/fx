@@ -290,7 +290,7 @@ describe("fx mcp on MCP-v2", () => {
     expect(unknownVerb.stderr).toStartWith("'nope' isn't a fx mcp command.\nusage: fx mcp COMMAND\n");
     const badFlag = await mcp(root, "logout", "--json", "x");
     expect(badFlag.code).toBe(2);
-    expect(badFlag.stderr).toBe("fx mcp logout has no --json flag.\nusage: fx mcp logout NAME\n");
+    expect(badFlag.stderr).toBe("fx mcp logout: unknown flag --json\nusage: fx mcp logout NAME\n");
 
     for (const [args, message] of [
       [["auth", "x"], "fx mcp auth is now fx mcp login NAME.\n"],
@@ -350,7 +350,7 @@ describe("/mcp in the shell on MCP-v2", () => {
     await tui.sendText("/mcp nope");
     await tui.waitForText("'nope' isn't a /mcp command.", 10_000);
     await tui.sendText("/mcp list --json");
-    await tui.waitForText("/mcp list has no --json flag.", 10_000);
+    await tui.waitForText("/mcp list: unknown flag --json", 10_000);
     await tui.sendText("/mcp auth web");
     await tui.waitForText("/mcp auth is now /mcp login NAME.", 10_000);
     expect(JSON.parse(readFileSync(root.profilePath, "utf8")).mcpServers.web).toEqual({ type: "http", url: "https://w.example/mcp" });
