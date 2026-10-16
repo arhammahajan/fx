@@ -2902,6 +2902,27 @@ fn loadMcpCommandRuntime(
     return .{ .startup = startup, .runtime = runtime };
 }
 
+const McpScopeFlag = enum { global, profile, project };
+const mcp_scope_flag_ids = cli_flags.idTable(McpScopeFlag, &builtin_commands.mcp_scope_options);
+
+/// Reads the scope flags before `fx mcp add` or `remove`'s arguments and
+/// returns the arguments after them, or null when a flag fails, after
+/// writing why when it's more than a usage error.
+fn takeMcpScope(deps: RunDeps, comptime verb: []const u8, args: []const [:0]const u8) !?[]const [:0]const u8 {
+    var parser: cli_flags.Parser = .initPrefix(&builtin_commands.mcp_scope_options, args);
+    while (true) {
+        const item = (parser.next() catch return null) orelse break;
+        switch (mcp_scope_flag_ids[item.option.index].?) {
+            .global, .profile => {},
+            .project => {
+                try writeStderr(deps, "fx mcp " ++ verb ++ ": this changes ~/.fx/mcp.json; edit the project's .mcp.json to change project servers\n");
+                return null;
+            },
+        }
+    }
+    return args[parser.index..];
+}
+
 fn runTopLevelMcp(
     alloc: Allocator,
     rest: []const [:0]const u8,
@@ -2917,10 +2938,27 @@ fn runTopLevelMcp(
     }
     const operation = rest[0];
     if (std.mem.eql(u8, operation, "add")) {
+        const add_args = (try takeMcpScope(deps, "add", rest[1..])) orelse {
+            try writeMcpAddUsage(deps);
+            return usage_failure;
+        };
+        // A dash word where the name goes is a flag add doesn't take.
+        if (add_args.len > 0 and add_args[0].len > 1 and add_args[0][0] == '-') {
+            if (cli_flags.firstFailure(&builtin_commands.mcp_add_options, add_args)) |failure| {
+                var line: std.Io.Writer.Allocating = .init(alloc);
+                defer line.deinit();
+                try line.writer.writeAll("fx mcp add: ");
+                try failure.write(&line.writer);
+                try line.writer.writeAll("\n");
+                try writeStderr(deps, line.written());
+                try writeMcpAddUsage(deps);
+                return usage_failure;
+            }
+        }
         var tokens: std.ArrayList([]const u8) = .empty;
         defer tokens.deinit(alloc);
-        try tokens.ensureTotalCapacity(alloc, rest.len - 1);
-        for (rest[1..]) |token| tokens.appendAssumeCapacity(token);
+        try tokens.ensureTotalCapacity(alloc, add_args.len);
+        for (add_args) |token| tokens.appendAssumeCapacity(token);
         const intent = mcp_command_provider.parseAddIntent(tokens.items) catch |err| {
             if (err == error.McpAddUsage) {
                 try writeMcpAddUsage(deps);
@@ -2995,18 +3033,20 @@ fn runTopLevelMcp(
         return .handled_success;
     }
     if (std.mem.eql(u8, operation, "remove")) {
-        if (rest.len != 2 or rest[1].len == 0) {
+        const remove_args = (try takeMcpScope(deps, "remove", rest[1..])) orelse &.{};
+        if (remove_args.len != 1 or remove_args[0].len == 0) {
             try writeTopLevelUsage(cfg.command_catalog, deps, .mcp);
             return usage_failure;
         }
-        var result = cfg.remove_mcp_profile_server(alloc, rest[1]) catch |err| {
+        const name = remove_args[0];
+        var result = cfg.remove_mcp_profile_server(alloc, name) catch |err| {
             try writeMcpOperationFailure(alloc, deps, "remove", err);
             return .handled_failure;
         };
         defer result.deinit(alloc);
         if (result.warning) |warning| try writeMcpProfileWarning(alloc, deps, warning);
         if (!result.removed) {
-            var encoded_name = try text_utils.encodeTerminalSafe(alloc, rest[1], 160);
+            var encoded_name = try text_utils.encodeTerminalSafe(alloc, name, 160);
             defer encoded_name.deinit(alloc);
             var out: std.Io.Writer.Allocating = .init(alloc);
             defer out.deinit();
@@ -3022,7 +3062,7 @@ fn runTopLevelMcp(
             deps,
             "Removed",
             "from",
-            rest[1],
+            name,
             result.profile_path,
         );
         return .handled_success;

@@ -90,7 +90,8 @@ pub fn parseAddIntent(tokens: []const []const u8) AddIntentError!AddIntent {
 }
 
 pub fn isValidServerName(name: []const u8) bool {
-    if (name.len == 0) return false;
+    // A leading dash would make a flag, such as a mistyped scope, a name.
+    if (name.len == 0 or name[0] == '-') return false;
     for (name) |byte| {
         if (std.ascii.isAlphanumeric(byte) or byte == '_' or byte == '-') continue;
         return false;

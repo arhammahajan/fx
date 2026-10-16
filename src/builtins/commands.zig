@@ -123,13 +123,13 @@ const mcp_subcommands = [_]command_specs.SubcommandDoc{
         .usage = "add NAME COMMAND [ARGS...]",
         .description = "Add a server that fx starts with COMMAND",
         .subcommands = &.{.{ .usage = "slack", .description = "Configure Slack and open authorization" }},
-        .options = &.{.{ .flag = "--transport <http>", .description = "Add a remote server: --transport http NAME URL" }},
+        .options = &mcp_add_options,
     },
     .{ .usage = "auth NAME", .description = "Sign in to a server" },
     .{ .usage = "list", .description = "List configured servers", .options = &mcp_list_options },
     .{ .usage = "logout NAME", .description = "Sign out of a server and delete its login" },
     .{ .usage = "path", .description = "Print the path of ~/.fx/mcp.json" },
-    .{ .usage = "remove NAME", .description = "Remove a server" },
+    .{ .usage = "remove NAME", .description = "Remove a server", .options = &mcp_scope_options },
     .{
         .usage = "trust",
         .description = "",
@@ -140,6 +140,20 @@ const mcp_subcommands = [_]command_specs.SubcommandDoc{
             .{ .usage = "reset", .description = "Forget this workspace's approvals and rejections" },
         },
     },
+};
+
+/// The scope flags `fx mcp add` and `remove` read before their arguments.
+/// They change ~/.fx/mcp.json, so `--global` names the default. `--profile`
+/// is its older name. `--project` is listed so it gets a clear error: only
+/// the MCP-v2 engine writes a project's .mcp.json.
+pub const mcp_scope_options = [_]command_specs.OptionDoc{
+    .{ .flag = "--global", .description = "Change ~/.fx/mcp.json, the default" },
+    .{ .flag = "--profile", .description = "Older name for --global", .hidden = true },
+    .{ .flag = "--project", .description = "Change the project's .mcp.json, with the MCP-v2 engine", .hidden = true },
+};
+
+pub const mcp_add_options = mcp_scope_options ++ [_]command_specs.OptionDoc{
+    .{ .flag = "--transport <http>", .description = "Add a remote server: --transport http NAME URL" },
 };
 
 pub const mcp_list_options = [_]command_specs.OptionDoc{
