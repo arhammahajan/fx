@@ -31,17 +31,28 @@ const recordings_dir_name = "recordings";
 /// other thread runs. Null means fx keeps its files in `~/.fx`.
 var fx_home: ?[]const u8 = null;
 
-pub const FxHomeError = error{ FxHomeNotAbsolute, FxHomeIsRoot };
+pub const FxHomeError = error{ FxHomeNotAbsolute, FxHomeIsRoot, FxHomeIsHome };
 
 /// Points every profile path at `value`, which must be an absolute path
-/// other than `/`. Trailing slashes are ignored, and an empty value leaves the
-/// default. `value` must outlive the process, as an environment string does.
-pub fn useFxHome(value: []const u8) FxHomeError!void {
+/// other than `/` and other than `home`: fx keeps its folder private, which
+/// would close the home folder to everyone else. Trailing slashes are
+/// ignored, and an empty value leaves the default. `value` must outlive the
+/// process, as an environment string does.
+pub fn useFxHome(value: []const u8, home: ?[]const u8) FxHomeError!void {
     const trimmed = std.mem.trimEnd(u8, value, "/");
     if (value.len == 0) return;
     if (!std.Io.Dir.path.isAbsolute(value)) return error.FxHomeNotAbsolute;
     if (trimmed.len == 0) return error.FxHomeIsRoot;
+    if (home) |path| if (std.mem.eql(u8, trimmed, std.mem.trimEnd(u8, path, "/"))) return error.FxHomeIsHome;
     fx_home = trimmed;
+}
+
+/// The folder that holds `$FX_HOME`, or null when it isn't set. fx uses it
+/// as the home folder when `HOME` is unset, since profile paths then come
+/// from `FX_HOME` alone.
+pub fn fxHomeParent() ?[]const u8 {
+    const root = fx_home orelse return null;
+    return std.Io.Dir.path.dirname(root) orelse "/";
 }
 
 /// Whether `FX_HOME` moved fx's folder for this process.
@@ -265,13 +276,15 @@ test "FX_HOME moves every profile path and how messages name it" {
     try std.testing.expectEqualStrings("/tmp/fake-home", rootParent("/tmp/fake-home"));
     try std.testing.expectEqualStrings(".fx", rootName());
     try std.testing.expectEqualStrings("back up ~/.fx/sessions", displayText("back up ~/.fx/sessions"));
-    try useFxHome("");
+    try useFxHome("", null);
     try std.testing.expect(!fxHomeActive());
-    try std.testing.expectError(error.FxHomeNotAbsolute, useFxHome("profiles/work"));
-    try std.testing.expectError(error.FxHomeIsRoot, useFxHome("///"));
+    try std.testing.expectError(error.FxHomeNotAbsolute, useFxHome("profiles/work", null));
+    try std.testing.expectError(error.FxHomeIsRoot, useFxHome("///", null));
+    try std.testing.expectError(error.FxHomeIsHome, useFxHome("/Users/me/", "/Users/me"));
     try std.testing.expect(!fxHomeActive());
 
-    try useFxHome("/tmp/fx-profile/");
+    try useFxHome("/tmp/fx-profile/", "/Users/me");
+    try std.testing.expectEqualStrings("/tmp", fxHomeParent().?);
     try std.testing.expect(fxHomeActive());
     try std.testing.expectEqualStrings("$FX_HOME", displayRoot());
     try std.testing.expectEqualStrings(
@@ -295,7 +308,7 @@ test "FX_HOME moves every profile path and how messages name it" {
     defer alloc.free(trace);
     try std.testing.expectEqualStrings("/tmp/fx-profile/logs/trace.log", trace);
 
-    try useFxHome("/fx");
+    try useFxHome("/fx", null);
     try std.testing.expectEqualStrings("/", rootParent("/tmp/fake-home"));
     try std.testing.expectEqualStrings("fx", rootName());
 }

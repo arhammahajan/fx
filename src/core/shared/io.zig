@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const darwin_process_spawn = @import("darwin_process_spawn.zig");
+const profile_paths = @import("profile_paths.zig");
 
 pub const RawEnviron = [*:null]const ?[*:0]const u8;
 
@@ -457,7 +458,8 @@ fn liveLibcEnviron() ?RawEnviron {
 /// unset, so fx never builds profile paths relative to the current folder.
 /// Child processes still inherit `HOME` unchanged.
 pub fn homeDir() ?[]const u8 {
-    const home = getenv("HOME") orelse return null;
+    // With HOME unset, FX_HOME alone names fx's files, so its parent serves.
+    const home = getenv("HOME") orelse return profile_paths.fxHomeParent();
     if (!std.Io.Dir.path.isAbsolute(home)) return null;
     return home;
 }

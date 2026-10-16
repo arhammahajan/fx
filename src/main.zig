@@ -3562,13 +3562,32 @@ fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !v
 /// fx before it reads or writes anything there.
 fn useFxHomeFromEnv(raw_env: RawEnviron) !void {
     const value = rawEnvValue(raw_env, "FX_HOME") orelse return;
-    profile_paths.useFxHome(value) catch |err| {
+    profile_paths.useFxHome(value, rawEnvValue(raw_env, "HOME")) catch |err| {
         try writeStderrFast(switch (err) {
             error.FxHomeNotAbsolute => "fx: FX_HOME must be an absolute path\n",
             error.FxHomeIsRoot => "fx: FX_HOME can't be the root folder\n",
+            error.FxHomeIsHome => "fx: FX_HOME can't be your home folder; fx keeps its folder private\n",
         });
         exitFast(1);
     };
+    // fx creates its own folder on first use, but opens the folder that holds
+    // it directly, so that one has to exist.
+    if (profile_paths.fxHomeParent()) |parent| createFolderPathRaw(parent);
+}
+
+/// Creates `path` and every folder above it that is missing. This runs before
+/// fx's I/O is set up, so it calls libc; a folder that already exists, or
+/// one fx can't create, is left for the first use to report.
+fn createFolderPathRaw(path: []const u8) void {
+    var buffer: [std.Io.Dir.max_path_bytes + 1]u8 = undefined;
+    if (path.len == 0 or path.len >= buffer.len) return;
+    var end: usize = 1;
+    while (end <= path.len) : (end += 1) {
+        if (end != path.len and path[end] != '/') continue;
+        @memcpy(buffer[0..end], path[0..end]);
+        buffer[end] = 0;
+        _ = std.c.mkdir(@ptrCast(&buffer), 0o755);
+    }
 }
 
 fn writeTopLevelHelpFast(raw_env: RawEnviron) !void {
