@@ -137,6 +137,7 @@ pub const keys = [_]Key{
     .{ .name = "provider_strict", .where = .project_safe, .kind = .boolean, .description = "Send AI Gateway requests only to the providers in provider_order" },
     .{ .name = "providers", .where = .profile, .kind = .object, .map = true, .top_level_only = true, .description = "Named custom model connections" },
     .{ .name = "review_model", .where = .profile, .kind = .string, .description = "The AI Gateway model that reviews actions in auto mode" },
+    .{ .name = "sandbox", .where = .retired, .kind = .any, .description = retired_description },
     .{ .name = "session_titles", .where = .profile, .kind = .boolean, .description = "Name each session from its first prompt" },
     // Retired, but still read so that fx can explain the migration.
     .{ .name = "skill_match_fuzzy", .where = .profile, .kind = .refused, .description = "No longer supported; fx refuses a file that sets it, so remove it" },
@@ -225,9 +226,12 @@ pub fn findRenamedTwice(alloc: Allocator, root: std.json.Value, file: File) ![]R
 fn appendRenamedTwice(alloc: Allocator, found: *std.ArrayList(RenamedTwice), object: std.json.ObjectMap, workspace: ?[]const u8) !void {
     for (keys) |key| {
         const current = key.renamed_to orelse continue;
-        if (object.contains(key.name) and object.contains(current)) {
-            try found.append(alloc, .{ .older = key.name, .current = current, .workspace = workspace });
-        }
+        const older_value = object.get(key.name) orelse continue;
+        const current_value = object.get(current) orelse continue;
+        // fx ignores a current group that isn't an object and keeps using the
+        // older one, so advising to remove the older one would lose settings.
+        if (older_value == .object and current_value != .object) continue;
+        try found.append(alloc, .{ .older = key.name, .current = current, .workspace = workspace });
     }
 }
 
@@ -340,6 +344,21 @@ test "every key says what it holds and what it does" {
     }
 }
 
+test "both spellings are reported only when fx would use the current one" {
+    const alloc = std.testing.allocator;
+    const text =
+        \\{"notifications":{"turn_end":true},"sound":false,
+        \\ "statusLine":{"context":true},"status_line":{"context":false}}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, text, .{});
+    defer parsed.deinit();
+
+    const found = try findRenamedTwice(alloc, parsed.value, .profile);
+    defer alloc.free(found);
+    try std.testing.expectEqual(@as(usize, 1), found.len);
+    try std.testing.expectEqualStrings("statusLine", found[0].older);
+}
+
 test "keys are unique and sorted so the list stays easy to scan" {
     for (keys[1..], 1..) |key, index| {
         try std.testing.expect(std.mem.order(u8, keys[index - 1].name, key.name) == .lt);
@@ -398,7 +417,7 @@ test "project files ignore profile keys but not project-safe or retired ones" {
 test "unknown keys are found at the top level, in fixed objects, and in workspace overrides" {
     const alloc = std.testing.allocator;
     const text =
-        \\{"fast_mdoe":true,"model":"m","maxxing_mode":1,
+        \\{"fast_mdoe":true,"model":"m","maxxing_mode":1,"sandbox":"os",
         \\ "statusLine":{"context":true,"contxt":false},
         \\ "notifications":"off",
         \\ "models":{"anything":"m"},
