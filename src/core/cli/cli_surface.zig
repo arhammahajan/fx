@@ -632,6 +632,11 @@ pub fn commandAfterGlobalLaunchArgs(args: []const [:0]const u8) ?[]const u8 {
 fn launchFlagFailure(args: []const [:0]const u8) ?cli_flags.Failure {
     var parser: cli_flags.Parser = .initPrefix(&builtin_commands.launch_options, args);
     while (parser.next() catch return parser.failure) |_| {}
+    // Flags may also follow a resume word and its target, as in `fx -c --model x`.
+    const rest = args[parser.index..];
+    if (rest.len > 0 and isResumeWord(rest[0])) {
+        return cli_flags.firstFailure(&builtin_commands.launch_options, rest[resumeHeadLen(rest, true)..]);
+    }
     return cli_flags.firstFailure(&builtin_commands.launch_options, args);
 }
 
@@ -855,20 +860,54 @@ pub fn parseInteractiveLaunch(
                 upgrade_relaunch = .{ .previous_revision = previous_revision };
             }
             const resume_line = if (has_upgrade_relaunch) resume_args[0..1] else resume_args;
-            const split: ResumePrompt = if (invocation.top_level_alias)
-                splitResumePrompt(resume_line)
-            else
-                .{ .target_args = resume_line };
-            if (split.prompt) |prompt| {
-                if (std.mem.trim(u8, prompt, " \t\r\n").len == 0) return error.EmptyLaunchPrompt;
+            const head_len = if (has_upgrade_relaunch) resume_line.len else resumeHeadLen(resume_line, invocation.top_level_alias);
+            var prompt: ?[]const u8 = null;
+            if (resume_line.len > head_len) {
+                // Launch flags may follow the resume word and its target, as in
+                // `fx -c --model x` or `fx session resume last --fast`. They're
+                // read together with the flags before the resume word, so the
+                // last one still wins.
+                const before = args[0 .. args.len - effective_args.len];
+                const after = resume_line[head_len..];
+                const line = try alloc.alloc([:0]const u8, before.len + after.len);
+                defer alloc.free(line);
+                @memcpy(line[0..before.len], before);
+                @memcpy(line[before.len..], after);
+                var launch = parseLaunchFlags(alloc, line, .around_prompt) catch |err| {
+                    // A second word after the target is a malformed resume,
+                    // not an unquoted prompt.
+                    if (err == error.UnquotedPrompt) return error.InvalidResumeArgs;
+                    // A removed resume spelling, such as `--id`, keeps its own
+                    // hint instead of reading as an unknown launch flag.
+                    if (err == error.InvalidFlag) {
+                        if (parseResumeArgs(alloc, resume_line, invocation.top_level_alias)) |parsed_target| {
+                            var unused = parsed_target;
+                            unused.deinit(alloc);
+                        } else |resume_err| if (removedResumeHint(resume_err) != null) return resume_err;
+                    }
+                    return err;
+                };
+                // `fx -c` and `fx -r` take a first prompt; `fx session resume`
+                // doesn't.
+                if (launch.prompt != null and !invocation.top_level_alias) {
+                    launch.deinit(alloc);
+                    return error.InvalidResumeArgs;
+                }
+                prompt = launch.prompt;
+                launch.remaining = &.{};
+                global_args.deinit(alloc);
+                global_args = launch;
+            }
+            if (prompt) |text| {
+                if (std.mem.trim(u8, text, " \t\r\n").len == 0) return error.EmptyLaunchPrompt;
             }
             var target = try parseResumeArgs(
                 alloc,
-                split.target_args,
+                resume_line[0..head_len],
                 invocation.top_level_alias,
             );
             errdefer target.deinit(alloc);
-            const initial_prompt: ?[]u8 = if (split.prompt) |prompt| try alloc.dupe(u8, prompt) else null;
+            const initial_prompt: ?[]u8 = if (prompt) |text| try alloc.dupe(u8, text) else null;
             const relaunch = upgrade_relaunch;
             upgrade_relaunch = null;
             return .{ .interactive = .{
@@ -909,31 +948,29 @@ pub fn parseInteractiveLaunch(
     } };
 }
 
-const ResumePrompt = struct {
-    target_args: []const [:0]const u8,
-    /// Borrowed from the arguments.
-    prompt: ?[]const u8 = null,
-};
+/// How many leading words of a resume line name what to resume: the resume
+/// word, when `has_resume_word` (`-c`, `-r`, `--resume`), and its target.
+/// `-c`, `--continue`, and `--resume=<id>` carry their target. `-r` and
+/// `--resume` take the next word as theirs unless it's a long flag, because
+/// a session ID can start with a single dash; `fx session resume` does the
+/// same with its first word. Every word after these is a launch flag or, for
+/// the resume flags, the first prompt.
+fn resumeHeadLen(line: []const [:0]const u8, has_resume_word: bool) usize {
+    var len: usize = 0;
+    if (has_resume_word) {
+        if (line.len == 0) return 0;
+        const word = line[0];
+        len = 1;
+        if (!std.mem.eql(u8, word, "--resume") and !std.mem.eql(u8, word, resume_short_flag)) return len;
+    }
+    if (line.len > len and !std.mem.startsWith(u8, line[len], "--")) len += 1;
+    return len;
+}
 
-/// Splits a first prompt off the end of a top-level resume: `fx -c "<prompt>"`,
-/// `fx -r <id|last> "<prompt>"`, or `fx --resume=<id|last> "<prompt>"`. `-c`
-/// takes no value, so its next argument is the prompt; `-r` and `--resume`
-/// take one first, as in other coding agents' CLIs. A flag in the prompt's
-/// place stays with the resume arguments, which reject it.
-fn splitResumePrompt(args: []const [:0]const u8) ResumePrompt {
-    if (args.len < 2) return .{ .target_args = args };
-    const flag = args[0];
-    const target_len: usize = if (std.mem.eql(u8, flag, "--resume") or std.mem.eql(u8, flag, resume_short_flag))
-        2
-    else if (std.mem.eql(u8, flag, "-c") or std.mem.eql(u8, flag, "--continue") or
-        std.mem.startsWith(u8, flag, resume_inline_prefix))
-        1
-    else
-        return .{ .target_args = args };
-    if (args.len != target_len + 1) return .{ .target_args = args };
-    const prompt = args[target_len];
-    if (prompt.len > 0 and prompt[0] == '-') return .{ .target_args = args };
-    return .{ .target_args = args[0..target_len], .prompt = prompt };
+fn isResumeWord(word: []const u8) bool {
+    return std.mem.eql(u8, word, "-c") or std.mem.eql(u8, word, "--continue") or
+        std.mem.eql(u8, word, "--resume") or std.mem.eql(u8, word, resume_short_flag) or
+        std.mem.startsWith(u8, word, resume_inline_prefix);
 }
 
 const LaunchWord = enum {
@@ -5002,6 +5039,42 @@ fn testCommandCatalog() CommandCatalog {
     return builtin_commands.top_level_registry;
 }
 
+test "launch flags may follow the resume word and its target" {
+    const alloc = std.testing.allocator;
+    const command_catalog = testCommandCatalog();
+    const Case = struct { args: []const [:0]const u8, target: std.meta.Tag(ResumeTarget), model: ?[]const u8 = null, fast: ?bool = null, prompt: ?[]const u8 = null };
+    const cases = [_]Case{
+        .{ .args = &.{ "-c", "--model", "x" }, .target = .remembered, .model = "x" },
+        .{ .args = &.{ "--continue", "--fast" }, .target = .remembered, .fast = true },
+        .{ .args = &.{ "--resume", "last", "--model", "x" }, .target = .last, .model = "x" },
+        .{ .args = &.{ "-r", "--model", "x" }, .target = .pick, .model = "x" },
+        .{ .args = &.{ "-c", "hello world", "--model", "x" }, .target = .remembered, .model = "x", .prompt = "hello world" },
+        .{ .args = &.{ "--model", "y", "-c", "--model", "x" }, .target = .remembered, .model = "x" },
+        .{ .args = &.{ "session", "resume", "last", "--fast" }, .target = .last, .fast = true },
+    };
+    for (cases) |case| {
+        var parsed = try parseInteractiveLaunch(alloc, case.args, command_catalog);
+        switch (parsed) {
+            .interactive => |*launch| {
+                defer launch.deinit(alloc);
+                try std.testing.expectEqual(case.target, std.meta.activeTag(launch.requested_resume.?));
+                if (case.model) |model| try std.testing.expectEqualStrings(model, launch.modifiers.model_override.?);
+                if (case.fast) |fast| try std.testing.expectEqual(fast, launch.modifiers.fast_override.?);
+                if (case.prompt) |prompt| try std.testing.expectEqualStrings(prompt, launch.initial_prompt.?) else try std.testing.expect(launch.initial_prompt == null);
+            },
+            .noninteractive => |*value| {
+                value.deinit(alloc);
+                return error.TestExpectedInteractiveLaunch;
+            },
+        }
+    }
+
+    const bad: []const [:0]const u8 = &.{ "-c", "--bogus" };
+    try std.testing.expectError(error.InvalidFlag, parseInteractiveLaunch(alloc, bad, command_catalog));
+    try std.testing.expectEqualStrings("--bogus", launchFlagFailure(bad).?.unknown.flag);
+    try std.testing.expectError(error.InvalidResumeArgs, parseInteractiveLaunch(alloc, &.{ "session", "resume", "last", "hello" }, command_catalog));
+}
+
 test "parse recognizes every top-level command and preserves unknown commands" {
     const command_catalog = testCommandCatalog();
     try std.testing.expectEqual(Command.interactive, parse(command_catalog, &.{}));
@@ -6803,12 +6876,11 @@ test "runIfRequested takes a first prompt after a resume target" {
         try std.testing.expectEqualStrings("", capture.stderr.written());
     }
 
-    // `-r` with one value still opens that session, and a flag in the
-    // prompt's place or after the prompt is a usage error.
+    // A second word after the prompt is a usage error. Launch flags may
+    // follow the target or the prompt; another test covers them.
     const rejected = [_][]const [:0]const u8{
-        &.{ @constCast("-c"), @constCast("--fast") },
         &.{ @constCast("-r"), @constCast("a"), @constCast("b"), @constCast("c") },
-        &.{ @constCast("-c"), @constCast("fix it"), @constCast("--model"), @constCast("x") },
+        &.{ @constCast("-c"), @constCast("fix it"), @constCast("again") },
     };
     for (rejected) |args| {
         var capture = CaptureOutput.init(std.testing.allocator);
