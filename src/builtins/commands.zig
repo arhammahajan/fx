@@ -508,7 +508,7 @@ pub const launch_options = [_]command_specs.OptionDoc{
     .{ .flag = "--auto", .description = "" },
     .{ .flag = "--full-access", .description = "" },
     .{ .flag = "--yolo", .description = "" },
-    .{ .flag = "--sessions-v2", .description = "" },
+    .{ .flag = "--sessions-v2", .description = "Use the experimental v2 session store", .hidden = true },
 };
 
 pub const top_level_flags = [_]TopLevelFlag{
