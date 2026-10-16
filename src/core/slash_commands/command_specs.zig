@@ -102,8 +102,12 @@ pub const SubcommandDoc = struct {
     description: []const u8,
     /// Words that may follow this one, such as `approve` after `mcp trust`.
     subcommands: []const SubcommandDoc = &.{},
-    /// Flags only this word takes, in addition to the command's own.
+    /// The flags this word takes. Completion offers these, not the
+    /// command's, after the word.
     options: []const OptionDoc = &.{},
+    /// The `<key>` is one `fx config set` changes, so completion offers only
+    /// those keys.
+    settable_key: bool = false,
 
     /// The word itself: `set` in `set <key> <value>`.
     pub fn name(self: SubcommandDoc) []const u8 {

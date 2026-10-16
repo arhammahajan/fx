@@ -244,6 +244,11 @@ fn parseSwitch(raw: []const u8) ?bool {
     return null;
 }
 
+/// Whether `fx config set` and `unset` change `key`.
+pub fn settable(key: []const u8) bool {
+    return std.meta.stringToEnum(Writable, key) != null;
+}
+
 /// What to use instead of `fx config` for a setting it doesn't change.
 fn ownerHint(key: []const u8) []const u8 {
     const head = key[0 .. std.mem.findScalar(u8, key, '.') orelse key.len];

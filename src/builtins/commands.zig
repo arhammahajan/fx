@@ -24,7 +24,7 @@ const json_option = command_specs.OptionDoc{ .flag = "--json", .description = "E
 pub const json_only_options = [_]command_specs.OptionDoc{json_option};
 
 const login_providers = [_]command_specs.SubcommandDoc{
-    .{ .usage = "vercel", .description = "Vercel AI Gateway (the default)" },
+    .{ .usage = "vercel", .description = "Vercel AI Gateway (the default)", .options = &login_options },
     .{ .usage = "codex", .description = "ChatGPT subscription" },
     .{ .usage = "grok", .description = "Grok subscription" },
 };
@@ -62,10 +62,10 @@ const workspace_subcommands = [_]command_specs.SubcommandDoc{
 };
 
 const config_subcommands = [_]command_specs.SubcommandDoc{
-    .{ .usage = "list", .description = "List the values set in each settings file (default)" },
-    .{ .usage = "get <key>", .description = "Print the value fx uses for a setting" },
-    .{ .usage = "set <key> <value>", .description = "Save a preference in ~/.fx/settings.json" },
-    .{ .usage = "unset <key>", .description = "Remove a preference from ~/.fx/settings.json" },
+    .{ .usage = "list", .description = "List the values set in each settings file (default)", .options = &config_options },
+    .{ .usage = "get <key>", .description = "Print the value fx uses for a setting", .options = &config_options },
+    .{ .usage = "set <key> <value>", .description = "Save a preference in ~/.fx/settings.json", .settable_key = true },
+    .{ .usage = "unset <key>", .description = "Remove a preference from ~/.fx/settings.json", .settable_key = true },
     .{ .usage = "schema", .description = "Print the JSON Schema for ~/.fx/settings.json", .options = &config_schema_options },
 };
 
@@ -207,7 +207,7 @@ pub const ask_options = agentRunOptions("this request", true) ++ [_]command_spec
     // `experimental.sessions_v2` replaces it; it warns until the experiment ends.
     .{ .flag = "--sessions-v2", .description = "Use the experimental v2 session store", .hidden = true },
     .{ .flag = "--no-color", .description = "Render TTY output without colors or hyperlinks; NO_COLOR or TERM=dumb also turns color off" },
-    .{ .flag = "--resume <last|id>", .description = "Continue the last session or a session by id" },
+    .{ .flag = "--resume <last|<id>>", .description = "Continue the last session or a session by id" },
     .{ .flag = "--resume-id <id>", .description = "Continue a session by exact id", .replacement = "use --resume <id>" },
     .{ .flag = "--continue-recovery", .description = "Resume the paused model response in the selected session" },
     .{ .flag = "--", .description = "Treat every following argument as prompt text" },
@@ -224,7 +224,7 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .ask,
         .token = "ask",
-        .usage = "ask " ++ agent_run_usage ++ " [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--timeout <seconds>] [--config <key=value>] [--no-save] [--no-color] [--resume <last|id>] [--continue-recovery] [--] <prompt>",
+        .usage = "ask " ++ agent_run_usage ++ " [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--timeout <seconds>] [--config <key=value>] [--no-save] [--no-color] [--resume <last|<id>>] [--continue-recovery] [--] <prompt>",
         .summary = "Run one noninteractive request",
         .options = &ask_options,
         .details = &.{

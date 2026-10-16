@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const command_specs = @import("../slash_commands/command_specs.zig");
+const cli_config = @import("cli_config.zig");
 const cli_flags = @import("cli_flags.zig");
 const settings_keys = @import("../config/settings_keys.zig");
 
@@ -35,8 +36,12 @@ const Node = struct {
     path: []const u8,
     words: std.ArrayList(Entry) = .empty,
     flags: std.ArrayList(Entry) = .empty,
-    setting_key: bool = false,
+    keys: KeyList = .none,
 };
+
+/// Which setting keys a word's `<key>` takes: every key for `config get`,
+/// only the ones `fx config set` changes for `set` and `unset`.
+const KeyList = enum { none, all, settable };
 
 const ValueList = struct {
     flag: []const u8,
@@ -51,6 +56,12 @@ const Model = struct {
     /// Fixed values by flag. The first list seen for a flag wins.
     values: std.ArrayList(ValueList) = .empty,
     setting_keys: std.ArrayList([]const u8) = .empty,
+    settable_keys: std.ArrayList([]const u8) = .empty,
+
+    fn addSettingKey(self: *Model, arena: Allocator, key: []const u8) !void {
+        try self.setting_keys.append(arena, key);
+        if (cli_config.settable(key)) try self.settable_keys.append(arena, key);
+    }
 
     fn node(self: *Model, arena: Allocator, path: []const u8) !*Node {
         for (self.nodes.items) |*existing| {
@@ -120,13 +131,11 @@ fn addOptions(model: *Model, arena: Allocator, target: *Node, options: []const O
     }
 }
 
-fn addSubcommands(
-    model: *Model,
-    arena: Allocator,
-    parent_path: []const u8,
-    parent_flags: []const Entry,
-    subcommands: []const SubcommandDoc,
-) !void {
+const help_flag: Entry = .{ .name = "--help", .description = "Show help for this command" };
+
+/// A word offers only the flags it declares, plus `--help`: a parent's flags
+/// may not apply, as `--api-key` doesn't after `fx login codex`.
+fn addSubcommands(model: *Model, arena: Allocator, parent_path: []const u8, subcommands: []const SubcommandDoc) !void {
     for (subcommands) |sub| {
         const name = sub.name();
         {
@@ -135,11 +144,10 @@ fn addSubcommands(
         }
         const path = try arena.print("{s} {s}", .{ parent_path, name });
         const child = try model.node(arena, path);
-        for (parent_flags) |flag| try addEntry(arena, &child.flags, flag);
         try addOptions(model, arena, child, sub.options);
-        if (sub.takesSettingKey()) child.setting_key = true;
-        const flags = try arena.dupe(Entry, child.flags.items);
-        try addSubcommands(model, arena, path, flags, sub.subcommands);
+        try addEntry(arena, &child.flags, help_flag);
+        if (sub.takesSettingKey()) child.keys = if (sub.settable_key) .settable else .all;
+        try addSubcommands(model, arena, path, sub.subcommands);
     }
 }
 
@@ -170,7 +178,6 @@ fn addTopLevelFlag(model: *Model, arena: Allocator, root: *Node, flag: command_s
 fn buildModel(arena: Allocator, registry: command_specs.TopLevelRegistry, launch_options: []const OptionDoc) !Model {
     var model: Model = .{};
     _ = try model.node(arena, "");
-    const help_flag: Entry = .{ .name = "--help", .description = "Show help for this command" };
 
     for (registry.specs) |spec| {
         if (spec.hidden_from_top_level_help or spec.replaced_by != null) continue;
@@ -181,8 +188,7 @@ fn buildModel(arena: Allocator, registry: command_specs.TopLevelRegistry, launch
         const command = try model.node(arena, spec.token);
         try addOptions(&model, arena, command, spec.options);
         try addEntry(arena, &command.flags, help_flag);
-        const flags = try arena.dupe(Entry, command.flags.items);
-        try addSubcommands(&model, arena, spec.token, flags, spec.subcommands);
+        try addSubcommands(&model, arena, spec.token, spec.subcommands);
     }
 
     // The launch flags' values, such as `--permission-mode`'s, also complete
@@ -198,11 +204,11 @@ fn buildModel(arena: Allocator, registry: command_specs.TopLevelRegistry, launch
         // editors, are not settings to offer.
         if (key.deprecated() or key.map or key.kind == .refused or key.where == .editor) continue;
         if (key.children.len == 0) {
-            try model.setting_keys.append(arena, key.name);
+            try model.addSettingKey(arena, key.name);
             continue;
         }
         for (key.children) |child| {
-            try model.setting_keys.append(arena, try arena.print("{s}.{s}", .{ key.name, child }));
+            try model.addSettingKey(arena, try arena.print("{s}.{s}", .{ key.name, child }));
         }
     }
     return model;
@@ -290,7 +296,7 @@ fn writeBash(w: *Writer, model: *const Model) !void {
         \\    case "$1" in
         \\        
     );
-    try writeKeyPaths(w, model, true);
+    try writeKeyPaths(w, model, true, .all);
     try w.writeAll(
         \\) return 0 ;;
         \\    esac
@@ -300,6 +306,23 @@ fn writeBash(w: *Writer, model: *const Model) !void {
         \\_fx_keys='
     );
     try writeWords(w, model.setting_keys.items);
+    try w.writeAll(
+        \\'
+        \\
+        \\_fx_takes_settable_key() {
+        \\    case "$1" in
+        \\        
+    );
+    try writeKeyPaths(w, model, true, .settable);
+    try w.writeAll(
+        \\) return 0 ;;
+        \\    esac
+        \\    return 1
+        \\}
+        \\
+        \\_fx_settable_keys='
+    );
+    try writeWords(w, model.settable_keys.items);
     try w.writeAll(
         \\'
         \\
@@ -331,7 +354,9 @@ fn writeBash(w: *Writer, model: *const Model) !void {
         \\        return 0
         \\    fi
         \\    (( extra > 0 )) && return 0
-        \\    if _fx_takes_key "$path"; then
+        \\    if _fx_takes_settable_key "$path"; then
+        \\        COMPREPLY=($(compgen -W "$_fx_settable_keys" -- "$cur"))
+        \\    elif _fx_takes_key "$path"; then
         \\        COMPREPLY=($(compgen -W "$_fx_keys" -- "$cur"))
         \\    else
         \\        COMPREPLY=($(compgen -W "$(_fx_words "$path")" -- "$cur"))
@@ -367,10 +392,20 @@ fn writeAlternatives(w: *Writer, words: []const []const u8, quote: bool) !void {
     }
 }
 
-fn writeKeyPaths(w: *Writer, model: *const Model, quote: bool) !void {
+fn writeFishKeyPaths(w: *Writer, model: *const Model, list: KeyList) !void {
     var first = true;
     for (model.nodes.items) |n| {
-        if (!n.setting_key) continue;
+        if (n.keys != list) continue;
+        if (!first) try w.writeByte(' ');
+        first = false;
+        try w.print("'{s}'", .{n.path});
+    }
+}
+
+fn writeKeyPaths(w: *Writer, model: *const Model, quote: bool, list: KeyList) !void {
+    var first = true;
+    for (model.nodes.items) |n| {
+        if (n.keys != list) continue;
         if (!first) try w.writeByte('|');
         first = false;
         if (quote) try w.print("'{s}'", .{n.path}) else try w.writeAll(n.path);
@@ -444,7 +479,7 @@ fn writeZsh(w: *Writer, model: *const Model) !void {
         \\    case "$1" in
         \\        
     );
-    try writeKeyPaths(w, model, true);
+    try writeKeyPaths(w, model, true, .all);
     try w.writeAll(
         \\) return 0 ;;
         \\    esac
@@ -454,6 +489,23 @@ fn writeZsh(w: *Writer, model: *const Model) !void {
         \\_fx_keys=(
     );
     try writeWords(w, model.setting_keys.items);
+    try w.writeAll(
+        \\)
+        \\
+        \\_fx_takes_settable_key() {
+        \\    case "$1" in
+        \\        
+    );
+    try writeKeyPaths(w, model, true, .settable);
+    try w.writeAll(
+        \\) return 0 ;;
+        \\    esac
+        \\    return 1
+        \\}
+        \\
+        \\_fx_settable_keys=(
+    );
+    try writeWords(w, model.settable_keys.items);
     try w.writeAll(
         \\)
         \\
@@ -486,6 +538,7 @@ fn writeZsh(w: *Writer, model: *const Model) !void {
         \\        return
         \\    fi
         \\    if (( extra > 0 )); then _files; return; fi
+        \\    if _fx_takes_settable_key "$path"; then compadd -a _fx_settable_keys; return; fi
         \\    if _fx_takes_key "$path"; then compadd -a _fx_keys; return; fi
         \\    _fx_words "$path"
         \\    if (( ${#reply} )); then _describe -t commands 'fx command' reply; else _files; fi
@@ -573,13 +626,7 @@ fn writeFish(w: *Writer, model: *const Model) !void {
         \\function __fx_takes_key
         \\    contains -- $argv[1] 
     );
-    var first = true;
-    for (model.nodes.items) |n| {
-        if (!n.setting_key) continue;
-        if (!first) try w.writeByte(' ');
-        first = false;
-        try w.print("'{s}'", .{n.path});
-    }
+    try writeFishKeyPaths(w, model, .all);
     try w.writeAll(
         \\
         \\end
@@ -587,6 +634,20 @@ fn writeFish(w: *Writer, model: *const Model) !void {
         \\set -g __fx_keys 
     );
     try writeWords(w, model.setting_keys.items);
+    try w.writeAll(
+        \\
+        \\
+        \\function __fx_takes_settable_key
+        \\    contains -- $argv[1] 
+    );
+    try writeFishKeyPaths(w, model, .settable);
+    try w.writeAll(
+        \\
+        \\end
+        \\
+        \\set -g __fx_settable_keys 
+    );
+    try writeWords(w, model.settable_keys.items);
     try w.writeAll(
         \\
         \\
@@ -637,6 +698,10 @@ fn writeFish(w: *Writer, model: *const Model) !void {
         \\    end
         \\    if test $extra -gt 0
         \\        __fish_complete_path $cur
+        \\        return
+        \\    end
+        \\    if __fx_takes_settable_key "$path"
+        \\        printf '%s\n' $__fx_settable_keys
         \\        return
         \\    end
         \\    if __fx_takes_key "$path"
@@ -731,14 +796,18 @@ test "the model follows subcommands, keeps parent flags, and marks setting-key p
         if (std.mem.eql(u8, n.path, "config get")) get = n;
         if (std.mem.eql(u8, n.path, "config trust reset")) reset = n;
     }
-    try std.testing.expect(get.?.setting_key);
-    try std.testing.expectEqualStrings("--global", get.?.flags.items[0].name);
-    try std.testing.expectEqualStrings("--global", reset.?.flags.items[0].name);
+    try std.testing.expectEqual(KeyList.all, get.?.keys);
+    // A word offers its own flags and --help, not its parent's.
+    try std.testing.expectEqual(@as(usize, 1), get.?.flags.items.len);
+    try std.testing.expectEqualStrings("--help", reset.?.flags.items[0].name);
     try std.testing.expect(contains(model.value_flags.items, "--permission-mode"));
     try std.testing.expectEqualStrings("auto", model.values.items[0].values[1]);
     try std.testing.expect(contains(model.setting_keys.items, "status_line.context"));
     try std.testing.expect(!contains(model.setting_keys.items, "notifications.turn_end"));
     try std.testing.expect(!contains(model.setting_keys.items, "models"));
+    try std.testing.expect(contains(model.settable_keys.items, "fast_mode"));
+    try std.testing.expect(contains(model.setting_keys.items, "permission_mode"));
+    try std.testing.expect(!contains(model.settable_keys.items, "permission_mode"));
 }
 
 test "descriptions are quoted for each shell" {

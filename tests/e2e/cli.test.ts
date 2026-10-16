@@ -409,7 +409,7 @@ describe("cli: help", () => {
 Run one noninteractive request
 
 Usage:
-  fx ask [--permission-mode <mode>|--ask|--auto|--full-access] [--provider <name>] [--model <id>] [--effort <level>] [--fast|--no-fast] [--ultrafast|--no-ultrafast] [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--timeout <seconds>] [--config <key=value>] [--no-save] [--no-color] [--resume <last|id>] [--continue-recovery] [--] <prompt>
+  fx ask [--permission-mode <mode>|--ask|--auto|--full-access] [--provider <name>] [--model <id>] [--effort <level>] [--fast|--no-fast] [--ultrafast|--no-ultrafast] [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--timeout <seconds>] [--config <key=value>] [--no-save] [--no-color] [--resume <last|<id>>] [--continue-recovery] [--] <prompt>
 
 Options:
   --permission-mode <mode>    Set the permission mode for this request: ask, auto, or full-access
@@ -436,7 +436,7 @@ Options:
   --config <key=value>        Override a setting for this request, with the keys fx config set takes; repeatable
   --no-save                   Do not save the session; incompatible with --resume
   --no-color                  Render TTY output without colors or hyperlinks; NO_COLOR or TERM=dumb also turns color off
-  --resume <last|id>          Continue the last session or a session by id
+  --resume <last|<id>>        Continue the last session or a session by id
   --continue-recovery         Resume the paused model response in the selected session
   --                          Treat every following argument as prompt text
 
