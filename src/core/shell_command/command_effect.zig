@@ -791,8 +791,9 @@ fn planGit(
     // A network command can start a program the repository's config names:
     // `remote.<name>.uploadpack`, `core.sshCommand`, `credential.helper` and
     // `core.gitProxy`. `-c` cannot turn those off without also disabling the
-    // user's own ssh and credential configuration, so fx does not run a fetch
-    // on its own.
+    // user's own ssh and credential configuration, and git keeps a
+    // repository's `uploadpack` over the agent environment's, so fx does not
+    // run a fetch on its own.
     if (std.mem.eql(u8, subcommand, "fetch")) return .{ .approval_required = .unsafe_git };
 
     const planned: safe_git.Subcommand = if (std.mem.eql(u8, subcommand, "status"))
@@ -817,6 +818,14 @@ fn planGit(
         .show => planGitShow(alloc, ready, words[2..]),
         .branch, .rev_parse => unreachable,
     };
+}
+
+/// A shape safe git cannot express goes to review like any other command. It
+/// then runs in the shell, where `safe_git.appendAgentEnvironment` turns off
+/// the programs the repository's config names for every git it starts. git
+/// older than 2.31 ignores that environment, so there the shape is held.
+fn unsupportedGitShape(ready: safe_git.Ready) StageAdmission {
+    return .{ .approval_required = if (ready.honors_config_environment) .unsupported_argument else .unsafe_git };
 }
 
 fn directGit(ready: safe_git.Ready, argv: []const []const u8) StageAdmission {
@@ -852,9 +861,7 @@ fn planGitStatus(
             std.mem.eql(u8, argument, "--untracked-files=all"))
             argument
         else
-            // fx cannot express this shape, and plain git could start a
-            // program the repository's config names, so it does not run.
-            return .{ .approval_required = .unsafe_git };
+            return unsupportedGitShape(ready);
         try argv.append(alloc, canonical);
     }
     return directGit(ready, try argv.toOwnedSlice(alloc));
@@ -882,13 +889,13 @@ fn planGitDiff(
             std.mem.eql(u8, argument, "--check") or
             std.mem.eql(u8, argument, "--no-renames")))
         {
-            return .{ .approval_required = .unsafe_git };
+            return unsupportedGitShape(ready);
         }
         try argv.append(alloc, argument);
     }
     const operands = if (index < arguments.len) arguments[index + 1 ..] else &.{};
     if (operands.len > max_git_pathspecs) {
-        return .{ .approval_required = .unsafe_git };
+        return unsupportedGitShape(ready);
     }
     try argv.append(alloc, "--");
     try argv.appendSlice(alloc, operands);
@@ -909,7 +916,7 @@ fn planGitLog(
         const argument = arguments[index];
         if (std.mem.eql(u8, argument, "-n")) {
             if (index + 1 >= arguments.len or !boundedDecimal(arguments[index + 1], max_git_log_count)) {
-                return .{ .approval_required = .unsafe_git };
+                return unsupportedGitShape(ready);
             }
             try argv.appendSlice(alloc, arguments[index .. index + 2]);
             index += 1;
@@ -917,7 +924,7 @@ fn planGitLog(
         }
         if (std.mem.startsWith(u8, argument, "--max-count=")) {
             if (!boundedDecimal(argument["--max-count=".len..], max_git_log_count)) {
-                return .{ .approval_required = .unsafe_git };
+                return unsupportedGitShape(ready);
             }
             try argv.append(alloc, argument);
             continue;
@@ -932,13 +939,13 @@ fn planGitLog(
             std.mem.eql(u8, argument, "--decorate=short") or
             std.mem.eql(u8, argument, "--decorate=no")))
         {
-            return .{ .approval_required = .unsafe_git };
+            return unsupportedGitShape(ready);
         }
         try argv.append(alloc, argument);
     }
     const operands = if (index < arguments.len) arguments[index + 1 ..] else &.{};
     if (operands.len > max_git_pathspecs) {
-        return .{ .approval_required = .unsafe_git };
+        return unsupportedGitShape(ready);
     }
     try argv.append(alloc, "--");
     try argv.appendSlice(alloc, operands);
@@ -974,7 +981,7 @@ fn planGitShow(
             continue;
         }
         if (!isGitRevision(argument) or revisions == max_git_show_revisions) {
-            return .{ .approval_required = .unsafe_git };
+            return unsupportedGitShape(ready);
         }
         try argv.append(alloc, argument);
         revisions += 1;
@@ -1319,14 +1326,14 @@ test "planner returns stable reasons for approval-bearing forms" {
         .{ .command = "git -C other status", .reason = .command_owned_input },
         .{ .command = "git push origin HEAD", .reason = .command_owned_input },
         .{ .command = "git fetch origin", .reason = .unsafe_git },
-        .{ .command = "git status --porcelain=v3", .reason = .unsafe_git },
-        .{ .command = "git status --short -- src", .reason = .unsafe_git },
-        .{ .command = "git diff --ext-diff", .reason = .unsafe_git },
-        .{ .command = "git diff HEAD", .reason = .unsafe_git },
-        .{ .command = "git log -p", .reason = .unsafe_git },
-        .{ .command = "git log -n 1001", .reason = .unsafe_git },
-        .{ .command = "git log --format='%x00'", .reason = .unsafe_git },
-        .{ .command = "git show --format=%H", .reason = .unsafe_git },
+        .{ .command = "git status --porcelain=v3", .reason = .unsupported_argument },
+        .{ .command = "git status --short -- src", .reason = .unsupported_argument },
+        .{ .command = "git diff --ext-diff", .reason = .unsupported_argument },
+        .{ .command = "git diff HEAD", .reason = .unsupported_argument },
+        .{ .command = "git log -p", .reason = .unsupported_argument },
+        .{ .command = "git log -n 1001", .reason = .unsupported_argument },
+        .{ .command = "git log --format='%x00'", .reason = .unsupported_argument },
+        .{ .command = "git show --format=%H", .reason = .unsupported_argument },
         .{ .command = "cat -n README.md", .reason = .unsupported_argument },
         .{ .command = "cat README.md", .reason = .unsupported_argument },
         .{ .command = "cat /tmp/.ssh/id_ed25519", .reason = .unsupported_argument },
@@ -1493,10 +1500,19 @@ test "planner blanks repository filters and falls back to review when safe git r
     }
     // Subcommands that are never auto-run keep their own reason.
     try expectApprovalWithGit("git push origin HEAD", false, .linux, .command_owned_input, refused);
-    // An inspection shape safe git cannot express is refused rather than
-    // handed to plain git.
-    try expectApprovalWithGit("git status --porcelain=v3", false, .linux, .unsafe_git, test_git);
+    // An inspection shape safe git cannot express goes to review, and runs
+    // under the agent environment; a fetch never runs on fx's own authority.
+    try expectApprovalWithGit("git status --porcelain=v3", false, .linux, .unsupported_argument, test_git);
     try expectApprovalWithGit("git fetch origin", false, .linux, .unsafe_git, test_git);
+    // git older than 2.31 ignores the agent environment, so the shape is held.
+    const old_git: GitSource = .{ .fixed = .{ .ready = .{
+        .executable = "/usr/bin/git",
+        .filter_names = &.{},
+        .no_lazy_fetch = false,
+        .honors_config_environment = false,
+    } } };
+    try expectApprovalWithGit("git status --porcelain=v3", false, .linux, .unsafe_git, old_git);
+    try expectApprovalWithGit("git diff HEAD", false, .linux, .unsafe_git, old_git);
 }
 
 test "planner pins git show to hardened argv and revision operands" {
@@ -1526,9 +1542,10 @@ test "planner pins git show to hardened argv and revision operands" {
         "HEAD",
     }, stage.argv);
 
-    // A revision that carries a path or a format string is not a shape fx runs.
-    try expectApprovalWithGit("git show HEAD:src/main.zig", false, .linux, .unsafe_git, test_git);
-    try expectApprovalWithGit("git show --format=%H", false, .linux, .unsafe_git, test_git);
+    // A revision that carries a path or a format string is not a shape fx runs
+    // directly, so it goes to review.
+    try expectApprovalWithGit("git show HEAD:src/main.zig", false, .linux, .unsupported_argument, test_git);
+    try expectApprovalWithGit("git show --format=%H", false, .linux, .unsupported_argument, test_git);
 }
 
 test "planner limits bounded readers to pipeline input" {

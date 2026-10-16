@@ -46,9 +46,9 @@ pub const loadSnapshot = snapshot_mod.load;
 /// Saves trees atomically to the absolute path; an all-empty save deletes it.
 pub const saveSnapshot = snapshot_mod.save;
 
-/// What a repository's own config lets it ask git to start: the filter drivers
-/// with a program, and whether a remote is a promisor whose transport git
-/// starts when an object is missing.
+/// What a repository's own config lets it ask git to start: the filter and diff
+/// drivers with a program, the signature verifiers it names, and whether a
+/// remote is a promisor whose transport git starts when an object is missing.
 pub const RepoPrograms = struct {
     /// Absolute git directory of the repository containing the root, found
     /// the way git discovers one, or null outside a repository.
@@ -58,19 +58,57 @@ pub const RepoPrograms = struct {
     /// The config marks a remote as a promisor, so git fetches a missing
     /// object from it on demand.
     promisor: bool,
+    /// The config names a program git starts to reach a remote: an
+    /// `uploadpack`, `receivepack`, ssh command, proxy, credential helper or
+    /// protocol allowance.
+    transport_program: bool = false,
+    /// Diff driver names with a `textconv` program.
+    textconv_driver_names: []const []const u8 = &.{},
+    /// Diff driver names with an external diff `command`.
+    diff_command_driver_names: []const []const u8 = &.{},
+    /// Whether the config names `diff.external`.
+    external_diff: bool = false,
+    /// Whether the config sets `format.pretty`, which can ask for a signature
+    /// check.
+    format_pretty: bool = false,
+    /// Full keys of the signature verifiers the config names, such as
+    /// `gpg.program` or `gpg.ssh.program`.
+    gpg_program_keys: []const []const u8 = &.{},
 
     /// Frees memory owned by the allocator passed to `repoPrograms`.
     pub fn deinit(self: RepoPrograms, alloc: Allocator) void {
         if (self.git_dir) |git_dir| alloc.free(git_dir);
-        for (self.names) |name| alloc.free(name);
-        alloc.free(self.names);
+        freeNames(alloc, self.names);
+        freeNames(alloc, self.textconv_driver_names);
+        freeNames(alloc, self.diff_command_driver_names);
+        freeNames(alloc, self.gpg_program_keys);
     }
 };
 
+fn freeNames(alloc: Allocator, names: []const []const u8) void {
+    for (names) |name| alloc.free(name);
+    alloc.free(names);
+}
+
+/// Copies `names` into memory owned by `alloc`.
+fn dupeNames(alloc: Allocator, names: []const []const u8) Allocator.Error![]const []const u8 {
+    const owned = try alloc.alloc([]const u8, names.len);
+    var copied: usize = 0;
+    errdefer {
+        for (owned[0..copied]) |name| alloc.free(name);
+        alloc.free(owned);
+    }
+    for (names) |name| {
+        owned[copied] = try alloc.dupe(u8, name);
+        copied += 1;
+    }
+    return owned;
+}
+
 pub const RepoProgramsError = error{ OutOfMemory, RepoConfigUnavailable };
 
-/// Finds the repository containing the absolute `workspace_root`, every filter
-/// driver its own config defines, and whether a remote is a promisor:
+/// Finds the repository containing the absolute `workspace_root`, the drivers
+/// and verifiers its own config names, and whether a remote is a promisor:
 /// `config`, `config.worktree` and the files they include, counting every
 /// `includeIf` as included so no condition can hide a driver. A repository
 /// config file that cannot be read within bounds, a malformed one, or an
@@ -97,23 +135,25 @@ pub fn repoPrograms(alloc: Allocator, workspace_root: []const u8) RepoProgramsEr
         return error.RepoConfigUnavailable;
     }
 
-    const names = try git_config.filterDriverNames(arena, loaded);
     const git_dir: ?[]const u8 = if (found) |repository| try alloc.dupe(u8, repository.git_dir) else null;
     errdefer if (git_dir) |path| alloc.free(path);
-    const owned = try alloc.alloc([]const u8, names.len);
-    var copied: usize = 0;
-    errdefer {
-        for (owned[0..copied]) |name| alloc.free(name);
-        alloc.free(owned);
-    }
-    for (names) |name| {
-        owned[copied] = try alloc.dupe(u8, name);
-        copied += 1;
-    }
+    const names = try dupeNames(alloc, try git_config.filterDriverNames(arena, loaded));
+    errdefer freeNames(alloc, names);
+    const textconv_driver_names = try dupeNames(alloc, try git_config.textconvDriverNames(arena, loaded));
+    errdefer freeNames(alloc, textconv_driver_names);
+    const diff_command_driver_names = try dupeNames(alloc, try git_config.diffCommandDriverNames(arena, loaded));
+    errdefer freeNames(alloc, diff_command_driver_names);
+    const gpg_program_keys = try dupeNames(alloc, try git_config.gpgProgramKeys(arena, loaded));
     return .{
         .git_dir = git_dir,
-        .names = owned,
+        .names = names,
         .promisor = git_config.usesPromisorRemote(loaded),
+        .transport_program = git_config.namesTransportProgram(loaded),
+        .textconv_driver_names = textconv_driver_names,
+        .diff_command_driver_names = diff_command_driver_names,
+        .external_diff = git_config.namesExternalDiff(loaded),
+        .format_pretty = git_config.setsFormatPretty(loaded),
+        .gpg_program_keys = gpg_program_keys,
     };
 }
 

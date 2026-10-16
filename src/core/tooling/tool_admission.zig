@@ -2117,9 +2117,9 @@ fn defaultRunCommandPermissionOutcome(
             .decision = .once,
             .execution_authority = .{ .run_command = .{ .direct_only = fingerprint } },
         },
-        // Review cannot see a repository's git config, and the routine-command
-        // rule would run plain git, so an automatic git command that fx could
-        // not make safe does not run at all.
+        // Review cannot see a repository's git config, so an automatic git
+        // command that neither safe git nor the agent environment can make
+        // safe, such as a fetch, does not run at all.
         .approval_required => |reason| if (reason == .unsafe_git and permission_mode == .auto)
             .{ .tool_failure = unsafe_git_hold_output }
         else
@@ -5799,25 +5799,40 @@ test "known reversible auto commands bypass the reviewer" {
     }
     try std.testing.expectEqual(@as(usize, 0), fake.calls);
 
-    // No git command reaches the routine-command rule. Safe git runs the
-    // shapes it can and holds the rest, so plain git never starts and the
-    // reviewer is never asked about a repository's config it cannot read.
-    for ([_][]const u8{ "git fetch origin main", "git log --graph -n 5" }) |command| {
-        const arguments = try arena_state.allocator().print(
-            "{{\"action\":\"run\",\"command\":{f}}}",
-            .{std.json.fmt(command, .{})},
-        );
-        const held = try requestPermissionOutcome(
-            input,
-            arena_state.allocator(),
-            .{ .id = "held-git", .name = "shell", .arguments_json = arguments },
-            .auto,
-            &.{},
-        );
-        try std.testing.expect(held.execution_authority == null);
-        try std.testing.expectEqualStrings(unsafe_git_hold_output, held.tool_failure.?);
-    }
+    // No git command reaches the routine-command rule, and a fetch never runs
+    // on fx's own authority.
+    const fetch = try requestPermissionOutcome(
+        input,
+        arena_state.allocator(),
+        .{ .id = "held-git", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"git fetch origin main\"}" },
+        .auto,
+        &.{},
+    );
+    try std.testing.expect(fetch.execution_authority == null);
+    try std.testing.expectEqualStrings(unsafe_git_hold_output, fetch.tool_failure.?);
     try std.testing.expectEqual(@as(usize, 0), fake.calls);
+
+    // A shape safe git cannot express goes to review and then runs under the
+    // agent environment. A host whose git fx cannot use, or whose git ignores
+    // that environment, holds it instead.
+    const graph = try requestPermissionOutcome(
+        input,
+        arena_state.allocator(),
+        .{ .id = "reviewed-git", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"git log --graph -n 5\"}" },
+        .auto,
+        &.{},
+    );
+    if (graph.execution_authority) |authority| {
+        try std.testing.expectEqual(
+            command_admission.ShellAuthorizationSource.auto_classifier,
+            authority.run_command.shell_allowed.source,
+        );
+        try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    } else {
+        try std.testing.expectEqualStrings(unsafe_git_hold_output, graph.tool_failure.?);
+        try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    }
+    const calls_before_tty = fake.calls;
 
     const tty = try requestPermissionOutcome(
         input,
@@ -5830,7 +5845,7 @@ test "known reversible auto commands bypass the reviewer" {
         .auto,
         &.{},
     );
-    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expectEqual(calls_before_tty + 1, fake.calls);
     try std.testing.expectEqual(
         command_admission.ShellAuthorizationSource.auto_classifier,
         tty.execution_authority.?.run_command.shell_allowed.source,

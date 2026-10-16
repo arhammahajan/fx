@@ -334,9 +334,14 @@ describe("poisoned repository", () => {
       // only what fx did.
       writeFileSync(fixture.log, "");
 
+      // Written another way, the same inspection goes to review and runs in
+      // the shell, where the agent environment stops the lazy fetch.
       const gateway = startFakeGateway([
         fakeGatewayToolCall("show", "shell", {
           request: { action: "run", command: "git show HEAD", yield_time_ms: 30_000 },
+        }),
+        fakeGatewayToolCall("show-reworded", "shell", {
+          request: { action: "run", command: "cd notes && git show HEAD", yield_time_ms: 30_000 },
         }),
         fakeGatewayFinalText("inspection complete"),
       ], { classifierResponses: [] });
@@ -348,7 +353,7 @@ describe("poisoned repository", () => {
       );
       expect(result.code, result.stderr).toBe(0);
       expect(sentinelRuns(fixture)).toEqual([]);
-      expect(gateway.classifierRequests).toHaveLength(0);
+      expect(gateway.classifierRequests).toHaveLength(1);
     },
     TIMEOUT,
   );
@@ -414,9 +419,18 @@ describe("poisoned repository", () => {
       expect(verifierRuns().length).toBeGreaterThan(0);
 
       rmSync(verifierLog, { force: true });
+      // Written another way, or with a format that asks for the check itself,
+      // the inspection goes to review and runs in the shell, where the agent
+      // environment sets the format aside and empties the verifier.
       const gateway = startFakeGateway([
         fakeGatewayToolCall("show", "shell", {
           request: { action: "run", command: `git show ${signed}`, yield_time_ms: 30_000 },
+        }),
+        fakeGatewayToolCall("show-reworded", "shell", {
+          request: { action: "run", command: `cd notes && git show ${signed}`, yield_time_ms: 30_000 },
+        }),
+        fakeGatewayToolCall("log-signature", "shell", {
+          request: { action: "run", command: `git log -1 --format='%G? %s' ${signed}`, yield_time_ms: 30_000 },
         }),
         fakeGatewayFinalText("inspection complete"),
       ], { classifierResponses: [] });
@@ -429,7 +443,53 @@ describe("poisoned repository", () => {
       expect(result.code, result.stderr).toBe(0);
       expect(verifierRuns()).toEqual([]);
       expect(sentinelRuns(fixture)).toEqual([]);
-      expect(gateway.classifierRequests).toHaveLength(0);
+      expect(gateway.classifierRequests).toHaveLength(2);
+      const last = gateway.requests[gateway.requests.length - 1]!.body;
+      expect(toolResult(last, "show-reworded")).toContain("signed-looking commit");
+      expect(toolResult(last, "log-signature")).toContain("signed-looking commit");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "git written another way, or in a terminal session, runs no repository program",
+    async () => {
+      const fixture = poisonedRepository();
+      // None of these is a shape safe git runs directly, so each goes to
+      // review and then runs in the shell, where the agent environment turns
+      // off the repository's programs for every git it starts.
+      const run = (id: string, command: string, extra: Record<string, unknown> = {}) =>
+        fakeGatewayToolCall(id, "shell", {
+          request: { action: "run", command, yield_time_ms: 30_000, ...extra },
+        });
+      const gateway = startFakeGateway([
+        run("cd-status", "cd notes && git status --short"),
+        run("dash-c-status", "git -C notes status --short"),
+        run("chain", "git status --short && git diff --stat"),
+        run("log-patch", "git log -p -n 1"),
+        run("blame", "git blame alpha-tracked.txt"),
+        run("tty-status", "git status --short", { tty: true }),
+        fakeGatewayFinalText("inspection complete"),
+      ]);
+      gateways.push(gateway);
+
+      // A terminal session needs a saved session; HOME is the fixture's own.
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "Inspect the repository."],
+        { cwd: fixture.workspace, env: fxEnv(fixture, gateway), timeoutMs: TIMEOUT },
+      );
+      expect(result.code, result.stderr).toBe(0);
+      expect(result.stderr).not.toMatch(/panic|error/i);
+      expect(sentinelRuns(fixture)).toEqual([]);
+      expect(gateway.classifierRequests).toHaveLength(6);
+
+      const last = gateway.requests[gateway.requests.length - 1]!.body;
+      expect(toolResult(last, "cd-status")).toContain("alpha-tracked.txt");
+      expect(toolResult(last, "dash-c-status")).toContain("alpha-tracked.txt");
+      expect(toolResult(last, "chain")).toContain("alpha-tracked.txt");
+      expect(toolResult(last, "log-patch")).toContain("+needle tracked one");
+      expect(toolResult(last, "blame")).toContain("needle tracked two");
+      expect(toolResult(last, "tty-status")).toContain("alpha-tracked.txt");
     },
     TIMEOUT,
   );

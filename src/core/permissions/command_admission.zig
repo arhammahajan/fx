@@ -132,10 +132,12 @@ pub fn defaultForRunCommand(
     // A repository's own config can name programs git starts for even its
     // read-only subcommands, so in `auto` mode every non-interactive git
     // command is planned through safe git before the shell profile is
-    // considered. The plan either runs the command with those programs turned
-    // off or refuses it with `.unsafe_git`, which the caller holds instead of
-    // running plain git. `ask` mode keeps the ordinary prompt, because a person
-    // decides there.
+    // considered. The plan runs a shape it can express with those programs
+    // turned off, sends any other shape to review, and refuses a fetch or a
+    // repository safe git cannot read with `.unsafe_git`, which the caller
+    // holds. A reviewed command runs in the shell under the agent environment
+    // from `safe_git.appendAgentEnvironment`. `ask` mode keeps the ordinary
+    // prompt, because a person decides there.
     if (permission_mode == .auto and
         command_ctx.execution_mode != .tty and
         command_effect.isGitCommand(command_ctx.command))
