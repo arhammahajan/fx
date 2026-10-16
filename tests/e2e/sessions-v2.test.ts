@@ -342,7 +342,7 @@ test("the deprecated flag and env var still turn v2 on with one warning, and --n
     fakeGatewayFinalText("ENV_VAR"),
     fakeGatewayFinalText("NOT_SAVED"),
   ]);
-  const flagWarning = "fx: --sessions-v2 is deprecated; use fx config set experimental.sessions_v2 true\n";
+  const flagWarning = "fx: --sessions-v2 is deprecated and stops working in fx 0.0.17; use fx config set experimental.sessions_v2 true\n";
   try {
     const before = await runFx(["--sessions-v2", "ask", "--json", "--auto", "Flag before ask."], {
       cwd: fixture.workspace,
@@ -366,7 +366,7 @@ test("the deprecated flag and env var still turn v2 on with one warning, and --n
       timeoutMs: TIMEOUT,
     });
     expect(byEnv.code).toBe(0);
-    expect(byEnv.stderr).toBe("fx: FX_SESSIONS_V2 is deprecated; use fx config set experimental.sessions_v2 true\n");
+    expect(byEnv.stderr).toBe("fx: FX_SESSIONS_V2 is deprecated and stops working in fx 0.0.17; use fx config set experimental.sessions_v2 true\n");
     const env_id = JSON.parse(byEnv.stdout).session_id;
     expect(existsSync(join(v2Root(fixture), env_id, "log.jsonl"))).toBe(true);
     expectNoV1Sessions(fixture);

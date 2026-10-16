@@ -243,7 +243,10 @@ describe("fx mcp on MCP-v2", () => {
     expect(JSON.parse(readFileSync(root.profilePath, "utf8"))).toEqual({ mcpServers: {}, other: 1 });
     const profile = await mcp(root, "remove", "--profile", "twin");
     expect(profile.code).toBe(1);
-    expect(profile.stderr).toBe("No MCP server named twin in ~/.fx/mcp.json.\n");
+    // The older --profile still names the profile file, with a warning.
+    expect(profile.stderr).toBe(
+      "fx mcp remove: --profile is deprecated and stops working in fx 0.0.17; use --global\nNo MCP server named twin in ~/.fx/mcp.json.\n",
+    );
   });
 
   test("approve and reject say exactly what they trust", async () => {

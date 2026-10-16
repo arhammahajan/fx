@@ -1,4 +1,5 @@
 const std = @import("std");
+const command_specs = @import("../slash_commands/command_specs.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const std_builtin = @import("builtin");
 const command_admission = @import("../permissions/command_admission.zig");
@@ -358,7 +359,7 @@ const ResumeTarget = session_store.ResumeTarget;
 
 /// `--sessions-v2` still works until the experiment ends, with this warning
 /// once per run.
-pub const sessions_v2_flag_warning = "fx: --sessions-v2 is deprecated; use fx config set experimental.sessions_v2 true\n";
+pub const sessions_v2_flag_warning = "fx: --sessions-v2 " ++ command_specs.deprecated_until ++ "; use fx config set experimental.sessions_v2 true\n";
 
 const AskOptions = struct {
     prompt: []u8,

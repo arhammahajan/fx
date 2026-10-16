@@ -2,6 +2,7 @@
 //! `fx config`.
 
 const std = @import("std");
+const command_specs = @import("../slash_commands/command_specs.zig");
 const cli_flags = @import("cli_flags.zig");
 const settings_keys = @import("../config/settings_keys.zig");
 
@@ -39,13 +40,30 @@ pub fn formatUnknownSetting(alloc: Allocator, key: settings_keys.UnknownKey, dis
 /// `statusLine and status_line are both set in ~/.fx/settings.json; fx uses
 /// status_line where they differ, so remove statusLine`. Caller owns the
 /// result.
-pub fn formatRenamedTwice(alloc: Allocator, twice: settings_keys.RenamedTwice, display_path: []const u8) ![]u8 {
+pub fn formatOlderName(alloc: Allocator, twice: settings_keys.OlderName, display_path: []const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     const writer = &out.writer;
-    try writer.print("{s} and {s} are both set in {s}", .{ twice.older, twice.current, display_path });
-    if (twice.workspace) |workspace| try writer.print(" for workspace {s}", .{workspace});
-    try writer.print("; fx uses {s} where they differ, so remove {s}", .{ twice.current, twice.older });
+    if (twice.both) {
+        try writer.print("{s} and {s} are both set in {s}", .{ twice.older, twice.current, display_path });
+        if (twice.workspace) |workspace| try writer.print(" for workspace {s}", .{workspace});
+        try writer.print("; fx uses {s} where they differ, so remove {s}", .{ twice.current, twice.older });
+    } else {
+        try writer.print("{s} in {s}", .{ twice.older, display_path });
+        if (twice.workspace) |workspace| try writer.print(" for workspace {s}", .{workspace});
+        try writer.print(" " ++ command_specs.deprecated_until ++ "; rename it to {s}", .{twice.current});
+    }
+    return out.toOwnedSlice();
+}
+
+/// `permission_mode yolo in ~/.fx/settings.json is deprecated and stops
+/// working in fx 0.0.17; use full-access`. Caller owns the result.
+pub fn formatOldYolo(alloc: Allocator, workspace: ?[]const u8, display_path: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try out.writer.print("permission_mode yolo in {s}", .{display_path});
+    if (workspace) |name| try out.writer.print(" for workspace {s}", .{name});
+    try out.writer.writeAll(" " ++ command_specs.deprecated_until ++ "; use full-access");
     return out.toOwnedSlice();
 }
 
@@ -100,12 +118,22 @@ test "unknown settings name the file, the workspace, and the closest key" {
 
 test "a setting under both its older and its current name names the one to remove" {
     const alloc = std.testing.allocator;
-    const top = try formatRenamedTwice(alloc, .{ .older = "statusLine", .current = "status_line" }, "~/.fx/settings.json");
+    const top = try formatOlderName(alloc, .{ .older = "statusLine", .current = "status_line" }, "~/.fx/settings.json");
     defer alloc.free(top);
     try std.testing.expectEqualStrings("statusLine and status_line are both set in ~/.fx/settings.json; fx uses status_line where they differ, so remove statusLine", top);
-    const workspace = try formatRenamedTwice(alloc, .{ .older = "notifications", .current = "sound", .workspace = "/w" }, "~/.fx/settings.json");
+    const workspace = try formatOlderName(alloc, .{ .older = "notifications", .current = "sound", .workspace = "/w" }, "~/.fx/settings.json");
     defer alloc.free(workspace);
     try std.testing.expectEqualStrings("notifications and sound are both set in ~/.fx/settings.json for workspace /w; fx uses sound where they differ, so remove notifications", workspace);
+}
+
+test "an older setting name or a saved yolo names the release that drops it" {
+    const alloc = std.testing.allocator;
+    const older = try formatOlderName(alloc, .{ .older = "statusLine", .current = "status_line", .both = false }, "~/.fx/settings.json");
+    defer alloc.free(older);
+    try std.testing.expectEqualStrings("statusLine in ~/.fx/settings.json is deprecated and stops working in fx 0.0.17; rename it to status_line", older);
+    const yolo = try formatOldYolo(alloc, "/w", "~/.fx/settings.json");
+    defer alloc.free(yolo);
+    try std.testing.expectEqualStrings("permission_mode yolo in ~/.fx/settings.json for workspace /w is deprecated and stops working in fx 0.0.17; use full-access", yolo);
 }
 
 test "a mistyped key on the command line gets the closest known key" {

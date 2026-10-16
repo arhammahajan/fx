@@ -192,9 +192,11 @@ pub fn currentPath(path: []const u8) []const u8 {
 
 pub const File = enum { profile, project };
 
-pub const RenamedTwice = struct {
+pub const OlderName = struct {
     older: []const u8,
     current: []const u8,
+    /// Whether the current name is set beside it.
+    both: bool = true,
     /// The workspace override holding both, borrowed from the parsed
     /// settings, or null at the top level.
     workspace: ?[]const u8 = null,
@@ -204,18 +206,18 @@ pub const RenamedTwice = struct {
 /// their current name, where the current one wins. A profile `settings.json`
 /// is also checked inside each `workspaces` override. Caller owns the
 /// returned slice; its strings borrow from `root` and the list.
-pub fn findRenamedTwice(alloc: Allocator, root: std.json.Value, file: File) ![]RenamedTwice {
-    var found: std.ArrayList(RenamedTwice) = .empty;
+pub fn findOlderNames(alloc: Allocator, root: std.json.Value, file: File) ![]OlderName {
+    var found: std.ArrayList(OlderName) = .empty;
     errdefer found.deinit(alloc);
     if (root != .object) return found.toOwnedSlice(alloc);
-    try appendRenamedTwice(alloc, &found, root.object, null);
+    try appendOlderNames(alloc, &found, root.object, null);
     if (file == .profile) {
         if (root.object.get("workspaces")) |workspaces| {
             if (workspaces == .object) {
                 var iterator = workspaces.object.iterator();
                 while (iterator.next()) |entry| {
                     if (entry.value_ptr.* != .object) continue;
-                    try appendRenamedTwice(alloc, &found, entry.value_ptr.object, entry.key_ptr.*);
+                    try appendOlderNames(alloc, &found, entry.value_ptr.object, entry.key_ptr.*);
                 }
             }
         }
@@ -223,11 +225,14 @@ pub fn findRenamedTwice(alloc: Allocator, root: std.json.Value, file: File) ![]R
     return found.toOwnedSlice(alloc);
 }
 
-fn appendRenamedTwice(alloc: Allocator, found: *std.ArrayList(RenamedTwice), object: std.json.ObjectMap, workspace: ?[]const u8) !void {
+fn appendOlderNames(alloc: Allocator, found: *std.ArrayList(OlderName), object: std.json.ObjectMap, workspace: ?[]const u8) !void {
     for (keys) |key| {
         const current = key.renamed_to orelse continue;
         const older_value = object.get(key.name) orelse continue;
-        const current_value = object.get(current) orelse continue;
+        const current_value = object.get(current) orelse {
+            try found.append(alloc, .{ .older = key.name, .current = current, .both = false, .workspace = workspace });
+            continue;
+        };
         // fx ignores a current group that isn't an object and keeps using the
         // older one, so advising to remove the older one would lose settings.
         if (older_value == .object and current_value != .object) continue;
@@ -353,7 +358,7 @@ test "both spellings are reported only when fx would use the current one" {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, text, .{});
     defer parsed.deinit();
 
-    const found = try findRenamedTwice(alloc, parsed.value, .profile);
+    const found = try findOlderNames(alloc, parsed.value, .profile);
     defer alloc.free(found);
     try std.testing.expectEqual(@as(usize, 1), found.len);
     try std.testing.expectEqualStrings("statusLine", found[0].older);
@@ -394,14 +399,18 @@ test "older names map to the current ones, in paths and in files" {
         \\ "workspaces":{"/w":{"notifications":{},"sound":{}},"/x":{"sound":{}}}}
     , .{});
     defer parsed.deinit();
-    const twice = try findRenamedTwice(alloc, parsed.value, .profile);
+    const twice = try findOlderNames(alloc, parsed.value, .profile);
     defer alloc.free(twice);
-    try std.testing.expectEqual(@as(usize, 2), twice.len);
-    try std.testing.expectEqualStrings("statusLine", twice[0].older);
-    try std.testing.expectEqualStrings("status_line", twice[0].current);
-    try std.testing.expect(twice[0].workspace == null);
-    try std.testing.expectEqualStrings("notifications", twice[1].older);
-    try std.testing.expectEqualStrings("/w", twice[1].workspace.?);
+    // A top-level older name is reported alone too, so fx doctor can say when
+    // it stops working.
+    try std.testing.expectEqual(@as(usize, 3), twice.len);
+    try std.testing.expectEqualStrings("notifications", twice[0].older);
+    try std.testing.expect(!twice[0].both and twice[0].workspace == null);
+    try std.testing.expectEqualStrings("statusLine", twice[1].older);
+    try std.testing.expectEqualStrings("status_line", twice[1].current);
+    try std.testing.expect(twice[1].both and twice[1].workspace == null);
+    try std.testing.expectEqualStrings("notifications", twice[2].older);
+    try std.testing.expectEqualStrings("/w", twice[2].workspace.?);
 }
 
 test "project files ignore profile keys but not project-safe or retired ones" {

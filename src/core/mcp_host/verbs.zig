@@ -20,7 +20,8 @@ const Host = @import("host.zig").Host;
 const Allocator = std.mem.Allocator;
 const Writer = std.Io.Writer;
 const cli_flags = @import("../cli/cli_flags.zig");
-const OptionDoc = @import("../slash_commands/command_specs.zig").OptionDoc;
+const command_specs = @import("../slash_commands/command_specs.zig");
+const OptionDoc = command_specs.OptionDoc;
 const Status = runtime_mod.Status;
 pub const Notify = runtime_mod.Notify;
 
@@ -42,8 +43,9 @@ pub const Command = union(enum) {
     help: ?Verb,
     list: struct { json: bool = false },
     show: struct { name: []const u8, json: bool = false },
-    add: struct { name: []const u8, file: config_file.File, entry: config_file.Entry },
-    remove: struct { name: []const u8, file: ?config_file.File },
+    /// `old_profile`: the older `--profile` named the file, so fx warns.
+    add: struct { name: []const u8, file: config_file.File, entry: config_file.Entry, old_profile: bool = false },
+    remove: struct { name: []const u8, file: ?config_file.File, old_profile: bool = false },
     login: struct { name: []const u8, browser: bool },
     logout: []const u8,
     /// Null approves every project server.
@@ -93,6 +95,7 @@ pub fn parse(arena: Allocator, surface: Surface, args: []const []const u8) Alloc
     var json = false;
     var project = false;
     var profile = false;
+    var old_profile = false;
     var all = false;
     var no_browser = false;
     while (true) {
@@ -112,7 +115,11 @@ pub fn parse(arena: Allocator, surface: Surface, args: []const []const u8) Alloc
             .connect => return moved(arena, "{s} list --connect is now {s} show NAME.", .{ p, p }),
             .json => json = true,
             .project => project = true,
-            .global, .profile => profile = true,
+            .global => profile = true,
+            .profile => {
+                profile = true;
+                old_profile = true;
+            },
             .all => all = true,
             .no_browser => no_browser = true,
             .env, .header => |id| {
@@ -145,7 +152,7 @@ pub fn parse(arena: Allocator, surface: Surface, args: []const []const u8) Alloc
                 const command = rest[dash + 1 ..];
                 if (command.len == 0) return usage(arena, verb, "{s} add needs a command after --.", .{p});
                 if (pair_flag == .header) return usage(arena, verb, "--header is for HTTP servers; use --env for a command.", .{});
-                return .{ .command = .{ .add = .{ .name = name, .file = file, .entry = .{ .stdio = .{ .command = command[0], .args = command[1..], .env = pairs.items } } } } };
+                return .{ .command = .{ .add = .{ .name = name, .file = file, .entry = .{ .stdio = .{ .command = command[0], .args = command[1..], .env = pairs.items } }, .old_profile = old_profile } } };
             }
             // fx knows Slack's address, as `add slack` did before.
             const url = if (n.len == 1 and std.mem.eql(u8, name, "slack")) slack.server_url else url: {
@@ -155,7 +162,7 @@ pub fn parse(arena: Allocator, surface: Surface, args: []const []const u8) Alloc
             if (!std.mem.startsWith(u8, url, "https://") and !std.mem.startsWith(u8, url, "http://"))
                 return usage(arena, verb, "'{s}' isn't a URL. A stdio server's command goes after --.", .{url});
             if (pair_flag == .env) return usage(arena, verb, "--env is for stdio servers; use --header for HTTP.", .{});
-            return .{ .command = .{ .add = .{ .name = name, .file = file, .entry = .{ .http = .{ .url = url, .headers = pairs.items } } } } };
+            return .{ .command = .{ .add = .{ .name = name, .file = file, .entry = .{ .http = .{ .url = url, .headers = pairs.items } }, .old_profile = old_profile } } };
         },
         .approve => {
             if (all and n.len > 0) return usage(arena, verb, "{s} approve takes a NAME or --all, not both.", .{p});
@@ -169,7 +176,7 @@ pub fn parse(arena: Allocator, surface: Surface, args: []const []const u8) Alloc
         .show => .{ .show = .{ .name = name, .json = json } },
         .remove => blk: {
             if (project and profile) return usage(arena, verb, "Use --project or --global, not both.", .{});
-            break :blk .{ .remove = .{ .name = name, .file = if (project) .project else if (profile) .profile else null } };
+            break :blk .{ .remove = .{ .name = name, .file = if (project) .project else if (profile) .profile else null, .old_profile = old_profile } };
         },
         .login => .{ .login = .{ .name = name, .browser = !no_browser } },
         .logout => .{ .logout = name },
@@ -343,6 +350,12 @@ fn runParsed(c: Context, arena: Allocator, args: []const []const u8) !u8 {
             return 2;
         },
     };
+    const old_profile = switch (command) {
+        .add => |a| a.old_profile,
+        .remove => |r| r.old_profile,
+        else => false,
+    };
+    if (old_profile) try c.err.print("{s} {s}: --profile " ++ command_specs.deprecated_until ++ "; use --global\n", .{ c.surface.prog(), @tagName(command) });
     return switch (command) {
         .help => |verb| {
             try writeUsage(c.out, c.surface, verb);

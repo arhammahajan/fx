@@ -77,6 +77,13 @@ pub const SlashKind = enum {
     version,
 };
 
+/// The release that drops every old spelling fx still reads with a warning,
+/// such as `fx setup`, `--sessions-v2`, and `/allowlist user`. The CLI shape
+/// check fails once fx's version reaches it, so they come out on time.
+pub const old_spelling_removal = "0.0.17";
+/// What every warning about an old spelling says.
+pub const deprecated_until = "is deprecated and stops working in fx " ++ old_spelling_removal;
+
 pub const OptionDoc = struct {
     flag: []const u8,
     description: []const u8,
@@ -876,8 +883,8 @@ const allowlist_action_completions = [_][]const u8{
 
 const allowlist_view_completions = [_][]const u8{
     "/allowlist view effective",
-    "/allowlist view local",
-    "/allowlist view user",
+    "/allowlist view workspace",
+    "/allowlist view global",
 };
 
 const allowlist_scoped_action_suffixes = [_][]const u8{
@@ -1396,7 +1403,7 @@ pub fn deprecationWarning(alloc: Allocator, registry: TopLevelRegistry, kind: To
     for (registry.specs) |spec| {
         if (spec.kind != kind) continue;
         const replacement = spec.replaced_by orelse return null;
-        return try alloc.print("fx {s} is deprecated; use {s}\n", .{ spec.token, replacement });
+        return try alloc.print("fx {s} " ++ deprecated_until ++ "; use {s}\n", .{ spec.token, replacement });
     }
     return null;
 }
@@ -2078,7 +2085,7 @@ test "a deprecated command warns with its replacement and a current one does not
     const alloc = std.testing.allocator;
     const warning = (try deprecationWarning(alloc, testTopLevelRegistry(), .setup)).?;
     defer alloc.free(warning);
-    try std.testing.expectEqualStrings("fx setup is deprecated; use fx login vercel --api-key\n", warning);
+    try std.testing.expectEqualStrings("fx setup is deprecated and stops working in fx 0.0.17; use fx login vercel --api-key\n", warning);
     try std.testing.expect((try deprecationWarning(alloc, testTopLevelRegistry(), .login)) == null);
 }
 
@@ -2172,8 +2179,8 @@ test "slash completions include allowlist staged arguments" {
 
     try std.testing.expectEqual(@as(usize, 3), slashCompletionCount(testSlashRegistry(), "/allowlist view "));
     try std.testing.expectEqualStrings("/allowlist view effective", nthSlashCompletion(testSlashRegistry(), "/allowlist view ", 0).?);
-    try std.testing.expectEqualStrings("/allowlist view local", nthSlashCompletion(testSlashRegistry(), "/allowlist view ", 1).?);
-    try std.testing.expectEqualStrings("/allowlist view user", nthSlashCompletion(testSlashRegistry(), "/allowlist view ", 2).?);
+    try std.testing.expectEqualStrings("/allowlist view workspace", nthSlashCompletion(testSlashRegistry(), "/allowlist view ", 1).?);
+    try std.testing.expectEqualStrings("/allowlist view global", nthSlashCompletion(testSlashRegistry(), "/allowlist view ", 2).?);
 
     try std.testing.expectEqual(@as(usize, 3), slashCompletionCount(testSlashRegistry(), "/allowlist global "));
     try std.testing.expectEqualStrings("/allowlist global add", nthSlashCompletion(testSlashRegistry(), "/allowlist global ", 0).?);
@@ -2211,7 +2218,7 @@ test "allowlist staged completions with more arguments append space on tab" {
     try std.testing.expect(slashCompletionHasArgs(testSlashRegistry(), "/allowlist global add"));
     try std.testing.expect(slashCompletionHasArgs(testSlashRegistry(), "/allowlist workspace remove tool"));
     try std.testing.expect(slashCompletionHasArgs(testSlashRegistry(), "/allowlist view"));
-    try std.testing.expect(!slashCompletionHasArgs(testSlashRegistry(), "/allowlist view user"));
+    try std.testing.expect(!slashCompletionHasArgs(testSlashRegistry(), "/allowlist view global"));
     try std.testing.expect(!slashCompletionHasArgs(testSlashRegistry(), "/allowlist reset all"));
 }
 

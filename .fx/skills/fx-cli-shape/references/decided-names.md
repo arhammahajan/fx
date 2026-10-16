@@ -33,7 +33,7 @@ Names the maintainers already settled. Reuse them; don't add another spelling. "
 | `--workspace` | This folder's entry in the profile |
 | `--project` | A committed file in the repo, only for commands that write one (`fx mcp` and `.mcp.json`) |
 
-`fx mcp --profile` is an alias of `--global`. `/allowlist` takes `global` and `workspace`; `user` (the profile's top level) and `local` (this folder's entry) still work as aliases, and fx always shows the new words.
+`fx mcp --profile` still works as `--global`, and `/allowlist` still takes `user` (the profile's top level) and `local` (this folder's entry) for `global` and `workspace`; each warns and stops working in fx 0.0.17, and fx always shows the new words.
 
 ## Settings and their surfaces
 

@@ -189,11 +189,28 @@ fn appendUnknownSettingChecksFor(
     for (unknown) |key| {
         try appendCheckOwned(checks, alloc, "config", .warn, try settings_messages.formatUnknownSetting(alloc, key, display_path));
     }
-    const twice = try settings_keys.findRenamedTwice(alloc, parsed.value, file);
-    defer alloc.free(twice);
-    for (twice) |entry| {
-        try appendCheckOwned(checks, alloc, "config", .warn, try settings_messages.formatRenamedTwice(alloc, entry, display_path));
+    const older = try settings_keys.findOlderNames(alloc, parsed.value, file);
+    defer alloc.free(older);
+    for (older) |entry| {
+        try appendCheckOwned(checks, alloc, "config", .warn, try settings_messages.formatOlderName(alloc, entry, display_path));
     }
+    if (parsed.value != .object) return;
+    try appendOldYolo(checks, alloc, parsed.value.object, null, display_path);
+    if (file != .profile) return;
+    const workspaces = parsed.value.object.get("workspaces") orelse return;
+    if (workspaces != .object) return;
+    var iterator = workspaces.object.iterator();
+    while (iterator.next()) |entry| {
+        if (entry.value_ptr.* == .object) try appendOldYolo(checks, alloc, entry.value_ptr.object, entry.key_ptr.*, display_path);
+    }
+}
+
+/// Warns about a saved `permission_mode: "yolo"`, the older name for
+/// `full-access`.
+fn appendOldYolo(checks: *std.ArrayList(Check), alloc: Allocator, object: std.json.ObjectMap, workspace: ?[]const u8, display_path: []const u8) !void {
+    const mode = object.get("permission_mode") orelse return;
+    if (mode != .string or !std.mem.eql(u8, mode.string, "yolo")) return;
+    try appendCheckOwned(checks, alloc, "config", .warn, try settings_messages.formatOldYolo(alloc, workspace, display_path));
 }
 
 fn appendConfigCheck(

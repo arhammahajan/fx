@@ -33,6 +33,8 @@ from pathlib import Path
 
 REGISTRY = "scripts/cli_shape_registry.json"
 COMMANDS = "src/builtins/commands.zig"
+MAIN = "src/main.zig"
+COMMAND_SPECS = "src/core/slash_commands/command_specs.zig"
 CLI_SURFACE = "src/core/cli/cli_surface.zig"
 CLI_ASK = "src/core/cli/cli_ask.zig"
 CONFIG_RUNTIME = "src/core/config/config_runtime.zig"
@@ -62,6 +64,9 @@ FLAG_LITERAL = re.compile(r'"(--?[A-Za-z0-9][A-Za-z0-9_<>-]*)=?"')
 KEY_READ = re.compile(r'\.(?:get|getPtr|contains)\("([^"]+)"\)')
 # An ACP config option as sessions.zig writes it: {\"id\":\"model\",\"name\":...
 ACP_CONFIG_ID = re.compile(r'\\"id\\":\\"([a-z_]+)\\",\\"name\\"')
+# fx's version, and the release that drops the old spellings.
+VERSION = re.compile(r'^pub const version = "(\d+)\.(\d+)\.(\d+)";', re.M)
+OLD_SPELLING_REMOVAL = re.compile(r'^pub const old_spelling_removal = "(\d+)\.(\d+)\.(\d+)";', re.M)
 # A config option ID that session/set_config_option accepts.
 ACP_SET_ID = re.compile(r'std\.mem\.eql\(u8, config_id, "([a-z_]+)"\)')
 LIBFX_MODEL_FIELD = re.compile(r"^\s+([a-z][A-Za-z]*)\??:")
@@ -215,6 +220,7 @@ class Checker:
         self.check_parsing()
         self.check_settings()
         self.check_run_options()
+        self.check_removal()
         for kind, entries in self.exceptions.items():
             for value in entries:
                 if (kind, value) not in self.used_exceptions:
@@ -442,6 +448,30 @@ class Checker:
             self.report(None, "names", f'libfx model option "{field}" needs a run_options row in {REGISTRY}', LIBFX_TYPES)
         for field in sorted(named_fields - fields):
             self.report(None, "names", f'run_options names libfx model option "{field}", which FxModelOptions doesn\'t declare')
+
+    def check_removal(self) -> None:
+        """Old spellings, such as `fx setup`, keep working with a warning until
+        old_spelling_removal; once fx reaches that version they must go."""
+        version = version_tuple(VERSION, (self.root / MAIN).read_text(), MAIN)
+        removal = version_tuple(OLD_SPELLING_REMOVAL, (self.root / COMMAND_SPECS).read_text(), COMMAND_SPECS)
+        if version >= removal:
+            shown = ".".join(str(part) for part in removal)
+            self.report(
+                None,
+                "removal",
+                f"fx {shown} drops the old spellings that warn they stop working in it: remove them, then old_spelling_removal "
+                f"(see decided-names.md in .fx/skills/fx-cli-shape/references)",
+                COMMAND_SPECS,
+            )
+
+
+def version_tuple(pattern: re.Pattern[str], text: str, path: str) -> tuple[int, int, int]:
+    match = pattern.search(text)
+    if match is None:
+        raise ShapeSourceError(f"cannot find {pattern.pattern} in {path}")
+    major, minor, patch = (int(part) for part in match.groups())
+    return (major, minor, patch)
+
 
 def libfx_model_fields(text: str) -> set[str] | None:
     """The fields of `FxModelOptions`, or None when the interface is missing."""

@@ -1,4 +1,5 @@
 const std = @import("std");
+const command_specs = @import("../slash_commands/command_specs.zig");
 const build_options = @import("build_options");
 const app_permission_runtime = @import("../app/app_permission_runtime.zig");
 const app_session_runtime = @import("../app/app_session_runtime.zig");
@@ -405,6 +406,10 @@ pub fn Commands(comptime App: type) type {
             }
 
             const first = splitFirstWord(trimmed).?;
+            const scope_word = if (std.ascii.eqlIgnoreCase(first.word, "view")) std.mem.trim(u8, first.rest, " \t") else first.word;
+            if (oldAllowlistWarning(scope_word)) |warning| {
+                try app.writeDomainNotice(.{ .topic = "", .tone = .warning, .body = warning }, true);
+            }
             if (std.ascii.eqlIgnoreCase(first.word, "view")) {
                 const view = parseAllowlistView(first.rest) orelse {
                     try writeAllowlistUsage(app);
@@ -1470,6 +1475,14 @@ fn allowlistScopeWord(scope: config_runtime.PermissionScope) []const u8 {
         .user => "global",
         .local => "workspace",
     };
+}
+
+/// The warning for the older scope words `user` and `local`, which still work
+/// until fx drops old spellings; null for any other word.
+fn oldAllowlistWarning(word: []const u8) ?[]const u8 {
+    if (std.ascii.eqlIgnoreCase(word, "user")) return "/allowlist user " ++ command_specs.deprecated_until ++ "; use /allowlist global";
+    if (std.ascii.eqlIgnoreCase(word, "local")) return "/allowlist local " ++ command_specs.deprecated_until ++ "; use /allowlist workspace";
+    return null;
 }
 
 /// `global` and `workspace`, and the older `user` and `local`, which still work.

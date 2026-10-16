@@ -740,7 +740,7 @@ pub fn Handlers(comptime App: type) type {
             try app.writeDomainNotice(.{
                 .topic = "",
                 .tone = .warning,
-                .body = "/setup is deprecated; use /login to sign in or add an API key, or /provider to choose a provider",
+                .body = "/setup " ++ command_specs.deprecated_until ++ "; use /login to sign in or add an API key, or /provider to choose a provider",
             }, true);
             try commandProvider(ctx);
         }

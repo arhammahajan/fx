@@ -94,6 +94,9 @@ ACP_SESSIONS = r"""fn writeModelOption(w: *std.Io.Writer) !void {
 }
 """
 
+MAIN = 'pub const version = "0.0.14";\n'
+COMMAND_SPECS = 'pub const old_spelling_removal = "0.0.17";\n'
+
 ACP_SERVER = """\
 fn handleSetConfigOption() void {
     if (std.mem.eql(u8, config_id, "model")) {}
@@ -138,6 +141,8 @@ class CheckCliShapeTests(unittest.TestCase):
             check_cli_shape.SETTINGS_KEYS: SETTINGS_KEYS,
             check_cli_shape.ACP_SESSIONS: ACP_SESSIONS,
             check_cli_shape.ACP_SERVER: ACP_SERVER,
+            check_cli_shape.MAIN: MAIN,
+            check_cli_shape.COMMAND_SPECS: COMMAND_SPECS,
             check_cli_shape.LIBFX_TYPES: LIBFX_TYPES,
             "src/env.zig": ENV,
         }
@@ -347,6 +352,10 @@ class CheckCliShapeTests(unittest.TestCase):
             '}\n\nfn writeFastOption(w: *std.Io.Writer) !void {\n    try w.writeAll("{\\\"id\\\":\\\"fast\\\",\\\"name\\\":\\\"Fast\\\"}");\n}\n',
         )
         self.assertOnly(self.run_check(), "names", 'ACP config option "fast" needs a run_options row')
+
+    def test_old_spellings_must_go_once_fx_reaches_their_removal(self) -> None:
+        self.edit(check_cli_shape.MAIN, '"0.0.14"', '"0.0.17"')
+        self.assertOnly(self.run_check(), "removal", "fx 0.0.17 drops the old spellings")
 
     def test_acp_set_config_option_id_needs_a_run_options_row(self) -> None:
         self.edit(check_cli_shape.ACP_SERVER, '"model")) {}\n', '"model")) {}\n    if (std.mem.eql(u8, config_id, "fast")) {}\n')

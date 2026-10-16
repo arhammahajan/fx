@@ -1420,7 +1420,7 @@ fn runIfRequestedWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Con
 fn writeSessionsV2Warnings(deps: RunDeps, flag: bool) !void {
     if (flag) try writeStderr(deps, cli_ask.sessions_v2_flag_warning);
     if (session_adapter.envRequested()) {
-        try writeStderr(deps, "fx: FX_SESSIONS_V2 is deprecated; use fx config set experimental.sessions_v2 true\n");
+        try writeStderr(deps, "fx: FX_SESSIONS_V2 " ++ command_specs.deprecated_until ++ "; use fx config set experimental.sessions_v2 true\n");
     }
 }
 
@@ -2921,7 +2921,8 @@ fn takeMcpScope(deps: RunDeps, comptime verb: []const u8, args: []const [:0]cons
     while (true) {
         const item = (parser.next() catch return null) orelse break;
         switch (mcp_scope_flag_ids[item.option.index].?) {
-            .global, .profile => {},
+            .global => {},
+            .profile => try writeStderr(deps, "fx mcp " ++ verb ++ ": --profile " ++ command_specs.deprecated_until ++ "; use --global\n"),
             .project => {
                 try writeStderr(deps, "fx mcp " ++ verb ++ ": this changes ~/.fx/mcp.json; edit the project's .mcp.json to change project servers\n");
                 return null;
@@ -6451,7 +6452,7 @@ test "setup preserves the disabled secret-store failure" {
     try std.testing.expectEqual(@as(usize, 0), capture.setup_store_calls);
     try std.testing.expectEqual(@as(usize, 0), capture.setup_read_calls);
     try std.testing.expectEqualStrings(
-        "fx setup is deprecated; use fx login vercel --api-key\n" ++
+        "fx setup is deprecated and stops working in fx 0.0.17; use fx login vercel --api-key\n" ++
             "fx setup: stored API keys are disabled by FX_DISABLE_KEYCHAIN\n",
         capture.stderr.written(),
     );

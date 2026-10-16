@@ -52,7 +52,7 @@ These are the rules agents most often get wrong. [references/rules.md](reference
 
 **Scopes.** Commands that choose where a setting lives use `--global` and `--workspace`, plus `--project` only when they write a committed file.
 
-**Change over time.** Every control is stable, experimental, deprecated, or internal. Renaming or removing a stable control keeps the old name working with a warning for at least two releases and 30 days.
+**Change over time.** Every control is stable, experimental, deprecated, or internal. Renaming or removing a stable control keeps the old name working with a warning for at least two releases and 30 days. The warning names the release that drops it, `old_spelling_removal` (0.0.17 for the current set), and CI fails once fx reaches it.
 
 ## Workflow
 
@@ -87,7 +87,7 @@ Ask before inventing a rule for something these rules don't cover: keyboard shor
 - Every `FX_*` name in `src/` must be registered, with a job and a stability, in `scripts/cli_shape_registry.json`, or CI fails. Known violations are listed there as exceptions, each with the change that removes it. A new exception needs a maintainer's approval; never add one to make a new control pass.
 - `-c` already means continue, so git's `-c key=value` can't be copied. The one-run override is `fx ask --config key=value`.
 - Full access is saved and printed as `full-access`, and `yolo` is still read. Only ACP's mode `_meta` and the fx-managed `yolo_acknowledged` key keep the old word.
-- `fx login vercel --api-key` pastes an AI Gateway API key. `fx setup` and `/setup` still work but warn: `fx setup` points to `fx login vercel --api-key`, and `/setup`, an alias of `/provider`, points to `/login` and `/provider`. Neither appears in help. Don't give "setup" a new meaning.
+- `fx login vercel --api-key` pastes an AI Gateway API key. `fx setup` and `/setup` still work until fx 0.0.17 but warn: `fx setup` points to `fx login vercel --api-key`, and `/setup`, an alias of `/provider`, points to `/login` and `/provider`. Neither appears in help. Don't give "setup" a new meaning.
 - Resume already has seven kept spellings. Use `--resume last` or `--resume <id>`; never add another form such as `--resume-latest`.
 - Every test hook starts with `FX_TEST_`; CI rejects a test hook with any other prefix.
 
