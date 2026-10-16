@@ -2077,7 +2077,7 @@ fn runNonInteractiveWithDeps(
             if (rest.len > 0 and std.mem.eql(u8, rest[0], "convert")) {
                 const format = parseSessionConvertArgs(rest[1..]) catch |err| {
                     try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .sessions, "sessions", err, rest);
-                    return .handled_failure;
+                    return usage_failure;
                 };
                 // It moves v1 sessions into the experimental store, where
                 // plain fx would no longer find them.
@@ -3809,14 +3809,23 @@ fn runSessionListV2(alloc: Allocator, deps: RunDeps, opts: SessionListOptions) !
     return writeSessionList(alloc, deps, page, opts);
 }
 
+const SessionConvertFlag = enum { json };
+const session_convert_flag_ids = cli_flags.idTable(SessionConvertFlag, &builtin_commands.sessions_convert_options);
+
 fn parseSessionConvertArgs(args: []const [:0]const u8) !output_contracts.OutputFormat {
-    if (args.len == 0) return .text;
-    if (args.len == 1 and std.mem.eql(u8, args[0], "--json")) return .json;
-    return error.InvalidLocalSurfaceArgs;
+    var format: output_contracts.OutputFormat = .text;
+    var parser: cli_flags.Parser = .init(&builtin_commands.sessions_convert_options, args);
+    while (parser.next() catch return error.InvalidLocalSurfaceArgs) |item| switch (item) {
+        .positional => return error.InvalidLocalSurfaceArgs,
+        .option => |match| switch (session_convert_flag_ids[match.index].?) {
+            .json => format = .json,
+        },
+    };
+    return format;
 }
 
 /// Why `fx sessions convert` refuses without the v2 store switched on.
-const sessions_v2_required_message = "sessions convert moves v1 sessions into the experimental v2 store and needs --sessions-v2 or FX_SESSIONS_V2=1";
+const sessions_v2_required_message = "sessions convert moves v1 sessions into the experimental v2 store, which is off; turn it on with fx config set experimental.sessions_v2 true";
 
 /// `fx sessions convert`: converts every v1 session v2 does not hold yet,
 /// and fails when it skipped any (D61).
@@ -4247,13 +4256,21 @@ test "session lookup failures preserve supporting-state errors in the requested 
     }
 }
 
+test "sessions convert reads its flags through the shared parser" {
+    try std.testing.expectEqual(output_contracts.OutputFormat.text, try parseSessionConvertArgs(&.{}));
+    try std.testing.expectEqual(output_contracts.OutputFormat.json, try parseSessionConvertArgs(&.{"--json"}));
+    try std.testing.expectEqual(output_contracts.OutputFormat.json, try parseSessionConvertArgs(&.{ "--json", "--json" }));
+    try std.testing.expectError(error.InvalidLocalSurfaceArgs, parseSessionConvertArgs(&.{"--jsno"}));
+    try std.testing.expectError(error.InvalidLocalSurfaceArgs, parseSessionConvertArgs(&.{"extra"}));
+}
+
 test "sessions convert without the v2 store names the switch it needs, in text and json" {
     for ([_]output_contracts.OutputFormat{ .text, .json }) |format| {
         var output = CaptureOutput.init(std.testing.allocator);
         defer output.deinit();
         try writeLookupFailure(std.testing.allocator, output.deps(), "sessions", error.SessionsV2Required, format);
         const body = if (format == .json) output.stdout.written() else output.stderr.written();
-        try std.testing.expect(std.mem.find(u8, body, "--sessions-v2 or FX_SESSIONS_V2=1") != null);
+        try std.testing.expect(std.mem.find(u8, body, "fx config set experimental.sessions_v2 true") != null);
         if (format == .json) {
             var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
             defer parsed.deinit();
