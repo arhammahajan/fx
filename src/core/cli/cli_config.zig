@@ -4,6 +4,7 @@
 const std = @import("std");
 const builtin_commands = @import("../../builtins/commands.zig");
 const cli_flags = @import("cli_flags.zig");
+const app_lifecycle = @import("../app/app_lifecycle.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const env_settings = @import("../config/env_settings.zig");
 const model_provider = @import("../config/model_provider.zig");
@@ -406,6 +407,197 @@ pub fn load(
     };
 }
 
+/// A key's value in a run, as `fx config` reports it.
+pub const Effective = union(enum) {
+    /// fx resolves the key where `fx config` doesn't look, so it reports the
+    /// value the files set.
+    unresolved,
+    /// fx uses no value, such as an unset theme.
+    none,
+    value: std.json.Value,
+};
+
+/// The keys `fx config` reads from the resolved state instead of the files.
+/// A test checks that each plain key is here or in `files_only_keys`.
+pub const resolved_keys = [_][]const u8{
+    "auto_compact_percent",     "auto_upgrade",           "collapse_tool_calls",
+    "context",                  "effort",                 "experimental.sessions_v2",
+    "fast_mode",                "first_call_tool_choice", "max_agent_steps",
+    "max_tool_result_bytes",    "permission_mode",        "prompt_history.enabled",
+    "provider",                 "provider_order",         "provider_strict",
+    "review_model",             "session_titles",         "slash_menu_categories",
+    "sound.attention_required", "sound.max",              "sound.turn_end",
+    "startup_scrollback",       "status_line.context",    "status_line.session",
+    "status_line.workspace",    "theme",                  "ultrafast_mode",
+    "update_channel",
+};
+
+/// Keys `fx config` shows as the files set them: objects fx checks with its
+/// own rules, model choices, editor hints, and values fx manages itself.
+const files_only_keys = [_][]const u8{
+    "$schema",                    "additional_directories", "codex_model",
+    "context_limits",             "credential_source",      "disabledMcpjsonServers",
+    "enableAllProjectMcpServers", "enabledMcpjsonServers",  "fast_mode_model_bound",
+    "grok_model",                 "model",                  "models",
+    "permission",                 "providers",              "skill_symlink_authorities",
+    "workspaces",                 "yolo_acknowledged",
+};
+
+/// The value a run uses for `key`, read from a state that
+/// `app_lifecycle.resolveSettings` filled; `provider` is the provider the run
+/// selects. Strings borrow from `state`, and `arena` holds anything built here.
+pub fn effectiveValue(
+    arena: Allocator,
+    state: *const app_lifecycle.StartupState,
+    provider: model_provider.ProviderId,
+    key: []const u8,
+) Allocator.Error!Effective {
+    const eql = std.mem.eql;
+    if (eql(u8, key, "auto_compact_percent")) return integer(arena, state.auto_compact_percent);
+    if (eql(u8, key, "auto_upgrade")) return boolean(state.auto_upgrade);
+    if (eql(u8, key, "collapse_tool_calls")) return boolean(state.collapse_tool_calls);
+    if (eql(u8, key, "context")) return boolean(state.context_enabled);
+    if (eql(u8, key, "effort")) return string(state.effort.label());
+    if (eql(u8, key, "experimental.sessions_v2")) return boolean(state.sessions_v2_setting);
+    if (eql(u8, key, "fast_mode")) return boolean(state.fast_mode);
+    if (eql(u8, key, "first_call_tool_choice")) return string(state.first_call_tool_choice.label());
+    if (eql(u8, key, "max_agent_steps")) return integer(arena, state.agent_step_limit);
+    if (eql(u8, key, "max_tool_result_bytes")) return integer(arena, state.max_tool_result_bytes);
+    if (eql(u8, key, "permission_mode")) return string(state.permission_mode.label());
+    if (eql(u8, key, "prompt_history.enabled")) return boolean(state.prompt_history_enabled);
+    if (eql(u8, key, "provider")) return string(try arena.dupe(u8, provider.label()));
+    if (eql(u8, key, "provider_order")) {
+        if (state.provider_order.len == 0) return .none;
+        var array: std.json.Array = .init(arena);
+        for (state.provider_order) |slug| try array.append(.{ .string = slug });
+        return .{ .value = .{ .array = array } };
+    }
+    if (eql(u8, key, "provider_strict")) return boolean(state.provider_strict);
+    if (eql(u8, key, "review_model")) return if (state.review_model.len == 0) .none else string(state.review_model);
+    if (eql(u8, key, "session_titles")) return boolean(state.session_title_generation);
+    if (eql(u8, key, "slash_menu_categories")) return boolean(state.slash_menu_categories);
+    if (eql(u8, key, "sound.attention_required")) return boolean(state.notification_attention_required);
+    if (eql(u8, key, "sound.max")) return boolean(state.notification_max);
+    if (eql(u8, key, "sound.turn_end")) return boolean(state.notification_turn_end);
+    if (eql(u8, key, "startup_scrollback")) return boolean(state.startup_scrollback);
+    if (eql(u8, key, "status_line.context")) return boolean(state.statusline_context);
+    if (eql(u8, key, "status_line.session")) return boolean(state.statusline_session);
+    if (eql(u8, key, "status_line.workspace")) return boolean(state.statusline_workspace);
+    if (eql(u8, key, "theme")) {
+        if (app_lifecycle.themeEnvOverride()) |value| return string(value);
+        return if (state.theme) |value| string(value) else .none;
+    }
+    if (eql(u8, key, "ultrafast_mode")) return boolean(state.ultrafast_mode);
+    if (eql(u8, key, "update_channel")) return string(state.update_channel.label());
+    return .unresolved;
+}
+
+fn boolean(value: bool) Effective {
+    return .{ .value = .{ .bool = value } };
+}
+
+fn string(value: []const u8) Effective {
+    return .{ .value = .{ .string = value } };
+}
+
+fn integer(arena: Allocator, value: usize) Allocator.Error!Effective {
+    if (std.math.cast(i64, value)) |fits| return .{ .value = .{ .integer = fits } };
+    return .{ .value = .{ .number_string = try std.fmt.allocPrint(arena, "{d}", .{value}) } };
+}
+
+/// The entries `fx config get` looks a key up in when no scope is chosen.
+/// `set` holds the values the files and `FX_*` variables set, lowest
+/// precedence first. Every resolved key gets the value a run uses, labeled
+/// with the highest layer that sets that value, or `default` when none does,
+/// as when nothing sets it or fx rejects or ignores what a file says. A key
+/// fx doesn't resolve keeps its last entry in `set`. Everything is in `arena`.
+pub fn effectiveEntries(
+    arena: Allocator,
+    state: *const app_lifecycle.StartupState,
+    provider: model_provider.ProviderId,
+    set: []const settings_entries.Entry,
+) ![]settings_entries.Entry {
+    var out: std.ArrayList(settings_entries.Entry) = .empty;
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    for (set) |entry| {
+        if (seen.contains(entry.key)) continue;
+        try seen.put(arena, entry.key, {});
+        switch (try effectiveValue(arena, state, provider, entry.key)) {
+            .unresolved => try out.append(arena, lastEntry(set, entry.key)),
+            .none => {},
+            .value => |value| try out.append(arena, labeled(set, entry.key, value)),
+        }
+    }
+    for (resolved_keys) |key| {
+        if (seen.contains(key)) continue;
+        switch (try effectiveValue(arena, state, provider, key)) {
+            .value => |value| try out.append(arena, .{ .key = key, .value = value, .origin = .default }),
+            .none, .unresolved => {},
+        }
+    }
+    return out.toOwnedSlice(arena);
+}
+
+fn lastEntry(set: []const settings_entries.Entry, key: []const u8) settings_entries.Entry {
+    var index = set.len;
+    while (index > 0) {
+        index -= 1;
+        if (std.mem.eql(u8, set[index].key, key)) return set[index];
+    }
+    unreachable;
+}
+
+/// `value` labeled with the highest layer in `set` that sets it.
+fn labeled(set: []const settings_entries.Entry, key: []const u8, value: std.json.Value) settings_entries.Entry {
+    var index = set.len;
+    while (index > 0) {
+        index -= 1;
+        const entry = set[index];
+        if (!std.mem.eql(u8, entry.key, key)) continue;
+        if (sameValue(key, entry.value, value)) return .{ .key = key, .value = value, .origin = entry.origin, .variable = entry.variable };
+    }
+    return .{ .key = key, .value = value, .origin = .default };
+}
+
+/// Whether a file's `raw` value is the resolved `value`. Words are compared
+/// after the runtime's own parse, so an older spelling such as `yolo` matches
+/// `full-access`.
+fn sameValue(key: []const u8, raw: std.json.Value, value: std.json.Value) bool {
+    switch (raw) {
+        .string => |text| if (value == .string) {
+            const eql = std.mem.eql;
+            if (eql(u8, key, "permission_mode")) {
+                const mode = types.PermissionMode.parse(text) orelse return false;
+                return eql(u8, mode.label(), value.string);
+            }
+            if (eql(u8, key, "effort")) {
+                const effort = types.ReasoningEffort.parse(text) orelse return false;
+                return eql(u8, effort.label(), value.string);
+            }
+            return eql(u8, text, value.string);
+        },
+        else => {},
+    }
+    return jsonEqual(raw, value);
+}
+
+fn jsonEqual(a: std.json.Value, b: std.json.Value) bool {
+    return switch (a) {
+        .null => b == .null,
+        .bool => |x| b == .bool and b.bool == x,
+        .integer => |x| b == .integer and b.integer == x,
+        .float => |x| b == .float and b.float == x,
+        .number_string => |x| b == .number_string and std.mem.eql(u8, x, b.number_string),
+        .string => |x| b == .string and std.mem.eql(u8, x, b.string),
+        .array => |x| blk: {
+            if (b != .array or b.array.items.len != x.items.len) break :blk false;
+            for (x.items, b.array.items) |left, right| if (!jsonEqual(left, right)) break :blk false;
+            break :blk true;
+        },
+        .object => false,
+    };
+}
+
 /// The provider the settings files choose, which `FX_MODEL` applies to unless
 /// `FX_PROVIDER` picks another.
 fn savedProvider(entries: []const settings_entries.Entry) model_provider.ProviderId {
@@ -710,4 +902,69 @@ test "fx config schema takes only --project" {
         &.{ "schema", "--show-origin" },
         &.{ "schema", "extra" },
     }) |args| try std.testing.expectError(error.InvalidConfigArgs, parseArgs(args, &unknown));
+}
+
+test "every plain setting is resolved or deliberately shown from the files" {
+    for (settings_keys.keys) |key| {
+        switch (key.where) {
+            .retired => continue,
+            else => {},
+        }
+        if (key.kind == .refused or key.renamed_to != null) continue;
+        if (key.kind == .switches) {
+            for (key.children) |child| {
+                var buf: [96]u8 = undefined;
+                const path = try std.fmt.bufPrint(&buf, "{s}.{s}", .{ key.name, child });
+                try std.testing.expect(inList(&resolved_keys, path) or inList(&files_only_keys, key.name));
+            }
+            continue;
+        }
+        if (!inList(&resolved_keys, key.name) and !inList(&files_only_keys, key.name)) {
+            std.debug.print("unclassified setting {s}\n", .{key.name});
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+fn inList(list: []const []const u8, name: []const u8) bool {
+    for (list) |item| if (std.mem.eql(u8, item, name)) return true;
+    return false;
+}
+
+test "effective entries show the value in use and the layer that set it" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var state = app_lifecycle.StartupState{ .agent_step_limit = 25 };
+    state.permission_mode = .yolo;
+    state.agent_step_limit = 25;
+    const set = [_]settings_entries.Entry{
+        // A rejected file value: the run uses the default.
+        .{ .key = "max_agent_steps", .value = .{ .integer = -3 }, .origin = .global },
+        // An older spelling of the value in use.
+        .{ .key = "permission_mode", .value = .{ .string = "yolo" }, .origin = .global },
+        .{ .key = "models.codex", .value = .{ .string = "m" }, .origin = .global },
+    };
+    const all = try effectiveEntries(arena, &state, .gateway, &set);
+    // The keys something sets come first, in order.
+    try std.testing.expectEqualStrings("max_agent_steps", all[0].key);
+    try std.testing.expectEqual(@as(i64, 25), all[0].value.integer);
+    try std.testing.expectEqual(settings_entries.Origin.default, all[0].origin);
+    try std.testing.expectEqualStrings("full-access", all[1].value.string);
+    try std.testing.expectEqual(settings_entries.Origin.global, all[1].origin);
+    try std.testing.expectEqualStrings("m", all[2].value.string);
+    var fast_mode: ?settings_entries.Entry = null;
+    for (all) |entry| if (std.mem.eql(u8, entry.key, "fast_mode")) {
+        fast_mode = entry;
+    };
+    try std.testing.expect(!fast_mode.?.value.bool);
+    try std.testing.expectEqual(settings_entries.Origin.default, fast_mode.?.origin);
+}
+
+test "a step count past a JSON integer is shown, not cast" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const effective = try integer(arena_state.allocator(), std.math.maxInt(usize));
+    try std.testing.expectEqualStrings("18446744073709551615", effective.value.number_string);
 }

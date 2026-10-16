@@ -467,6 +467,7 @@ pub const ConfigSnapshot = struct {
                         try writeTerminalSafe(&out.writer, alloc, self.workspace_root);
                     },
                     .env => try out.writer.print("env:{s}", .{entry.variable.?}),
+                    .default => try out.writer.writeAll("default"),
                 }
                 try out.writer.writeByte('\t');
             }
@@ -494,7 +495,7 @@ pub const ConfigSnapshot = struct {
             if (entry.origin == .env) {
                 try out.writer.writeAll(",\"variable\":");
                 try std.json.Stringify.value(entry.variable.?, .{}, &out.writer);
-            } else {
+            } else if (entry.origin != .default) {
                 try out.writer.writeAll(",\"file\":");
                 try std.json.Stringify.value(if (entry.origin == .project) ".fx.json" else profile_paths.displayText("~/.fx/settings.json"), .{}, &out.writer);
             }

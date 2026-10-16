@@ -102,7 +102,12 @@ pub fn collect(arena: Allocator, provider: model_provider.ProviderId) ![]Overrid
         }
     }
     if (agent_steps.parseMaxAgentSteps(getenv("FX_MAX_AGENT_STEPS"))) |steps| {
-        try list.append(arena, .{ .variable = "FX_MAX_AGENT_STEPS", .key = "max_agent_steps", .value = .{ .integer = @intCast(steps) } });
+        // fx accepts any usize, which can exceed a JSON integer.
+        const value: std.json.Value = if (std.math.cast(i64, steps)) |fits|
+            .{ .integer = fits }
+        else
+            .{ .number_string = try std.fmt.allocPrint(arena, "{d}", .{steps}) };
+        try list.append(arena, .{ .variable = "FX_MAX_AGENT_STEPS", .key = "max_agent_steps", .value = value });
     }
     if (compactor.parsePercent(getenv("FX_AUTO_COMPACT_PERCENT"))) |percent| {
         try list.append(arena, .{ .variable = "FX_AUTO_COMPACT_PERCENT", .key = "auto_compact_percent", .value = .{ .integer = percent } });

@@ -844,12 +844,18 @@ describe("cli: status", () => {
         );
         expect(list.stderr).toBe("fx config: unknown setting fast_mdoe in ~/.fx/settings.json (did you mean fast_mode?)\n");
 
+        // get reads the settings the runtime resolves, so it gives the same
+        // warnings a run does: this .fx.json sets a profile-only key.
+        const projectWarning = "fx: config project: ignored_project_user_only_setting; key=model\n";
         const get = await runFx(["config", "get", "fast_mode"], { cwd, env });
-        expect([get.code, get.stdout, get.stderr]).toEqual([0, "false\n", ""]);
+        expect([get.code, get.stdout, get.stderr]).toEqual([0, "false\n", projectWarning]);
         const global = await runFx(["config", "get", "fast_mode", "--global"], { cwd, env });
         expect([global.code, global.stdout]).toEqual([0, "true\n"]);
         const unset = await runFx(["config", "get", "theme"], { cwd, env });
-        expect([unset.code, unset.stdout, unset.stderr]).toEqual([1, "", ""]);
+        expect([unset.code, unset.stdout, unset.stderr]).toEqual([1, "", projectWarning]);
+        // A key nothing sets gives the value fx uses, labeled default.
+        const fallback = await runFx(["config", "get", "--show-origin", "permission_mode"], { cwd, env });
+        expect([fallback.code, fallback.stdout]).toEqual([0, "default\tauto\n"]);
 
         const typo = await runFx(["config", "get", "fast_mdoe"], { cwd, env });
         expect(typo.code).toBe(2);

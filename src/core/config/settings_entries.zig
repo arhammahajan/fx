@@ -16,6 +16,8 @@ pub const Origin = enum {
     workspace,
     /// An `FX_*` variable set for this process.
     env,
+    /// Nothing sets it, so fx uses its built-in value.
+    default,
 };
 
 pub const Scope = enum { all, global, workspace };

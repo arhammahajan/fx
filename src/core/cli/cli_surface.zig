@@ -2369,7 +2369,7 @@ fn runNonInteractiveWithDeps(
                 return usage_failure;
             };
             return switch (opts.action) {
-                .list, .get => runConfig(alloc, deps, opts),
+                .list, .get => runConfig(alloc, cfg, deps, opts),
                 .set, .unset => runConfigWrite(alloc, deps, opts),
                 .schema => runConfigSchema(alloc, deps, opts),
             };
@@ -4496,7 +4496,7 @@ fn runConfigSchema(alloc: Allocator, deps: RunDeps, opts: cli_config.Options) !R
     return .handled_success;
 }
 
-fn runConfig(alloc: Allocator, deps: RunDeps, opts: cli_config.Options) !RunResult {
+fn runConfig(alloc: Allocator, cfg: Config, deps: RunDeps, opts: cli_config.Options) !RunResult {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
     defer alloc.free(workspace_root);
     var paths = try config_runtime.discoverPaths(alloc, workspace_root);
@@ -4516,12 +4516,25 @@ fn runConfig(alloc: Allocator, deps: RunDeps, opts: cli_config.Options) !RunResu
     };
     defer loaded.deinit(alloc);
 
+    // list shows what each file sets, as git config --list does. get without a
+    // scope reports the value a run uses, defaults included, so it reads the
+    // settings the runtime resolves.
+    var resolved_arena: std.heap.ArenaAllocator = .init(alloc);
+    defer resolved_arena.deinit();
+    const shown: []const settings_entries.Entry = if (opts.scope == .all and opts.key != null)
+        resolvedConfigEntries(alloc, resolved_arena.allocator(), cfg, deps, opts.format, workspace_root, loaded.entries.items) catch |err| blk: {
+            debug_trace.logf("config", "resolving settings failed err={s}; showing file values", .{@errorName(err)});
+            break :blk loaded.entries.items;
+        }
+    else
+        loaded.entries.items;
+
     const matches: ?[]settings_entries.Entry = if (opts.key) |key|
-        try settings_entries.lookup(alloc, loaded.entries.items, key)
+        try settings_entries.lookup(alloc, shown, key)
     else
         null;
     defer if (matches) |found| alloc.free(found);
-    const entries = matches orelse loaded.entries.items;
+    const entries = matches orelse shown;
     const snapshot: output_contracts.ConfigSnapshot = .{
         .entries = entries,
         .unknown = if (opts.key == null) loaded.unknown else &.{},
@@ -4541,6 +4554,46 @@ fn runConfig(alloc: Allocator, deps: RunDeps, opts: cli_config.Options) !RunResu
     defer alloc.free(text);
     try writeFormattedOutput(deps, text, opts.format);
     return if (opts.key != null and entries.len == 0) .handled_failure else .handled_success;
+}
+
+/// The entries `fx config get` looks a key up in without a scope: each value
+/// as a run resolves it, through the same `resolveSettings` the session uses.
+fn resolvedConfigEntries(
+    alloc: Allocator,
+    arena: Allocator,
+    cfg: Config,
+    deps: RunDeps,
+    format: output_contracts.OutputFormat,
+    workspace_root: []const u8,
+    set: []const settings_entries.Entry,
+) ![]settings_entries.Entry {
+    var detailed = try config_runtime.loadMergedSettingsDetailed(alloc, workspace_root);
+    defer detailed.deinit(alloc);
+    // The same warnings fx status prints, such as a profile fx rejects, which
+    // explain a value shown as the default.
+    if (format == .text) try writeConfigDiagnostics(alloc, deps, detailed.diagnostics);
+    var state = app_lifecycle.StartupState{ .agent_step_limit = cfg.default_agent_step_limit };
+    defer state.deinit(alloc);
+    state.model_source = detailed.model_source orelse .compiled_default;
+    try app_lifecycle.resolveSettings(alloc, &state, &detailed);
+    const selection = try config_runtime.selectProviderModel(cfg.default_model, &detailed.settings, null, config_runtime.modelEnvOverride());
+    const entries = try cli_config.effectiveEntries(arena, &state, selection.provider, set);
+    // Values borrow from `state`, which is freed on return.
+    for (entries) |*entry| entry.value = try dupeJsonValue(arena, entry.value);
+    return entries;
+}
+
+fn dupeJsonValue(arena: Allocator, value: std.json.Value) !std.json.Value {
+    return switch (value) {
+        .string => |text| .{ .string = try arena.dupe(u8, text) },
+        .number_string => |text| .{ .number_string = try arena.dupe(u8, text) },
+        .array => |array| blk: {
+            var copy: std.json.Array = .init(arena);
+            for (array.items) |item| try copy.append(try dupeJsonValue(arena, item));
+            break :blk .{ .array = copy };
+        },
+        else => value,
+    };
 }
 
 const workspace_write_message = "preferences apply to every workspace, so set and unset don't take --workspace";
