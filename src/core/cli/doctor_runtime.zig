@@ -1,9 +1,12 @@
 const std = @import("std");
+const profile_paths = @import("../shared/profile_paths.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const agent_steps = @import("../config/agent_steps.zig");
 const config_runtime = @import("../config/config_runtime.zig");
+const settings_keys = @import("../config/settings_keys.zig");
+const settings_messages = @import("settings_messages.zig");
 const host = @import("../hosts/host.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
 const session_store = @import("../session/session_store.zig");
@@ -117,6 +120,7 @@ pub fn collect(
 
     try appendConfigCheck(&checks, alloc, paths, detailed.diagnostics);
     try appendConfigDiagnosticChecks(&checks, alloc, detailed.diagnostics);
+    try appendUnknownSettingChecks(&checks, alloc, paths);
     try appendMcpConfigCheck(&checks, alloc, mcp_config_diagnostic);
     try appendAuthCheck(&checks, alloc, snapshot.auth);
     const selection = config_runtime.selectProviderModel(
@@ -152,6 +156,43 @@ fn appendConfigDiagnosticChecks(
         try config_runtime.writeDiagnosticMetadata(&detail_writer.writer, diagnostic);
         const detail = try detail_writer.toOwnedSlice();
         try appendCheckOwned(checks, alloc, "config", .warn, detail);
+    }
+}
+
+/// Warns about each key fx doesn't know in the profile and project settings
+/// files, with the closest known key. Startup ignores these keys silently.
+fn appendUnknownSettingChecks(
+    checks: *std.ArrayList(Check),
+    alloc: Allocator,
+    paths: config_runtime.Paths,
+) !void {
+    if (paths.user_settings) |path| try appendUnknownSettingChecksFor(checks, alloc, path, profile_paths.displayText("~/.fx/settings.json"), .profile);
+    try appendUnknownSettingChecksFor(checks, alloc, paths.workspace_settings, ".fx.json", .project);
+}
+
+fn appendUnknownSettingChecksFor(
+    checks: *std.ArrayList(Check),
+    alloc: Allocator,
+    path: []const u8,
+    display_path: []const u8,
+    file: settings_keys.File,
+) !void {
+    // An unreadable or malformed file is already reported by the config check.
+    const loaded = config_runtime.readSettingsFileJson(alloc, path) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return,
+    };
+    var parsed = loaded orelse return;
+    defer parsed.deinit();
+    const unknown = try settings_keys.findUnknown(alloc, parsed.value, file);
+    defer alloc.free(unknown);
+    for (unknown) |key| {
+        try appendCheckOwned(checks, alloc, "config", .warn, try settings_messages.formatUnknownSetting(alloc, key, display_path));
+    }
+    const twice = try settings_keys.findRenamedTwice(alloc, parsed.value, file);
+    defer alloc.free(twice);
+    for (twice) |entry| {
+        try appendCheckOwned(checks, alloc, "config", .warn, try settings_messages.formatRenamedTwice(alloc, entry, display_path));
     }
 }
 
@@ -515,15 +556,15 @@ fn recoveryActionForSessionDiagnostic(
         .invalid_commit_intent,
         => std.mem.print(
             buffer,
-            "back up ~/.fx/sessions, then inspect this session with fx session {s} --json",
-            .{session_id},
+            "back up {s}/sessions, then inspect this session with fx session {s} --json",
+            .{ profile_paths.displayRoot(), session_id },
         ),
 
         .missing_authority,
         .invalid_authority,
         .invalid_authority_transition,
         .unsafe_path,
-        => "back up ~/.fx/sessions and avoid opening this session until the path is repaired",
+        => profile_paths.displayText("back up ~/.fx/sessions and avoid opening this session until the path is repaired"),
     };
 }
 
@@ -586,8 +627,8 @@ fn appendMcpConfigCheck(
             var out: std.Io.Writer.Allocating = .init(alloc);
             defer out.deinit();
             try out.writer.print(
-                "~/.fx/mcp.json warning: {s}",
-                .{@tagName(warning.cause)},
+                "{s}/mcp.json warning: {s}",
+                .{ profile_paths.displayRoot(), @tagName(warning.cause) },
             );
             if (warning.key()) |key| try out.writer.print(" key={s}", .{key});
             try out.writer.print(
@@ -605,8 +646,8 @@ fn appendMcpConfigCheck(
         },
         .failed => |err| {
             const detail = try alloc.print(
-                "failed to load ~/.fx/mcp.json: {s}",
-                .{@errorName(err)},
+                "failed to load {s}/mcp.json: {s}",
+                .{ profile_paths.displayRoot(), @errorName(err) },
             );
             try appendCheckOwned(checks, alloc, "mcp_config", .fail, detail);
             return;
@@ -623,7 +664,7 @@ fn formatConfigPresence(alloc: Allocator, user_exists: bool, repo_exists: bool) 
     if (user_exists) {
         if (!first) try out.writer.writeAll(", ");
         first = false;
-        try out.writer.writeAll("~/.fx/settings.json");
+        try out.writer.writeAll(profile_paths.displayText("~/.fx/settings.json"));
     }
     if (repo_exists) {
         if (!first) try out.writer.writeAll(", ");

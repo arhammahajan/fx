@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const oauth = @import("../auth/oauth.zig");
 const io = @import("../shared/io.zig");
+const profile_paths = @import("../shared/profile_paths.zig");
 const browser = @import("../auth/browser_callback.zig");
 const transport_mod = @import("../auth/oauth_transport.zig");
 const host = @import("../hosts/host.zig");
@@ -40,12 +41,12 @@ const Installation = struct {
 // The caller supplies an arena; the returned snapshot borrows its allocations.
 pub fn run(alloc: Allocator, action: Action, transport: transport_mod.Provider, opener: host.UrlOpener) !output.SlackSnapshot {
     if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return error.SlackInstallationUnsupported;
-    const origin = io.getenv("FX_E2E_SLACK_ORIGIN") orelse "https://fx.sh";
+    const origin = io.getenv("FX_TEST_SLACK_ORIGIN") orelse "https://fx.sh";
     if (!std.mem.eql(u8, origin, "https://fx.sh") and !test_origin(origin)) return error.InvalidSlackTestOrigin;
     const home = io.homeDir() orelse return error.HomeNotSet;
-    var home_dir = io.VerifiedDir{ .dir = try std.Io.Dir.openDirAbsolute(io.getIo(), home, .{ .iterate = true }) };
+    var home_dir = io.VerifiedDir{ .dir = try std.Io.Dir.openDirAbsolute(io.getIo(), profile_paths.rootParent(home), .{ .iterate = true }) };
     defer home_dir.close();
-    var root = try io.openOrCreateVerifiedPrivateDir(&home_dir, ".fx");
+    var root = try io.openOrCreateVerifiedPrivateDir(&home_dir, profile_paths.rootName());
     defer root.close();
     var dir = try io.openOrCreateVerifiedPrivateDir(&root, "slack");
     defer dir.close();
