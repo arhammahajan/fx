@@ -757,7 +757,6 @@ fn loadStartupStateWithKeychainRead(
     if (hasProcessModelOverride()) state.model_source = .process_override;
     state.config_diagnostics = detailed.diagnostics;
     detailed.diagnostics = &.{};
-    state.prompt_history_enabled = settings.prompt_history_enabled orelse true;
     state.prompt_history_store_allowed = detailed.prompt_history_store_allowed;
     state.credential_source_preference = settings.credential_source;
     if (auth_mode == .local and !state.model_requests_blocked) {
@@ -789,10 +788,22 @@ fn loadStartupStateWithKeychainRead(
             state.fx_login_status = resolution.fx_login_status;
         }
     }
+    try resolveSettings(alloc, &state, &detailed);
+
+    return state;
+}
+
+/// Turns merged settings into the values a run uses, defaults and `FX_*`
+/// overrides included. The session and `fx config get` both read settings
+/// through it, so the two can't disagree. Call it with `state.agent_step_limit`
+/// holding the default and `state.model_source` already set.
+pub fn resolveSettings(alloc: Allocator, state: *StartupState, detailed: *const config_runtime.DetailedSettings) !void {
+    const settings = &detailed.settings;
+    state.prompt_history_enabled = settings.prompt_history_enabled orelse true;
     state.permission_mode = loadPermissionMode(settings.permission_mode);
     state.yolo_acknowledged = settings.yolo_acknowledged orelse false;
     state.permission_rules = try types.dupePermissionRuleSet(alloc, settings.permission_rules);
-    state.agent_step_limit = loadAgentStepLimit(default_agent_step_limit, settings.max_agent_steps);
+    state.agent_step_limit = loadAgentStepLimit(state.agent_step_limit, settings.max_agent_steps);
     state.max_tool_result_bytes = tool_result_limits.resolveMaxToolResultBytes(settings.max_tool_result_bytes, tool_result_limits.default_max_tool_result_bytes);
     state.auto_compact_percent = compactor.resolvePercent(settings.auto_compact_percent, io_mod.getenv("FX_AUTO_COMPACT_PERCENT"));
     state.context_limits = config_runtime.resolveContextLimits(settings, &.{});
@@ -845,8 +856,12 @@ fn loadStartupStateWithKeychainRead(
     state.notification_turn_end = sound_on_override orelse settings.notification_turn_end orelse notification_sound.default_enabled;
     state.notification_attention_required = sound_on_override orelse settings.notification_attention_required orelse notification_sound.default_enabled;
     state.notification_max = max_override orelse settings.notification_max orelse false;
+}
 
-    return state;
+/// `FX_THEME`, which beats the `theme` setting. An empty value counts as unset.
+pub fn themeEnvOverride() ?[]const u8 {
+    const value = io_mod.getenv("FX_THEME") orelse return null;
+    return if (value.len > 0) value else null;
 }
 
 const StartupFastMode = struct {
@@ -931,9 +946,7 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
     // builtin variant and skip the OSC 11 probe; any other value names a theme
     // file under ~/.fx/themes.
     var configured_theme: ?[]const u8 = state.theme;
-    if (io_mod.getenv("FX_THEME")) |value| {
-        if (value.len > 0) configured_theme = value;
-    }
+    if (themeEnvOverride()) |value| configured_theme = value;
     if (if (configured_theme) |value| shared_theme.classifyValue(value) else null) |choice| {
         switch (choice) {
             .pin_light, .pin_dark => {
