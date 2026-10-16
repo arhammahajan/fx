@@ -227,7 +227,7 @@ class Checker:
                     line,
                     "env",
                     f"{name} is not in {REGISTRY}. Register it with a job and a "
-                    "stability, or reuse an existing variable (shape rule S-7).",
+                    "stability, or reuse an existing variable (Env vars in .fx/skills/fx-cli-shape/references/rules.md).",
                 )
         for name, entry in sorted(registered.items()):
             if name not in seen:
@@ -273,7 +273,7 @@ class Checker:
                 line,
                 "flags",
                 f'"{flag}" must be kebab-case with no value inside the name; '
-                "pass values as an argument (shape rule S-6)",
+                "pass values as an argument (Flags in .fx/skills/fx-cli-shape/references/rules.md)",
             )
 
     def check_parsing(self) -> None:
@@ -297,7 +297,7 @@ class Checker:
                         "parsing",
                         f"{flag} is compared with an argument by hand. Add it to the "
                         f"command's option list in {COMMANDS} and read it through "
-                        "cli_flags (shape rules S-6 and S-13), or list it in "
+                        "cli_flags (Flags and One source of truth in .fx/skills/fx-cli-shape/references/rules.md), or list it in "
                         f"hand_parsed_flags in {REGISTRY} with the reason.",
                     )
         for flag in sorted(set(allowed) - seen):
@@ -312,7 +312,7 @@ class Checker:
                 key = match.group(1)
                 if SNAKE_KEY.match(key) or self.excepted("setting_keys", key):
                     continue
-                self.report(line, "settings", f'settings key "{key}" must be snake_case (shape rule S-8)')
+                self.report(line, "settings", f'settings key "{key}" must be snake_case (Settings in .fx/skills/fx-cli-shape/references/rules.md)')
         listed = {
             match.group(1): (line, match.group(2))
             for line in self.lines(SETTINGS_KEYS)

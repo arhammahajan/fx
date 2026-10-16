@@ -1,5 +1,5 @@
 {
-  "_about": "Registry for scripts/check_cli_shape.py. env lists every FX_* environment variable fx reads, with its job and stability (shape rule S-7). external_env lists the non-fx variables fx reads by name. not_env lists FX_* string literals that are not environment variables. exceptions maps known shape violations to the reason and the finding that removes them; delete an entry when its finding lands.",
+  "_about": "Registry for scripts/check_cli_shape.py. env lists every FX_* environment variable fx reads, with its job and stability (Env vars in .fx/skills/fx-cli-shape/references/rules.md). external_env lists the non-fx variables fx reads by name. not_env lists FX_* string literals that are not environment variables. exceptions maps known shape violations to the reason and the finding that removes them; delete an entry when its finding lands.",
   "env": {
     "FX_AUTH_MODE": {
       "job": "internal",

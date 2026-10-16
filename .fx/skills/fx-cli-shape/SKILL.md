@@ -38,7 +38,7 @@ These are the rules agents most often get wrong. [references/rules.md](reference
 
 **Flag placement.** Agent-run flags (`--model`, `--provider`, `--effort`, `--fast`, `--ultrafast`, `--provider-order`, `--provider-strict`, `--permission-mode`) go after the subcommand, and every command that runs the agent accepts the whole set, parsed by `src/core/cli/agent_run_flags.zig`. `fx acp` leaves out the two provider-order flags, because ACP sessions don't apply gateway provider routing. Plain `fx` takes them directly. Only launch-wide flags such as `--add-dir` go before a subcommand, as in `git -C dir log`.
 
-**Env vars are for context, not preferences.** A setting gets a named env override only when CI or wrapper scripts need it for a whole process tree, and the override uses the setting's name: `collapse_tool_calls` becomes `FX_COLLAPSE_TOOL_CALLS`, never a shorter invented name. Other settings use the planned generic override. Diagnostics use `FX_TRACE*` and `FX_RECORD*`, tests use `FX_TEST_*`, and fx's home will be `FX_HOME`. Respect `NO_COLOR` and `TERM=dumb`.
+**Env vars are for context, not preferences.** A setting gets a named env override only when CI or wrapper scripts need it for a whole process tree, and the override uses the setting's name: `collapse_tool_calls` becomes `FX_COLLAPSE_TOOL_CALLS`, never a shorter invented name. Other settings take `fx ask --config key=value` for one run. Diagnostics use `FX_TRACE*` and `FX_RECORD*`, tests use `FX_TEST_*`, and `FX_HOME` moves fx's home. Respect `NO_COLOR` and `TERM=dumb`.
 
 **Experiments are settings.** An unfinished feature is `experimental.<name>`, off by default and profile-only. It never gets its own flag or env var, so finishing or dropping it removes nothing people type.
 
@@ -89,7 +89,7 @@ Ask before inventing a rule for something these rules don't cover: keyboard shor
 - Full access is saved and printed as `full-access`, and `yolo` is still read. Only ACP's mode `_meta` and the fx-managed `yolo_acknowledged` key keep the old word.
 - `fx login vercel --api-key` pastes an AI Gateway API key. `fx setup` and `/setup` still work but warn: `fx setup` points to `fx login vercel --api-key`, and `/setup`, an alias of `/provider`, points to `/login` and `/provider`. Neither appears in help. Don't give "setup" a new meaning.
 - Resume already has seven kept spellings. Use `--resume last` or `--resume <id>`; never add another form such as `--resume-latest`.
-- The five test-hook prefixes are leftovers, not patterns to copy.
+- Every test hook starts with `FX_TEST_`; CI rejects a test hook with any other prefix.
 
 ## References
 
