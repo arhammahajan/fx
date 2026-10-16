@@ -340,6 +340,15 @@ pub fn selectProviderModel(
     return .{ .provider = provider, .model = model };
 }
 
+/// What fx says about a provider name that isn't built in and isn't defined
+/// under "providers". `fx provider` and `fx ask --provider` both print it.
+pub fn unknownProviderMessage(alloc: Allocator, name: []const u8) ![]u8 {
+    return alloc.print(
+        "unknown provider {s}; expected gateway, codex, grok, or a name under \"providers\" in {s}",
+        .{ name, profile_paths.displayText("~/.fx/settings.json") },
+    );
+}
+
 /// User-facing guidance for a `ModelSelectionError`, or null for any other error.
 pub fn modelNotSelectedMessage(err: anyerror) ?[]const u8 {
     const for_this_run = "or set a model for this run with --model or FX_MODEL";

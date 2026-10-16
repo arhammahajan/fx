@@ -1153,13 +1153,12 @@ fn activateProviderSelectionFallible(
     if (target == .configured) {
         const bound = target.bind(settings.providers orelse .{}) catch |err| switch (err) {
             error.UnknownConfiguredProvider => {
-                const detail = try alloc.print(
-                    "unknown provider {s}; expected gateway, codex, grok, or a name under \"providers\" in ~/.fx/settings.json",
-                    .{target.label()},
-                );
+                const detail = try config_runtime.unknownProviderMessage(alloc, target.label());
                 defer alloc.free(detail);
                 try writeProviderActivationError(alloc, deps, caller, detail);
-                return false;
+                // A name fx doesn't know is a bad argument, so the caller
+                // exits as a usage error.
+                return error.UnknownConfiguredProvider;
             },
             error.ConfiguredProviderChanged => return err,
         };
@@ -1684,12 +1683,13 @@ fn runNonInteractiveWithDeps(
             }
             const target = model_provider.parse(rest[0]) orelse {
                 try writeStderr(deps, "fx provider: expected gateway, codex, grok, or a configured name\n");
-                return .handled_failure;
+                return usage_failure;
             };
-            return if (try activateProviderSelection(alloc, cfg, deps, target, .provider_command, null))
-                .handled_success
-            else
-                .handled_failure;
+            const activated = activateProviderSelection(alloc, cfg, deps, target, .provider_command, null) catch |err| switch (err) {
+                error.UnknownConfiguredProvider => return usage_failure,
+                else => return err,
+            };
+            return if (activated) .handled_success else .handled_failure;
         },
         .setup => |rest| {
             if (try command_specs.deprecationWarning(alloc, cfg.command_catalog, .setup)) |warning| {

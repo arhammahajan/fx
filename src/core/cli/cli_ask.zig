@@ -1534,6 +1534,25 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
             );
             return 1;
         }
+        if (err == error.UnknownConfiguredProvider) {
+            // Named by --provider, it's a bad argument; from FX_PROVIDER or a
+            // settings file, it's a failure to run.
+            const from_flag = options.agent.provider != null;
+            const code: u8 = if (from_flag) output_contracts.usage_exit_code else 1;
+            const name = if (options.agent.provider) |provider| provider.label() else config_runtime.providerEnvOverride() orelse "";
+            if (options.json_output) {
+                const json = try renderErrorJsonResult(alloc, @errorName(err), code);
+                defer alloc.free(json);
+                try deps.write_stdout(deps.stdout_ctx, json);
+                return code;
+            }
+            const message = try config_runtime.unknownProviderMessage(alloc, name);
+            defer alloc.free(message);
+            try deps.write_stderr(deps.stderr_ctx, "fx ask: ");
+            try deps.write_stderr(deps.stderr_ctx, message);
+            try deps.write_stderr(deps.stderr_ctx, "\n");
+            return code;
+        }
         if (!options.json_output) {
             const notice = askErrorNotice(err) orelse return err;
             try deps.write_stderr(deps.stderr_ctx, "fx ask: ");
