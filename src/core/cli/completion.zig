@@ -231,7 +231,8 @@ pub fn writeScript(
 fn writeBash(w: *Writer, model: *const Model) !void {
     try w.writeAll(
         \\# bash completion for fx. Load it with:
-        \\#   source <(fx completion bash)
+        \\#   eval "$(fx completion bash)"
+        \\# bash 3.2, the macOS default, loads nothing through source <(...).
         \\
         \\_fx_words() {
         \\    case "$1" in

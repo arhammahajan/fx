@@ -6204,7 +6204,7 @@ describe("cli: completion", () => {
       expect(none.stderr).toBe("usage: fx completion bash|zsh|fish\n");
       const help = await runFx(["completion", "--help"], { env: { HOME: home } });
       expect(help.code).toBe(0);
-      expect(help.stdout).toContain("Commands:\n  bash  Load it with: source <(fx completion bash)\n");
+      expect(help.stdout).toContain('Commands:\n  bash  Load it with: eval "$(fx completion bash)"\n');
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
@@ -6216,7 +6216,9 @@ describe("cli: completion", () => {
       const script = await writeScript("bash", home);
       const harness = join(home, "harness.bash");
       writeFileSync(harness, [
-        `source '${script}'`,
+        // The way help says to load it. bash 3.2 loads nothing through
+        // source <(...), so eval is the line that works everywhere.
+        `eval "$(cat '${script}')"`,
         'comp() { COMP_WORDS=("$@"); COMP_CWORD=$(( ${#COMP_WORDS[@]} - 1 )); COMPREPLY=(); _fx; echo "${COMPREPLY[*]}"; }',
         ...cases.map(([words]) => `comp ${quoted(words)}`),
         "",

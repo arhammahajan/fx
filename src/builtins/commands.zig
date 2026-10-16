@@ -414,7 +414,7 @@ pub const top_level_specs = [_]TopLevelSpec{
         .usage = "completion bash|zsh|fish",
         .summary = "Print a shell completion script",
         .subcommands = &.{
-            .{ .usage = "bash", .description = "Load it with: source <(fx completion bash)" },
+            .{ .usage = "bash", .description = "Load it with: eval \"$(fx completion bash)\"" },
             .{ .usage = "zsh", .description = "Load it after compinit with: source <(fx completion zsh)" },
             .{ .usage = "fish", .description = "Load it with: fx completion fish | source" },
         },
