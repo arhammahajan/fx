@@ -654,39 +654,7 @@ fn loadMergedSettingsDetailedWithOptionalHome(
             ),
         };
     }
-    if (io_mod.getenv("FX_PROVIDER_ORDER")) |order_override| {
-        switch (parseProviderOrderList(alloc, order_override)) {
-            .ok => |maybe_order| {
-                if (maybe_order) |order| {
-                    if (settings.provider_order) |old| {
-                        for (old) |slug| alloc.free(@constCast(slug));
-                        alloc.free(old);
-                    }
-                    settings.provider_order = order;
-                }
-            },
-            .invalid => debug_trace.logf("config", "ignoring invalid FX_PROVIDER_ORDER value", .{}),
-        }
-    }
-    if (io_mod.getenv("FX_PROVIDER_STRICT")) |strict_override| {
-        const trimmed = std.mem.trim(u8, strict_override, " \t\r\n");
-        if (parseEnvBool(trimmed)) |strict| {
-            settings.provider_strict = strict;
-        } else if (trimmed.len > 0) {
-            debug_trace.logf("config", "ignoring invalid FX_PROVIDER_STRICT value", .{});
-        }
-    }
-    if (io_mod.getenv("FX_REVIEW_MODEL")) |review_override| {
-        const trimmed = std.mem.trim(u8, review_override, " \t\r\n");
-        if (trimmed.len > 0) {
-            if (settings_store.validateModel(trimmed)) |_| {
-                if (settings.review_model) |old| alloc.free(old);
-                settings.review_model = try alloc.dupe(u8, trimmed);
-            } else |_| {
-                debug_trace.logf("config", "ignoring invalid FX_REVIEW_MODEL value", .{});
-            }
-        }
-    }
+    try applyEnvSettingOverrides(alloc, &settings);
     const ultrafast_mode_env_override = ultrafastModeEnvOverride() catch |err| blk: {
         try diagnostics.append(alloc, .{
             .layer = .user,
@@ -1418,6 +1386,46 @@ pub const SettingOverride = struct {
 /// settings file. Flags and FX_* variables are resolved later, so they still
 /// win, as they do over the files. A later override for a key replaces an
 /// earlier one. Nothing is saved.
+/// The `FX_*` overrides the loader applies to merged settings:
+/// `FX_PROVIDER_ORDER`, `FX_PROVIDER_STRICT`, and `FX_REVIEW_MODEL`. They beat
+/// every settings layer, including `fx ask --config`, so
+/// `applySettingOverrides` runs them again after its merge.
+pub fn applyEnvSettingOverrides(alloc: Allocator, settings: *Settings) !void {
+    if (io_mod.getenv("FX_PROVIDER_ORDER")) |order_override| {
+        switch (parseProviderOrderList(alloc, order_override)) {
+            .ok => |maybe_order| {
+                if (maybe_order) |order| {
+                    if (settings.provider_order) |old| {
+                        for (old) |slug| alloc.free(@constCast(slug));
+                        alloc.free(old);
+                    }
+                    settings.provider_order = order;
+                }
+            },
+            .invalid => debug_trace.logf("config", "ignoring invalid FX_PROVIDER_ORDER value", .{}),
+        }
+    }
+    if (io_mod.getenv("FX_PROVIDER_STRICT")) |strict_override| {
+        const trimmed = std.mem.trim(u8, strict_override, " \t\r\n");
+        if (parseEnvBool(trimmed)) |strict| {
+            settings.provider_strict = strict;
+        } else if (trimmed.len > 0) {
+            debug_trace.logf("config", "ignoring invalid FX_PROVIDER_STRICT value", .{});
+        }
+    }
+    if (io_mod.getenv("FX_REVIEW_MODEL")) |review_override| {
+        const trimmed = std.mem.trim(u8, review_override, " \t\r\n");
+        if (trimmed.len > 0) {
+            if (settings_store.validateModel(trimmed)) |_| {
+                if (settings.review_model) |old| alloc.free(old);
+                settings.review_model = try alloc.dupe(u8, trimmed);
+            } else |_| {
+                debug_trace.logf("config", "ignoring invalid FX_REVIEW_MODEL value", .{});
+            }
+        }
+    }
+}
+
 pub fn applySettingOverrides(alloc: Allocator, settings: *Settings, overrides: []const SettingOverride) !void {
     if (overrides.len == 0) return;
     var arena: std.heap.ArenaAllocator = .init(alloc);
@@ -1438,6 +1446,8 @@ pub fn applySettingOverrides(alloc: Allocator, settings: *Settings, overrides: [
     var incoming = try parseSettingsValueForLayer(alloc, .{ .object = root }, .profile, false, true);
     defer incoming.deinit(alloc);
     try mergeSettings(settings, &incoming, alloc);
+    // Like git's GIT_* variables over -c, an FX_* override still wins.
+    try applyEnvSettingOverrides(alloc, settings);
 }
 
 /// Reads and parses one settings file for inspection, such as `fx doctor`'s
@@ -3036,6 +3046,18 @@ test "renamed groups read either spelling and the current one wins" {
     try std.testing.expect(stray.notification_max.?);
     try std.testing.expect(stray.statusline_context == null);
     try std.testing.expectError(error.InvalidNotificationsType, parseSettingsJson(alloc, "{\"notifications\":\"on\"}"));
+}
+
+test "an FX_* override beats a setting override for one run" {
+    const alloc = std.testing.allocator;
+    var env = try TestHome.install(alloc, null);
+    defer env.deinit();
+    try env.map.put("FX_PROVIDER_STRICT", "0");
+
+    var settings = try parseSettingsJson(alloc, "{\"provider_strict\":false}");
+    defer settings.deinit(alloc);
+    try applySettingOverrides(alloc, &settings, &.{.{ .key = "provider_strict", .value = .{ .bool = true } }});
+    try std.testing.expect(!settings.provider_strict.?);
 }
 
 test "setting overrides sit above the files, nest dotted keys, and keep the last value" {
