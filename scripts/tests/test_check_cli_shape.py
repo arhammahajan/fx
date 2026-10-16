@@ -231,6 +231,32 @@ class CheckCliShapeTests(unittest.TestCase):
         self.registry["hand_parsed_flags"]["--verbose="] = "a listed reason"
         self.assertEqual([], self.run_check())
 
+    def test_hand_compare_is_found_in_either_order_and_through_constants(self) -> None:
+        self.edit(
+            check_cli_shape.CLI_SURFACE,
+            "    _ = &parser;\n",
+            '    _ = &parser;\n    if (std.mem.eql(u8, "--verbose", args[0])) {}\n',
+        )
+        self.assertOnly(self.run_check(), "parsing", "--verbose is compared with an argument by hand")
+        self.edit(
+            check_cli_shape.CLI_SURFACE,
+            '    if (std.mem.eql(u8, "--verbose", args[0])) {}\n',
+            '    const quiet_flag = "--quiet";\n    if (std.mem.eql(u8, args[0], quiet_flag)) {}\n',
+        )
+        self.assertOnly(self.run_check(), "parsing", "--quiet is compared with an argument by hand")
+
+    def test_hand_compare_outside_the_cli_folder_fails_until_its_file_is_listed(self) -> None:
+        path = "src/core/other/parse.zig"
+        (self.root / "src/core/other").mkdir(parents=True, exist_ok=True)
+        (self.root / path).write_text('fn parse(arg: []const u8) bool {\n    return std.mem.eql(u8, arg, "--dry-run");\n}\n')
+        self.assertOnly(self.run_check(), "parsing", "--dry-run is compared with an argument by hand")
+        self.registry.setdefault("hand_parsed_files", {})[path] = "reads another program's flags"
+        self.assertEqual([], self.run_check())
+
+    def test_stale_hand_parsed_file_fails(self) -> None:
+        self.registry.setdefault("hand_parsed_files", {})["src/core/gone.zig"] = "no longer compares"
+        self.assertOnly(self.run_check(), "registry", 'hand_parsed_files lists "src/core/gone.zig"')
+
     def test_stale_hand_parsed_entry_fails(self) -> None:
         self.registry["hand_parsed_flags"]["--gone"] = "no longer compared"
         self.assertOnly(self.run_check(), "registry", 'hand_parsed_flags lists "--gone"')

@@ -65,7 +65,12 @@ LIBFX_MODEL_FIELD = re.compile(r"^\s+([a-z][A-Za-z]*)\??:")
 TOP_LEVEL_KEY_READ = re.compile(r'\broot\.object\.(?:get|getPtr|contains)\("([^"]+)"\)')
 SETTING_ENTRY = re.compile(r'\.name = "([^"]+)", \.where = \.([a-z_]+)')
 TEST_START = re.compile(r"^\s*test\b")
-HAND_COMPARE = re.compile(r'(?:eql|startsWith)\(u8,\s*[^,]+,\s*"(-{1,2}[A-Za-z][A-Za-z0-9-]*=?)"')
+HAND_FLAG = r'(-{1,2}[A-Za-z][A-Za-z0-9-]*=?)'
+# `eql(u8, arg, "--x")` and `eql(u8, "--x", arg)`.
+HAND_COMPARE = re.compile(r'(?:eql|startsWith)\(u8,\s*[^,"]+,\s*"' + HAND_FLAG + '"')
+HAND_COMPARE_FIRST = re.compile(r'(?:eql|startsWith)\(u8,\s*"' + HAND_FLAG + r'"\s*,')
+# A flag kept in a named constant, such as `const resume_short_flag = "-r";`.
+FLAG_CONSTANT = re.compile(r'\bconst\s+(\w+)\s*=\s*"' + HAND_FLAG + '";')
 CLI_DIR = "src/core/cli"
 STRING = re.compile(r'"(?:\\.|[^"\\])*"')
 CHAR = re.compile(r"'(?:\\.|[^'\\])+'")
@@ -120,6 +125,17 @@ def non_test_lines(path: str, text: str) -> list[Line]:
             continue
         lines.append(Line(path, number, raw, code))
     return lines
+
+
+def compared_flags(text: str, constants: dict[str, str]) -> list[str]:
+    """The flag literals a line compares with an argument, in either order or
+    through a named constant."""
+    flags = [m.group(1) for m in HAND_COMPARE.finditer(text)]
+    flags += [m.group(1) for m in HAND_COMPARE_FIRST.finditer(text)]
+    for name, flag in constants.items():
+        if re.search(r"(?:eql|startsWith)\(u8,\s*(?:[^,]+,\s*" + name + r"\b|" + name + r"\s*,)", text):
+            flags.append(flag)
+    return flags
 
 
 def function_body(lines: list[Line], name: str) -> list[Line]:
@@ -283,12 +299,18 @@ class Checker:
         slip past help, so each remaining comparison needs a listed reason.
         """
         allowed = self.registry.get("hand_parsed_flags", {})
+        files = self.registry.get("hand_parsed_files", {})
         seen: set[str] = set()
-        for source in sorted((self.root / CLI_DIR).glob("*.zig")):
+        seen_files: set[str] = set()
+        for source in sorted((self.root / "src").rglob("*.zig")):
             path = source.relative_to(self.root).as_posix()
-            for line in self.lines(path):
-                for match in HAND_COMPARE.finditer(line.text):
-                    flag = match.group(1)
+            lines = self.lines(path)
+            constants = {m.group(1): m.group(2) for line in lines for m in FLAG_CONSTANT.finditer(line.text)}
+            for line in lines:
+                for flag in compared_flags(line.text, constants):
+                    if path in files:
+                        seen_files.add(path)
+                        continue
                     seen.add(flag)
                     if flag in allowed:
                         continue
@@ -302,6 +324,8 @@ class Checker:
                     )
         for flag in sorted(set(allowed) - seen):
             self.report(None, "registry", f'hand_parsed_flags lists "{flag}", which no CLI code compares; remove it')
+        for path in sorted(set(files) - seen_files):
+            self.report(None, "registry", f'hand_parsed_files lists "{path}", which compares no flag by hand; remove it')
 
     def check_settings(self) -> None:
         config = self.lines(CONFIG_RUNTIME)
