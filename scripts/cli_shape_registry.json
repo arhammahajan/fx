@@ -381,7 +381,8 @@
     "--golden": "Maps a missing-value failure onto fx replay's own error.",
     "-p": "Other agents' one-shot flag. fx doesn't accept it; it is matched only to point to fx ask.",
     "--print": "Long form of -p, matched only to point to fx ask.",
-    "--print=": "Inline form of --print, matched only to point to fx ask."
+    "--print=": "Inline form of --print, matched only to point to fx ask.",
+    "--no-": "Pairs each --x with --no-x at compile time to build the launch usage line from launch_options; no argument is read."
   },
   "run_options": {
     "_about": "One row per option a run can set, named on every surface: the agent-run flag, the setting, its FX_* variable, the ACP config option, and the libfx option. Names may differ by surface, as ACP's mode does, but each one is written here. check_cli_shape fails when ACP offers a config option or libfx's FxModelOptions declares a field that no row names, or when a row names something that doesn't exist.",

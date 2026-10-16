@@ -510,13 +510,19 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
     } },
 };
 
-/// The flags `fx` reads before a command or an interactive launch, in the
-/// form the shared flag parser reads. `top_level_flags` documents them in
-/// `fx --help`, and a test checks that every flag here appears there.
-pub const launch_options = [_]command_specs.OptionDoc{
+/// The launch-wide flags: they go before a command, which can't take them
+/// itself, as `git -C dir log` does.
+pub const launch_wide_options = [_]command_specs.OptionDoc{
     .{ .flag = "--context-limit <spec>", .description = "" },
     .{ .flag = "--add-dir <path>", .description = "" },
     .{ .flag = "--no-additional-dirs", .description = "" },
+};
+
+/// The flags `fx` reads before a command or an interactive launch, in the
+/// form the shared flag parser reads. `top_level_flags` documents them in
+/// `fx --help`, and a test checks that the two lists match. The usage line
+/// after a launch-flag mistake is built from this list.
+pub const launch_options = launch_wide_options ++ [_]command_specs.OptionDoc{
     .{ .flag = "--provider <name>", .description = "", .values = &builtin_providers },
     .{ .flag = "--provider-order <a,b,...>", .description = "" },
     .{ .flag = "--provider-strict", .description = "" },
@@ -533,6 +539,26 @@ pub const launch_options = [_]command_specs.OptionDoc{
     .{ .flag = "--full-access", .description = "" },
     .{ .flag = "--yolo", .description = "" },
     .{ .flag = "--sessions-v2", .description = "Use the experimental v2 session store", .hidden = true },
+};
+
+/// `usage: fx [--context-limit <spec>] ... <command>`, from `launch_options`,
+/// with each `--x` and `--no-x` pair written as `[--x|--no-x]`.
+pub const launch_usage: []const u8 = blk: {
+    @setEvalBranchQuota(20_000);
+    var out: []const u8 = "usage: fx";
+    var i: usize = 0;
+    while (i < launch_options.len) : (i += 1) {
+        const doc = launch_options[i];
+        if (doc.hidden or doc.replacement != null) continue;
+        const name = doc.flag[0 .. std.mem.findScalar(u8, doc.flag, ' ') orelse doc.flag.len];
+        if (i + 1 < launch_options.len and std.mem.eql(u8, launch_options[i + 1].flag, "--no-" ++ name[2..])) {
+            out = out ++ " [" ++ doc.flag ++ "|" ++ launch_options[i + 1].flag ++ "]";
+            i += 1;
+            continue;
+        }
+        out = out ++ " [" ++ doc.flag ++ "]";
+    }
+    break :blk out ++ " <command>\n";
 };
 
 pub const top_level_flags = [_]TopLevelFlag{
@@ -881,4 +907,27 @@ test "every launch flag appears in fx --help" {
         std.debug.print("{s} is parsed but missing from top_level_flags\n", .{name});
         return error.TestExpectedEqual;
     }
+    // And the other way: help shows no launch flag the parser doesn't read,
+    // apart from the resume words, help, and version, which fx reads first.
+    for (top_level_flags) |flag| {
+        var parts = std.mem.splitSequence(u8, flag.usage, ", ");
+        part: while (parts.next()) |part| {
+            const name = part[0 .. std.mem.findScalar(u8, part, ' ') orelse part.len];
+            for ([_][]const u8{ "-c", "--continue", "-r", "--resume", "-h", "--help", "-v", "--version" }) |early| {
+                if (std.mem.eql(u8, name, early)) continue :part;
+            }
+            for (launch_options) |doc| {
+                if (std.mem.eql(u8, cli_flags.flagName(doc), name)) continue :part;
+            }
+            std.debug.print("{s} is in top_level_flags but the launch parser doesn't read it\n", .{name});
+            return error.TestExpectedEqual;
+        }
+    }
+}
+
+test "the launch usage line pairs each --no- spelling with its flag" {
+    try std.testing.expect(std.mem.startsWith(u8, launch_usage, "usage: fx [--context-limit <spec>] [--add-dir <path>] [--no-additional-dirs] "));
+    try std.testing.expect(std.mem.find(u8, launch_usage, " [--fast|--no-fast] ") != null);
+    try std.testing.expect(std.mem.find(u8, launch_usage, "--sessions-v2") == null);
+    try std.testing.expect(std.mem.endsWith(u8, launch_usage, " <command>\n"));
 }
