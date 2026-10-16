@@ -1796,7 +1796,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendKeys("Right");
       grid = await waitForStatuslineMenu(session, "Context");
       pane = grid.join("\n");
-      expect(pane).not.toContain("saved to user settings");
+      expect(pane).not.toContain("saved to global settings");
       expect(pane).not.toMatch(/[*✓!✗⊘i] statusline:/);
       await waitForStatuslineValue(settingsPath, "session", true);
 
@@ -1804,7 +1804,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendKeys("Right");
       grid = await waitForStatuslineMenu(session, "Workspace");
       pane = grid.join("\n");
-      expect(pane).not.toContain("saved to user settings");
+      expect(pane).not.toContain("saved to global settings");
       await waitForStatuslineValue(settingsPath, "workspace", true);
 
       await session.sendKeys("Escape");

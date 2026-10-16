@@ -1392,7 +1392,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
             !pane.includes("model-helper"),
           TIMEOUT,
         );
-        expect(await session.capturePane()).not.toContain("saved to user settings");
+        expect(await session.capturePane()).not.toContain("saved to global settings");
 
         const stored = JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8"));
         expect(stored.models.gateway).toBe("xai/grok-build-1");
@@ -1633,7 +1633,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         rmSync(settingsPath);
         symlinkSync(externalSettings, settingsPath);
         await session.sendText("/statusline workspace");
-        await session.waitForText("active for this process but not saved to user settings", TIMEOUT);
+        await session.waitForText("active for this process but not saved to global settings", TIMEOUT);
         await session.waitForPane(
           (pane) => pane.includes("workspace-write-failure-visible"),
           TIMEOUT,

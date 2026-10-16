@@ -148,7 +148,7 @@ test.skipIf(!tmuxAvailable())(
       await session.sendText("/sound");
       await session.waitForText("* sound: on", TIMEOUT);
       expect(await session.captureFullScrollback()).not.toContain(
-        "saved to user settings",
+        "saved to global settings",
       );
 
       let settings = JSON.parse(readFileSync(settingsPath, "utf8"));

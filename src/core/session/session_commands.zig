@@ -69,7 +69,7 @@ pub fn reportUserSettingsCommit(
     var out: std.Io.Writer.Allocating = .init(app.alloc);
     defer out.deinit();
 
-    const benign_commit = "saved to user settings (scope=user)";
+    const benign_commit = "saved to global settings (scope=global)";
     try out.writer.writeAll(benign_commit);
     try appendShadowedUserSources(&out.writer, patch, detailed.sources);
     try appendCommitCleanup(&out.writer, outcome);
@@ -96,7 +96,7 @@ fn writeUserSettingsCommitUnknownSource(
     defer out.deinit();
 
     try out.writer.print(
-        "saved to user settings (scope=user); next-startup source unknown ({s})",
+        "saved to global settings (scope=global); next-startup source unknown ({s})",
         .{@errorName(resolution_error)},
     );
     try appendCommitCleanup(&out.writer, outcome);
@@ -120,12 +120,12 @@ pub fn reportUserSettingsFailure(
 
     if (err == error.SettingsCommitIndeterminate) {
         try out.writer.print(
-            "user settings persistence uncertain (scope=user, error={s})",
+            "global settings persistence uncertain (scope=global, error={s})",
             .{@errorName(err)},
         );
     } else {
         try out.writer.print(
-            "{s}not saved to user settings ({s})",
+            "{s}not saved to global settings ({s})",
             .{ if (runtime_changed) "active for this process but " else "", @errorName(err) },
         );
     }
@@ -2359,7 +2359,7 @@ test "session_commands handleSettings reports usage and save failures" {
 
     app.clearTranscript();
     try Commands(FakeApp).handleSettings(&app, "startup-scrollback off");
-    try expectTranscriptContains(&app, "✗ startup-scrollback: not saved to user settings (HomeNotSet)");
+    try expectTranscriptContains(&app, "✗ startup-scrollback: not saved to global settings (HomeNotSet)");
     try std.testing.expectEqual(types.NoticeTone.@"error", app.last_tone.?);
 }
 
@@ -3166,7 +3166,7 @@ test "session_commands user save notice uses one post-commit load after legacy c
     try Commands(FakeApp).handleModel(&app, "user/new");
 
     try std.testing.expectEqual(@as(usize, 1), app.post_commit_resolution_count);
-    try expectTranscriptContains(&app, "* model: saved to user settings (scope=user)");
+    try expectTranscriptContains(&app, "* model: saved to global settings (scope=global)");
     try std.testing.expect(std.mem.find(u8, app.text(), "model=project") == null);
     try expectTranscriptContains(&app, "normalized 1 legacy value across 1 workspace");
     try expectTranscriptContains(&app, "settings.json.preference-migration.model.");
@@ -3199,7 +3199,7 @@ test "session_commands durable user save survives post-commit resolver failure" 
     try Commands(FakeApp).handleModel(&app, "user/new");
 
     try std.testing.expectEqual(@as(usize, 1), app.post_commit_resolution_count);
-    try expectTranscriptContains(&app, "! model: saved to user settings (scope=user)");
+    try expectTranscriptContains(&app, "! model: saved to global settings (scope=global)");
     try expectTranscriptContains(&app, "next-startup source unknown");
     try expectTranscriptContains(&app, "normalized 1 legacy value across 1 workspace");
     try expectTranscriptContains(&app, "settings.json.preference-migration.model.");
@@ -3233,7 +3233,7 @@ test "session_commands durable user save survives post-commit resolver diagnosti
     try Commands(FakeApp).handleModel(&app, "user/new");
 
     try std.testing.expectEqual(@as(usize, 1), app.post_commit_resolution_count);
-    try expectTranscriptContains(&app, "! model: saved to user settings (scope=user)");
+    try expectTranscriptContains(&app, "! model: saved to global settings (scope=global)");
     try expectTranscriptContains(&app, "next-startup source unknown (DurablePathUnsafe)");
 }
 
@@ -3301,7 +3301,7 @@ test "session_commands runtime-first model keeps runtime state when both durable
     try std.testing.expectEqual(@as(usize, 1), app.preference_commit_count);
     try expectTranscriptContains(
         &app,
-        "✗ model: active for this process but not saved to user settings",
+        "✗ model: active for this process but not saved to global settings",
     );
     try expectTranscriptContains(
         &app,
@@ -3326,7 +3326,7 @@ test "session_commands report indeterminate settings and session failures indepe
 
     try Commands(FakeApp).handleModel(&app, "new/model");
 
-    try expectTranscriptContains(&app, "user settings persistence uncertain");
+    try expectTranscriptContains(&app, "global settings persistence uncertain");
     try expectTranscriptContains(&app, "normalized 1 legacy value across 1 workspace");
     try expectTranscriptContains(&app, "recovery=/tmp/settings.json.preference-migration.model.json");
     try expectTranscriptContains(&app, "✗ model: failed to persist current session");
