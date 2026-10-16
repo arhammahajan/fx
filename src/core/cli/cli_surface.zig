@@ -4912,7 +4912,20 @@ fn parseWorkflowArgs(alloc: Allocator, args: []const [:0]const u8, bad: *?BadAge
             else => unreachable,
         }
     }
-    opts.context = try joinArgs(alloc, args[parser.index..]);
+    // Context starts at the first argument that isn't a flag. A dash word
+    // there is a flag this command doesn't take, such as a typo, not
+    // context: context that starts with a dash follows `--`. Words after the
+    // context starts are all context.
+    var context_start = parser.index;
+    if (context_start < args.len) {
+        const arg = args[context_start];
+        if (std.mem.eql(u8, arg, "--")) {
+            context_start += 1;
+        } else if (arg.len >= 2 and arg[0] == '-') {
+            return error.InvalidWorkflowArgs;
+        }
+    }
+    opts.context = try joinArgs(alloc, args[context_start..]);
     return opts;
 }
 
@@ -5904,6 +5917,18 @@ test "parse workflow args consumes leading flags and joins remaining context exa
     var empty = try parseWorkflowArgs(std.testing.allocator, &.{}, &bad);
     defer empty.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("", empty.context);
+}
+
+test "pr and issue reject a flag they don't take instead of sending it as context" {
+    var bad: ?BadAgentValue = null;
+    try std.testing.expectError(error.InvalidWorkflowArgs, parseWorkflowArgs(std.testing.allocator, &.{ "--modle", "x" }, &bad));
+    try std.testing.expectError(error.InvalidWorkflowArgs, parseWorkflowArgs(std.testing.allocator, &.{ "--auto", "--add-dir", "/tmp" }, &bad));
+    try std.testing.expectError(error.InvalidWorkflowArgs, parseWorkflowArgs(std.testing.allocator, &.{ "--config", "fast_mode=true" }, &bad));
+
+    var dashed = try parseWorkflowArgs(std.testing.allocator, &.{ "--create", "--", "--verbose", "is", "gone" }, &bad);
+    defer dashed.deinit(std.testing.allocator);
+    try std.testing.expect(dashed.create);
+    try std.testing.expectEqualStrings("--verbose is gone", dashed.context);
 }
 
 test "runIfRequested help writes top-level help" {

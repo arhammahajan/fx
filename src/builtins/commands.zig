@@ -232,7 +232,7 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .pr,
         .token = "pr",
-        .usage = "pr " ++ agent_run_usage ++ " [--create] [context]",
+        .usage = "pr " ++ agent_run_usage ++ " [--create] [--] [context]",
         .summary = "Draft or publish a pull request",
         .options = &pr_options,
         .details = &.{
@@ -242,7 +242,7 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .issue,
         .token = "issue",
-        .usage = "issue " ++ agent_run_usage ++ " [--create] [context]",
+        .usage = "issue " ++ agent_run_usage ++ " [--create] [--] [context]",
         .summary = "Draft or publish a GitHub issue",
         .options = &issue_options,
     },
