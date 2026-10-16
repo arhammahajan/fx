@@ -1407,6 +1407,16 @@ fn cleanupLegacyWorkspacePreferences(
                 }
             }
         }
+        // A workspace entry can still hold the keys only fx config set writes,
+        // or the one fx config unset removes. Left there, the older copy
+        // would keep applying in that folder after the save reports success.
+        for (configWrittenPaths(patch)) |maybe_path| {
+            const path = maybe_path orelse continue;
+            if (removePath(&entry.value_ptr.object, path)) {
+                application.changed = true;
+                application.legacy_fields_removed += 1;
+            }
+        }
         if (application.legacy_fields_removed != removed_before) {
             application.legacy_workspaces_changed += 1;
             if (entry.value_ptr.object.count() == 0) {
@@ -1417,6 +1427,21 @@ fn cleanupLegacyWorkspacePreferences(
     for (empty_workspaces.items) |workspace_root| {
         _ = workspaces.object.orderedRemove(workspace_root);
     }
+}
+
+/// The settings paths a patch from `fx config set` or `unset` writes that the
+/// `/settings` cleanup above doesn't already cover.
+fn configWrittenPaths(patch: UserSettingsPatch) [8]?[]const u8 {
+    return .{
+        if (patch.theme != null) "theme" else null,
+        if (patch.auto_upgrade != null) "auto_upgrade" else null,
+        if (patch.max_agent_steps != null) "max_agent_steps" else null,
+        if (patch.max_tool_result_bytes != null) "max_tool_result_bytes" else null,
+        if (patch.auto_compact_percent != null) "auto_compact_percent" else null,
+        if (patch.provider_strict != null) "provider_strict" else null,
+        if (patch.context != null) "context" else null,
+        patch.remove,
+    };
 }
 
 fn removeLegacyLeaf(
@@ -2729,6 +2754,42 @@ test "user patch snapshots and removes legacy workspace copies" {
     const recovered = try io_mod.readFileToEnd(alloc, &recovery, max_settings_bytes + 1);
     defer alloc.free(recovered);
     try std.testing.expectEqualStrings(original, recovered);
+}
+
+test "fx config set and unset remove the workspace copy they would lose to" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try writeStoreFixture(
+        tmp.dir,
+        "home/.fx/settings.json",
+        "{\"effort\":\"high\",\"workspaces\":{\"/workspace\":{\"max_agent_steps\":5,\"effort\":\"low\",\"status_line\":{\"session\":true}}}}\n",
+    );
+
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    var store = try Store.initFromHome(alloc, home, .writable);
+    defer store.deinit(alloc);
+
+    var set = try store.applyUserPatch(alloc, .{ .max_agent_steps = 12 });
+    defer set.deinit(alloc);
+    try std.testing.expect(set == .committed);
+    var unset_effort = try store.applyUserPatch(alloc, .{ .remove = "effort" });
+    defer unset_effort.deinit(alloc);
+    try std.testing.expect(unset_effort == .committed);
+    var unset_session = try store.applyUserPatch(alloc, .{ .remove = "status_line.session" });
+    defer unset_session.deinit(alloc);
+    try std.testing.expect(unset_session == .committed);
+
+    const bytes = try store.readPrimaryForTest(alloc);
+    defer alloc.free(bytes);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 12), parsed.value.object.get("max_agent_steps").?.integer);
+    try std.testing.expect(parsed.value.object.get("effort") == null);
+    // Nothing is left in the workspace entry, so it goes.
+    if (parsed.value.object.get("workspaces")) |workspaces| try std.testing.expect(workspaces.object.get("/workspace") == null);
 }
 
 test "update channel patch removes legacy workspace copies" {
