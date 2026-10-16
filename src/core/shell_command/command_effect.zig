@@ -1109,8 +1109,9 @@ test "planner canonicalizes pwd to a fixed physical path" {
 }
 
 /// Planner tests use a fixed safe-git result, so they do not depend on the
-/// host's git. `safe_git.zig` tests the real preparation.
-const test_git: GitSource = .{ .fixed = .{ .ready = .{ .executable = "/usr/bin/git", .filter_names = &.{} } } };
+/// host's git. `safe_git.zig` tests the real preparation. The fixed result
+/// takes `--no-lazy-fetch`, as every git from 2.45 does.
+const test_git: GitSource = .{ .fixed = .{ .ready = .{ .executable = "/usr/bin/git", .filter_names = &.{}, .no_lazy_fetch = true } } };
 
 fn expectDirect(command: []const u8, target_os: std.Target.Os.Tag) !Admission {
     const admission = try planWithGit(
@@ -1453,6 +1454,7 @@ test "planner pins read-only git inspection to hardened argv and environment" {
         "/usr/bin/git",
         "--no-pager",
         "--no-optional-locks",
+        "--no-lazy-fetch",
         "-c",
         "core.fsmonitor=false",
         "-c",
@@ -1472,7 +1474,7 @@ test "planner pins read-only git inspection to hardened argv and environment" {
 }
 
 test "planner blanks repository filters and falls back to review when safe git refuses" {
-    const with_filter: GitSource = .{ .fixed = .{ .ready = .{ .executable = "/usr/bin/git", .filter_names = &.{"evil"} } } };
+    const with_filter: GitSource = .{ .fixed = .{ .ready = .{ .executable = "/usr/bin/git", .filter_names = &.{"evil"}, .no_lazy_fetch = true } } };
     var admission = try planWithGit(std.testing.allocator, "git status --short", "/workspace", false, .linux, with_filter);
     defer admission.deinit(std.testing.allocator);
     const argv = admission.direct_read_only.stages[0].argv;
@@ -1507,6 +1509,7 @@ test "planner pins git show to hardened argv and revision operands" {
         "/usr/bin/git",
         "--no-pager",
         "--no-optional-locks",
+        "--no-lazy-fetch",
         "-c",
         "core.fsmonitor=false",
         "-c",

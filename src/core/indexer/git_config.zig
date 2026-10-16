@@ -494,6 +494,34 @@ pub fn loadRepositoryEveryInclude(arena: Allocator, context: *const Context) All
     return loader.result();
 }
 
+/// Whether the repository config marks a remote as a promisor, the way a
+/// partial clone does. git fetches a missing object from such a remote on
+/// demand, and that fetch starts the transport program the remote's config
+/// names. `extensions.partialClone` names the promisor remote in the spelling
+/// older git wrote.
+pub fn usesPromisorRemote(loaded: Loaded) bool {
+    var legacy: ?[]const u8 = null;
+    for (loaded.entries) |loaded_entry| {
+        const entry = loaded_entry.entry;
+        if (std.mem.eql(u8, entry.section, "extensions") and
+            entry.subsection == null and
+            std.mem.eql(u8, entry.name, "partialclone"))
+        {
+            legacy = entry.value;
+        }
+    }
+    for (loaded.entries) |loaded_entry| {
+        const entry = loaded_entry.entry;
+        if (!std.mem.eql(u8, entry.section, "remote")) continue;
+        const name = entry.subsection orelse continue;
+        if (std.mem.eql(u8, entry.name, "promisor") and (parseBool(entry.value) orelse false)) return true;
+        if (legacy) |legacy_name| {
+            if (std.mem.eql(u8, legacy_name, name)) return true;
+        }
+    }
+    return false;
+}
+
 /// Distinct filter driver names with a `clean`, `smudge` or `process`
 /// command. Memory belongs to `arena`.
 pub fn filterDriverNames(arena: Allocator, loaded: Loaded) Allocator.Error![]const []const u8 {

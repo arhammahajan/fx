@@ -22,6 +22,10 @@ const Allocator = std.mem.Allocator;
 const minimum_major: u32 = 2;
 const minimum_minor: u32 = 25;
 
+/// `--no-lazy-fetch` arrived in git 2.45.
+const no_lazy_fetch_major: u32 = 2;
+const no_lazy_fetch_minor: u32 = 45;
+
 const max_probe_output: usize = 4096;
 
 pub const Refusal = enum {
@@ -31,6 +35,9 @@ pub const Refusal = enum {
     repo_config_unavailable,
     /// `-c` splits at the first `=`, so such a driver cannot be blanked.
     unsupported_filter_name,
+    /// The repository marks a remote as a promisor, so git would fetch a
+    /// missing object from it on demand, and this git cannot be told not to.
+    lazy_fetch_unsupported,
     /// git would use a different repository than the one whose config fx read.
     repository_mismatch,
 };
@@ -40,6 +47,9 @@ pub const Ready = struct {
     executable: []const u8,
     /// Filter drivers defined by repository-scope config.
     filter_names: []const []const u8,
+    /// This git takes `--no-lazy-fetch`, so a promisor remote cannot start
+    /// its transport program for a missing object.
+    no_lazy_fetch: bool,
 };
 
 pub const Prepared = union(enum) {
@@ -54,22 +64,37 @@ pub const Subcommand = enum { status, diff, log, show, branch, rev_parse };
 /// process, and confirms git resolves the same repository fx read. All memory
 /// belongs to `arena`.
 pub fn prepare(arena: Allocator, cwd: []const u8) Allocator.Error!Prepared {
-    const filters = indexer.repoFilters(arena, cwd) catch |err| switch (err) {
+    const programs = indexer.repoPrograms(arena, cwd) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.RepoConfigUnavailable => return refuse(.repo_config_unavailable, cwd),
     };
-    for (filters.names) |name| {
+    for (programs.names) |name| {
         if (name.len == 0 or std.mem.findScalar(u8, name, '=') != null) return refuse(.unsupported_filter_name, cwd);
     }
     const executable = trustedExecutable() orelse return refuse(.git_missing, cwd);
-    switch (try versionCheck(arena, executable)) {
+    const probe = try versionCheck(arena, executable);
+    switch (probe.check) {
         .supported => {},
         .too_old => return refuse(.git_too_old, cwd),
         .unknown => return refuse(.git_version_unknown, cwd),
     }
-    const ready: Ready = .{ .executable = executable, .filter_names = filters.names };
-    if (!try sameRepository(arena, ready, cwd, filters.git_dir)) return refuse(.repository_mismatch, cwd);
+    if (lazyFetchRefusal(programs.promisor, probe.no_lazy_fetch)) |reason| return refuse(reason, cwd);
+    const ready: Ready = .{
+        .executable = executable,
+        .filter_names = programs.names,
+        .no_lazy_fetch = probe.no_lazy_fetch,
+    };
+    if (!try sameRepository(arena, ready, cwd, programs.git_dir)) return refuse(.repository_mismatch, cwd);
     return .{ .ready = ready };
+}
+
+/// A promisor remote makes git fetch a missing object on demand, and that
+/// fetch starts the transport program the remote's config names. Git 2.45
+/// added `--no-lazy-fetch`, which turns that off; older git cannot be told,
+/// so fx refuses instead of running an inspection that could start a program.
+fn lazyFetchRefusal(promisor: bool, no_lazy_fetch: bool) ?Refusal {
+    if (!promisor or no_lazy_fetch) return null;
+    return .lazy_fetch_unsupported;
 }
 
 fn refuse(reason: Refusal, cwd: []const u8) Prepared {
@@ -103,6 +128,9 @@ fn appendPrelude(arena: Allocator, argv: *std.ArrayList([]const u8), ready: Read
         ready.executable,
         "--no-pager",
         "--no-optional-locks",
+    });
+    if (ready.no_lazy_fetch) try argv.append(arena, "--no-lazy-fetch");
+    try argv.appendSlice(arena, &.{
         "-c",
         "core.fsmonitor=false",
         "-c",
@@ -119,9 +147,9 @@ fn appendPrelude(arena: Allocator, argv: *std.ArrayList([]const u8), ready: Read
 }
 
 /// The child environment for every safe git call: a fixed PATH and locale, no
-/// prompts, pagers or optional locks, and only the variables that locate the
-/// user's own git config. Nothing else from fx's environment, such as
-/// `GIT_DIR` or `GIT_CONFIG_PARAMETERS`, reaches git.
+/// prompts, pagers, optional locks or lazy fetches, and only the variables that
+/// locate the user's own git config. Nothing else from fx's environment, such
+/// as `GIT_DIR` or `GIT_CONFIG_PARAMETERS`, reaches git.
 pub fn environment(alloc: Allocator) Allocator.Error!std.process.Environ.Map {
     var map = std.process.Environ.Map.init(alloc);
     errdefer map.deinit();
@@ -130,6 +158,7 @@ pub fn environment(alloc: Allocator) Allocator.Error!std.process.Environ.Map {
     try map.put("LANG", "C");
     try map.put("GIT_OPTIONAL_LOCKS", "0");
     try map.put("GIT_TERMINAL_PROMPT", "0");
+    try map.put("GIT_NO_LAZY_FETCH", "1");
     try map.put("GIT_PAGER", "cat");
     try map.put("PAGER", "cat");
     for ([_][]const u8{ "HOME", "XDG_CONFIG_HOME", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM" }) |key| {
@@ -164,32 +193,48 @@ fn trustedExecutable() ?[]const u8 {
 
 const VersionCheck = enum { supported, too_old, unknown };
 
+/// What the trusted git's version reported, and whether it takes the options
+/// fx needs beyond its minimum.
+pub const Probe = struct {
+    check: VersionCheck,
+    /// Git 2.45 added the global `--no-lazy-fetch`, which keeps a promisor
+    /// remote from starting its transport program for a missing object.
+    no_lazy_fetch: bool = false,
+};
+
 var version_lock: std.Io.Mutex = .init;
-var cached_version: ?struct { executable: []const u8, check: VersionCheck } = null;
+var cached_probe: ?struct { executable: []const u8, probe: Probe } = null;
 
 /// Runs `git --version` once per executable and process. A failed probe is not
 /// cached, so a transient spawn failure does not disable git for the session.
-fn versionCheck(arena: Allocator, executable: []const u8) Allocator.Error!VersionCheck {
+fn versionCheck(arena: Allocator, executable: []const u8) Allocator.Error!Probe {
     const io = io_mod.getIo();
     version_lock.lockUncancelable(io);
     defer version_lock.unlock(io);
-    if (cached_version) |cached| {
-        if (std.mem.eql(u8, cached.executable, executable)) return cached.check;
+    if (cached_probe) |cached| {
+        if (std.mem.eql(u8, cached.executable, executable)) return cached.probe;
     }
-    const output = try runCaptured(arena, &.{ executable, "--version" }, "/") orelse return .unknown;
-    const check = classifyVersion(output);
-    cached_version = .{ .executable = executable, .check = check };
-    return check;
+    const output = try runCaptured(arena, &.{ executable, "--version" }, "/") orelse return .{ .check = .unknown };
+    const probe = classifyVersion(output);
+    cached_probe = .{ .executable = executable, .probe = probe };
+    return probe;
 }
 
-fn classifyVersion(output: []const u8) VersionCheck {
+fn classifyVersion(output: []const u8) Probe {
     const prefix = "git version ";
-    if (!std.mem.startsWith(u8, output, prefix)) return .unknown;
+    if (!std.mem.startsWith(u8, output, prefix)) return .{ .check = .unknown };
     var parts = std.mem.splitScalar(u8, output[prefix.len..], '.');
-    const major = leadingNumber(parts.next() orelse "") orelse return .unknown;
-    const minor = leadingNumber(parts.next() orelse "") orelse return .unknown;
-    if (major != minimum_major) return if (major > minimum_major) .supported else .too_old;
-    return if (minor >= minimum_minor) .supported else .too_old;
+    const major = leadingNumber(parts.next() orelse "") orelse return .{ .check = .unknown };
+    const minor = leadingNumber(parts.next() orelse "") orelse return .{ .check = .unknown };
+    return .{
+        .check = if (atLeastVersion(major, minor, minimum_major, minimum_minor)) .supported else .too_old,
+        .no_lazy_fetch = atLeastVersion(major, minor, no_lazy_fetch_major, no_lazy_fetch_minor),
+    };
+}
+
+fn atLeastVersion(major: u32, minor: u32, want_major: u32, want_minor: u32) bool {
+    if (major != want_major) return major > want_major;
+    return minor >= want_minor;
 }
 
 fn leadingNumber(text: []const u8) ?u32 {
@@ -242,41 +287,74 @@ fn runCaptured(arena: Allocator, argv: []const []const u8, cwd: []const u8) Allo
 }
 
 test "git version check requires 2.25 and reads vendor suffixes" {
-    const cases = [_]struct { output: []const u8, expected: VersionCheck }{
-        .{ .output = "git version 2.50.1 (Apple Git-155)\n", .expected = .supported },
-        .{ .output = "git version 2.36.0\n", .expected = .supported },
-        .{ .output = "git version 2.34.1\n", .expected = .supported },
-        .{ .output = "git version 2.25.0\n", .expected = .supported },
-        .{ .output = "git version 2.39.3.windows.1\n", .expected = .supported },
-        .{ .output = "git version 3.0.0\n", .expected = .supported },
-        .{ .output = "git version 2.24.4\n", .expected = .too_old },
-        .{ .output = "git version 1.9.5\n", .expected = .too_old },
-        .{ .output = "hub version 2.14\n", .expected = .unknown },
-        .{ .output = "git version x.y\n", .expected = .unknown },
+    const cases = [_]struct { output: []const u8, check: VersionCheck, no_lazy_fetch: bool }{
+        .{ .output = "git version 2.50.1 (Apple Git-155)\n", .check = .supported, .no_lazy_fetch = true },
+        .{ .output = "git version 2.45.0\n", .check = .supported, .no_lazy_fetch = true },
+        .{ .output = "git version 2.44.4\n", .check = .supported, .no_lazy_fetch = false },
+        .{ .output = "git version 2.36.0\n", .check = .supported, .no_lazy_fetch = false },
+        .{ .output = "git version 2.34.1\n", .check = .supported, .no_lazy_fetch = false },
+        .{ .output = "git version 2.25.0\n", .check = .supported, .no_lazy_fetch = false },
+        .{ .output = "git version 2.39.3.windows.1\n", .check = .supported, .no_lazy_fetch = false },
+        .{ .output = "git version 3.0.0\n", .check = .supported, .no_lazy_fetch = true },
+        .{ .output = "git version 2.24.4\n", .check = .too_old, .no_lazy_fetch = false },
+        .{ .output = "git version 1.9.5\n", .check = .too_old, .no_lazy_fetch = false },
+        .{ .output = "hub version 2.14\n", .check = .unknown, .no_lazy_fetch = false },
+        .{ .output = "git version x.y\n", .check = .unknown, .no_lazy_fetch = false },
     };
-    for (cases) |case| try std.testing.expectEqual(case.expected, classifyVersion(case.output));
+    for (cases) |case| {
+        const probe = classifyVersion(case.output);
+        try std.testing.expectEqual(case.check, probe.check);
+        try std.testing.expectEqual(case.no_lazy_fetch, probe.no_lazy_fetch);
+    }
+}
+
+test "a promisor remote is refused until this git can stop lazy fetching" {
+    // Git 2.45 takes `--no-lazy-fetch`, which stops a promisor remote from
+    // starting its transport program for a missing object. Older git cannot,
+    // so the command does not run at all.
+    try std.testing.expectEqual(
+        Refusal.lazy_fetch_unsupported,
+        lazyFetchRefusal(true, false).?,
+    );
+    try std.testing.expectEqual(@as(?Refusal, null), lazyFetchRefusal(true, true));
+    try std.testing.expectEqual(@as(?Refusal, null), lazyFetchRefusal(false, false));
 }
 
 test "safe git argv turns off repository programs for every subcommand" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const ready: Ready = .{ .executable = "/usr/bin/git", .filter_names = &.{ "lfs", "evil.x" } };
+    const ready: Ready = .{ .executable = "/usr/bin/git", .filter_names = &.{ "lfs", "evil.x" }, .no_lazy_fetch = true };
     var argv: std.ArrayList([]const u8) = .empty;
     try appendCommand(arena, &argv, ready, .diff);
     const expected = [_][]const u8{
-        "/usr/bin/git",             "--no-pager",           "--no-optional-locks",
-        "-c",                       "core.fsmonitor=false", "-c",
-        "core.hooksPath=/dev/null", "-c",                   "log.showSignature=false",
-        "-c",                       "filter.lfs.clean=",    "-c",
-        "filter.lfs.smudge=",       "-c",                   "filter.lfs.process=",
-        "-c",                       "filter.evil.x.clean=", "-c",
-        "filter.evil.x.smudge=",    "-c",                   "filter.evil.x.process=",
-        "diff",                     "--no-ext-diff",        "--no-textconv",
-        "--ignore-submodules=all",
+        "/usr/bin/git",            "--no-pager",               "--no-optional-locks",
+        "--no-lazy-fetch",         "-c",                       "core.fsmonitor=false",
+        "-c",                      "core.hooksPath=/dev/null", "-c",
+        "log.showSignature=false", "-c",                       "filter.lfs.clean=",
+        "-c",                      "filter.lfs.smudge=",       "-c",
+        "filter.lfs.process=",     "-c",                       "filter.evil.x.clean=",
+        "-c",                      "filter.evil.x.smudge=",    "-c",
+        "filter.evil.x.process=",  "diff",                     "--no-ext-diff",
+        "--no-textconv",           "--ignore-submodules=all",
     };
     try std.testing.expectEqual(expected.len, argv.items.len);
     for (expected, argv.items) |want, have| try std.testing.expectEqualStrings(want, have);
+}
+
+test "safe git argv leaves out the lazy fetch option an older git lacks" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const ready: Ready = .{ .executable = "/usr/bin/git", .filter_names = &.{}, .no_lazy_fetch = false };
+    var argv: std.ArrayList([]const u8) = .empty;
+    try appendCommand(arena, &argv, ready, .log);
+    var found_log = false;
+    for (argv.items) |arg| {
+        try std.testing.expect(!std.mem.eql(u8, arg, "--no-lazy-fetch"));
+        if (std.mem.eql(u8, arg, "log")) found_log = true;
+    }
+    try std.testing.expect(found_log);
 }
 
 test "safe git environment keeps only fixed values and user config locations" {
@@ -285,6 +363,7 @@ test "safe git environment keeps only fixed values and user config locations" {
     try std.testing.expectEqualStrings("/usr/bin:/bin", env.get("PATH").?);
     try std.testing.expectEqualStrings("0", env.get("GIT_OPTIONAL_LOCKS").?);
     try std.testing.expectEqualStrings("0", env.get("GIT_TERMINAL_PROMPT").?);
+    try std.testing.expectEqualStrings("1", env.get("GIT_NO_LAZY_FETCH").?);
     try std.testing.expectEqualStrings("cat", env.get("GIT_PAGER").?);
     for ([_][]const u8{ "GIT_DIR", "GIT_WORK_TREE", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT", "GIT_EXEC_PATH" }) |key| {
         try std.testing.expect(env.get(key) == null);
@@ -314,7 +393,7 @@ const SentinelRepo = struct {
 
     fn init(arena: Allocator, dir: std.Io.Dir) !SentinelRepo {
         const git = trustedExecutable() orelse return error.SkipZigTest;
-        if (try versionCheck(arena, git) != .supported) return error.SkipZigTest;
+        if ((try versionCheck(arena, git)).check != .supported) return error.SkipZigTest;
         const root = try io_mod.dirRealpathAlloc(arena, dir, ".");
         const self: SentinelRepo = .{
             .arena = arena,
@@ -341,6 +420,14 @@ const SentinelRepo = struct {
 
     fn writeExecutable(self: SentinelRepo, absolute: []const u8) !void {
         const script = try self.arena.print("#!/bin/sh\necho ran >> '{s}'\ncat\n", .{self.log});
+        try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = absolute, .data = script, .flags = .{ .permissions = .fromMode(0o755) } });
+    }
+
+    /// A transport program, which records its run and exits instead of
+    /// speaking the upload-pack protocol, so a lazy fetch attempt is
+    /// observable and does not wait on stdin.
+    fn writeTransport(self: SentinelRepo, absolute: []const u8) !void {
+        const script = try self.arena.print("#!/bin/sh\necho ran >> '{s}'\nexit 0\n", .{self.log});
         try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = absolute, .data = script, .flags = .{ .permissions = .fromMode(0o755) } });
     }
 
@@ -449,6 +536,45 @@ const SentinelRepo = struct {
         try std.testing.expect(try self.runs() > 0);
     }
 };
+
+// A partial clone fetches a missing object from its promisor remote on
+// demand, and that fetch starts the transport program the remote's config
+// names. `git show` reaches for a blob, so it is the shortest route: fx must
+// either turn lazy fetching off or refuse the command.
+test "safe git never lazy fetches a missing object from a promisor remote" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repo = try SentinelRepo.init(arena, tmp.dir);
+    const transport = try repo.path("transport.sh");
+    try repo.writeTransport(transport);
+
+    const blob = try repo.plainOutput(repo.repo, &.{ "rev-parse", "HEAD:a.txt" });
+    const blob_path = try std.Io.Dir.path.join(arena, &.{ repo.repo, ".git/objects", blob[0..2], blob[2..] });
+    try std.Io.Dir.deleteFileAbsolute(std.testing.io, blob_path);
+
+    try repo.plain(repo.repo, &.{ "config", "remote.origin.url", "file:///fixture-origin" });
+    try repo.plain(repo.repo, &.{ "config", "remote.origin.promisor", "true" });
+    try repo.plain(repo.repo, &.{ "config", "remote.origin.partialclonefilter", "blob:none" });
+    try repo.plain(repo.repo, &.{ "config", "remote.origin.uploadpack", transport });
+    try repo.plain(repo.repo, &.{ "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*" });
+
+    switch (try prepare(arena, repo.repo)) {
+        .ready => |ready| {
+            try std.testing.expect(ready.no_lazy_fetch);
+            _ = try repo.run(repo.repo, try repo.helperArgv(repo.repo, .show, &.{"HEAD:a.txt"}), .{ .safe = null });
+            try std.testing.expectEqual(@as(usize, 0), try repo.runs());
+        },
+        // A git older than 2.45 cannot be told to stop, so fx must refuse.
+        .refused => |reason| try std.testing.expectEqual(Refusal.lazy_fetch_unsupported, reason),
+    }
+
+    // The control proves the route is live: plain git starts the program.
+    _ = try repo.run(repo.repo, try repo.plainArgv(&.{ "show", "HEAD:a.txt" }), .plain);
+    try std.testing.expect(try repo.runs() > 0);
+}
 
 test "safe git blocks a repository fsmonitor" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);

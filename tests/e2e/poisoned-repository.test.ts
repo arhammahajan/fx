@@ -296,6 +296,64 @@ describe("poisoned repository", () => {
   );
 
   test(
+    "a missing object does not make fx lazy fetch a repository's transport program",
+    async () => {
+      const fixture = poisonedRepository();
+      // A partial clone fetches a missing object from its promisor remote on
+      // demand, and that fetch starts the transport program the remote's
+      // config names. `git show` reaches for a blob.
+      const blob = git(fixture, ["rev-parse", "HEAD:alpha-tracked.txt"]).trim();
+      rmSync(join(fixture.workspace, ".git", "objects", blob.slice(0, 2), blob.slice(2)), { force: true });
+      const transport = join(fixture.base, "transport.sh");
+      writeFileSync(transport, `#!/bin/sh\necho "ran $0 $*" >> '${fixture.log}'\nexit 0\n`);
+      chmodSync(transport, 0o755);
+      for (const [key, value] of [
+        ["remote.origin.url", "file:///fixture-origin"],
+        ["remote.origin.promisor", "true"],
+        ["remote.origin.partialclonefilter", "blob:none"],
+        ["remote.origin.uploadpack", transport],
+        ["remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"],
+      ]) git(fixture, ["config", key!, value!]);
+
+      // The control proves the route is live: plain git starts the program.
+      // The control run is expected to fail, because the transport program
+      // does not speak the upload-pack protocol.
+      writeFileSync(fixture.log, "");
+      Bun.spawnSync(["git", "show", "HEAD"], {
+        cwd: fixture.workspace,
+        env: {
+          PATH: process.env.PATH ?? "/usr/bin:/bin",
+          HOME: fixture.home,
+          GIT_CONFIG_NOSYSTEM: "1",
+          LC_ALL: "C",
+        },
+      });
+      expect(sentinelRuns(fixture).length).toBeGreaterThan(0);
+
+      // Start the fx run from an empty log, so the assertion below measures
+      // only what fx did.
+      writeFileSync(fixture.log, "");
+
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("show", "shell", {
+          request: { action: "run", command: "git show HEAD", yield_time_ms: 30_000 },
+        }),
+        fakeGatewayFinalText("inspection complete"),
+      ], { classifierResponses: [] });
+      gateways.push(gateway);
+
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Inspect the repository."],
+        { cwd: fixture.workspace, env: fxEnv(fixture, gateway), timeoutMs: TIMEOUT },
+      );
+      expect(result.code, result.stderr).toBe(0);
+      expect(sentinelRuns(fixture)).toEqual([]);
+      expect(gateway.classifierRequests).toHaveLength(0);
+    },
+    TIMEOUT,
+  );
+
+  test(
     "fx pr snapshots the repository without running its programs",
     async () => {
       const fixture = poisonedRepository();
