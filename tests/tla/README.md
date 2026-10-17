@@ -1,6 +1,6 @@
 # TLA+ models
 
-TLA+ specifications for fx, checked with TLC, together with the scripts and Bun drivers that check them. CI runs the SDK model. Run the others when you change the behavior they describe.
+TLA+ specifications for fx, checked with TLC, together with the scripts and Bun drivers that check them. CI runs the SDK and recovery models. Run the others when you change the behavior they describe.
 
 | Folder | What it models | Checker |
 |---|---|---|
@@ -11,6 +11,7 @@ TLA+ specifications for fx, checked with TLC, together with the scripts and Bun 
 | `indexer/` | When a scanned root's listing may be reused, merging parallel grep results, the file picker's loading row, and listing snapshots (`src/core/indexer/`). | `indexer/check.sh` |
 | `mcp/` | The MCP engine (`src/mcp/`): wire format, requests, stdio, version detection, the tool catalog, both HTTP transports, input-required rounds, authorization, subscriptions, elicitation, and the engine. `rules.md` lists the MCP specification rules the models cite by ID. | `mcp/check.sh`, then the drivers in `drivers/mcp/` |
 | `mcp_host/` | fx's MCP host (`src/core/mcp_host/`): host lifecycle, saved credentials, logins shared between processes, logins beside processes that run an older build (`MixedBuilds.tla`), sign-in, elicitation routing, and calls held for the URLs a server asks the user to open. | `mcp_host/check.sh`, `bun test drivers/mcp_host/` |
+| `recovery/` | Recovery for one model request (`src/core/recovery/`): retry waits, the crash-loop guard, resuming after a closed window, the status line, and the save that goes with every send. Eight planted mutations, each a bug fx has had or a promise of the API, must each be caught by its named rule. fx does not route requests through the module yet. | `recovery/check.sh` |
 | `sdk/` | libfx durable sessions (`DurableSession.tla`), how a session object takes prompts in (`PromptIntake.tla`), images saved once by name (`ImageStore.tla`), agent names and routing (`AgentRouting.tla`), tenants whose agents share one process (`TenantIsolation.tla`), steering (`DurableSteer.tla`), and the provider credential edge (`ProviderAuth.tla`). `check.sh` also writes the TLC state graphs the drivers walk. | `sdk/check.sh`, then the drivers |
 | `session/` | The session the interactive app has open across launches, prompts, `/new`, `/clear`, `/resume`, `/fork`, quitting and crashes, and what `/status` and the exit line say about it (`src/core/session/`, D90). | `session/check.sh`, then `bun test ./tests/tla/drivers/session/`, which runs the real binary along it and has TLC check every run |
 | `session_manager/` | The session log, turn lifecycle, writer lock, snapshots, fork, subagents, catalog, host wiring, the side-file move, v1 conversion, and prompt images saved as blobs (`PromptImages.tla`). `rollout/` holds the models of the changes that moved fx onto the session manager. `system-design.md` is the design record the specs check and defines the `D1` to `D90` decision numbers that code comments cite. | `session_manager/check.sh`, `session_manager/mutants.py`, `session_manager/rollout/run.py`, `bun test drivers/session_manager/` |
@@ -76,6 +77,7 @@ tests/tla/mcp/check.sh                                  # every MCP engine model
 tests/tla/mcp_host/check.sh                             # every MCP host model, planted bug, and finding
 bun tests/tla/drivers/mcp/driver.ts                      # src/mcp/ along the MCP engine models
 bun test ./tests/tla/drivers/mcp_host/                  # fx's MCP host along its models; FX_BIN picks the binary
+tests/tla/recovery/check.sh                             # the recovery model and its planted bugs
 tests/tla/sdk/check.sh                                  # the SDK specs; writes the state graphs the drivers walk
 bun tests/tla/drivers/drive.mjs send --walks 40         # one durable-session graph; see .github/workflows/ci.yml for the rest
 bun tests/tla/drivers/drive-agents.mjs --walks 60       # agent routing
