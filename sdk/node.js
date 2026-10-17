@@ -682,6 +682,8 @@ export async function createFxEngine(options = {}) {
 // live, as agents passed one durability do, so they can send each other's
 // prompts on.
 const environments = new Map();
+// The process's environment, read at run time (see `development` below).
+const processEnv = process.env;
 function environmentDurability() {
   const dir = process.env.VERCEL ? null : process.env.FX_SESSIONS_DIR || resolve(tmpdir(), "libfx", "sessions");
   const key = dir ?? "vercel";
@@ -714,6 +716,13 @@ export const createFxAgent = createDurableAgentFactory({
   defaultDurability: environmentDurability,
   // One durability per environment, so agents created without one share it.
   defaultShared: true,
+  // A dev server such as `next dev` loads a module again and so creates its
+  // agents again: there the newest replaces the agent its name had. Read
+  // each time, as a process may set it after loading libfx, and through
+  // `processEnv`: a bundler replaces `process.env.NODE_ENV` with the mode
+  // it builds in, as Bun does when it builds node.cjs, which would make
+  // every process that loads that build a development server (SEC-2).
+  development: () => processEnv.NODE_ENV === "development",
   harness: fxHarness({
     createEngine: createFxEngine,
     // An explicit key, then the durability's own credential, such as a

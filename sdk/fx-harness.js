@@ -1,7 +1,7 @@
 // fx as a harness of the durable core in durable.js: `createFxAgent` is that
 // core running fx engines. Everything the core needs to know about fx is
 // here; the core itself knows only the harness contract.
-import { catalogMemory, coreAnswered, engineInternals, journalMarksWanted, maxPromptFrameBytes, normalizeInstructions, normalizeModelChoice, promptFrameBytes } from "./fx-sdk.js";
+import { catalogMemory, coreAnswered, engineInternals, journalMarksWanted, maxPromptFrameBytes, normalizeInstructions, normalizeModelChoice, promptFrameBytes, turnEndInputs } from "./fx-sdk.js";
 import { createCredentialMemory, credentialMemory } from "./subscription.js";
 
 const encoder = new TextEncoder();
@@ -47,6 +47,9 @@ export function fxHarness({ createEngine, defaultApiKey = async () => undefined,
           ...withSettings(engineOptions, settings),
           ...(apiKey === undefined ? {} : { apiKey }),
           ...((ready === undefined && inputs === undefined) || engineOptions.tools === undefined ? {} : { tools: workerTools(engineOptions.tools, ready, inputs) }),
+          // The core waits on it before a turn ends as well, so a steer
+          // stored while the last reply streamed continues the turn.
+          ...(inputs === undefined ? {} : { [turnEndInputs]: inputs }),
           sessionId,
           [credentialMemory]: credentials,
           [catalogMemory]: catalogs,

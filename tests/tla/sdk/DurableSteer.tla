@@ -24,21 +24,26 @@
 (*   (JoinBeforeStart). With no turn at all, it starts one.                *)
 (* - Sending a message again with the same id adds nothing (Dedupe).       *)
 (*                                                                         *)
-(* A steer is stored in the session's log, and the running turn has it only *)
-(* once its worker reads the log, which a poll or another server's write   *)
-(* need not make it do in time. A steer sent while a reply streams is read *)
-(* at once here, as no property depends on how soon it cuts the reply. One *)
-(* sent while the model writes a tool call or the tool runs waits unread   *)
-(* until the worker reads the log (Read), and before the tool's result     *)
-(* reaches the model the worker reads it itself (ReadAfterTool), so the    *)
-(* request after the result carries it (API-53).                           *)
+(* A steer is stored in the session's log, and the running turn has it     *)
+(* only once its worker reads the log, which a poll or another server's    *)
+(* write need not make it do in time. A steer the worker hears of as it is *)
+(* stored, as of a write on its own server, is read at once while a reply  *)
+(* streams; any other waits unread until the worker reads the log (Read),  *)
+(* in every phase. Before a tool's result reaches the model the worker     *)
+(* reads the log itself (ReadAfterTool), so the request after the result   *)
+(* carries every steer stored before it (API-53). Before a turn whose      *)
+(* reply ended with no tool call ends, the worker reads the log again      *)
+(* (ReadAtEnd), so a steer sent while that reply streamed continues the    *)
+(* turn (API-50) instead of running as a turn of its own.                  *)
 (*                                                                         *)
-(* Turns after the first start in the same delivery as the turn before    *)
+(* Turns after the first start in the same delivery as the turn before     *)
 (* them. A turn that waits with no worker running starts when a delivery   *)
 (* takes the session (Start), so a message sent before then has not been   *)
-(* seen by any worker. At a deadline the running request is cut off and   *)
-(* the turn continues in the next delivery (Handoff); steers it had taken  *)
-(* but not placed go into the resumed request.                             *)
+(* seen by any worker. At a deadline the running request, or a call that   *)
+(* waits for its intent to be stored, is cut off and the turn continues in *)
+(* the next delivery (Handoff). Steers it had taken but not placed, and    *)
+(* the ones stored since, go into the resumed request; a call that is safe *)
+(* to run twice runs again first, and they wait for it.                    *)
 (*                                                                         *)
 (* Each rule has a constant. Setting one to FALSE gives the behavior libfx *)
 (* had before this model, and each witness config shows the property that *)
@@ -59,11 +64,12 @@ CONSTANTS
     HandBack,        \* a cancel hands waiting steers back to run next
     JoinBeforeStart, \* a steer sent while a turn waits to start joins it
     Dedupe,          \* a repeated id adds nothing
-    ReadAfterTool    \* the worker reads stored steers before a tool's result goes to the model
+    ReadAfterTool,   \* the worker reads stored steers before a tool's result goes to the model
+    ReadAtEnd        \* the worker reads stored steers before a turn ends after a reply
 
 ASSUME Interrupt \in BOOLEAN /\ CallWaits \in BOOLEAN /\ HandBack \in BOOLEAN
 ASSUME JoinBeforeStart \in BOOLEAN /\ Dedupe \in BOOLEAN /\ Retries \in BOOLEAN
-ASSUME ReadAfterTool \in BOOLEAN
+ASSUME ReadAfterTool \in BOOLEAN /\ ReadAtEnd \in BOOLEAN
 
 P == "p"
 Msgs == {P} \cup Steers
@@ -154,9 +160,10 @@ Finish(how, back) ==
 
 \* The user sends a message it has not sent before. The first prompt comes
 \* first. A steer goes to the running turn, joins the turn waiting to start,
-\* or starts a turn of its own. One for the running turn is read at once
-\* while its reply streams, and waits unread while the model writes a tool
-\* call or the tool runs.
+\* or starts a turn of its own. One for the running turn waits unread until
+\* its worker reads the log, as one another server stores does; while its
+\* reply streams and nothing waits unread, the worker may hear of it at once
+\* and read it then, as it does a steer stored on its own server.
 Send(m) ==
     /\ m \notin Range(sent)
     /\ (m = P) = (sent = <<>>)
@@ -173,16 +180,16 @@ Send(m) ==
                /\ unread' = <<>>
                /\ UNCHANGED <<preStart, alone>>
           ELSE IF Running
-          THEN /\ IF phase = "gen" /\ unread = <<>>
-                     THEN /\ IF Interrupt
-                                \* the reply stops and the next request carries m
-                                THEN /\ turns' = [turns EXCEPT ![Run] = Placed(turns[Run], <<m>>)]
-                                     /\ UNCHANGED queue
-                                ELSE /\ queue' = Append(queue, m)
-                                     /\ UNCHANGED turns
-                          /\ UNCHANGED unread
-                     ELSE /\ unread' = Append(unread, m)
-                          /\ UNCHANGED <<turns, queue>>
+          THEN /\ \/ /\ phase = "gen" /\ unread = <<>>
+                     /\ IF Interrupt
+                           \* the reply stops and the next request carries m
+                           THEN /\ turns' = [turns EXCEPT ![Run] = Placed(turns[Run], <<m>>)]
+                                /\ UNCHANGED queue
+                           ELSE /\ queue' = Append(queue, m)
+                                /\ UNCHANGED turns
+                     /\ UNCHANGED unread
+                  \/ /\ unread' = Append(unread, m)
+                     /\ UNCHANGED <<turns, queue>>
                /\ UNCHANGED <<phase, worker, preStart, alone>>
           ELSE IF WaitingAt # {}
           THEN /\ preStart' = preStart \cup {m}
@@ -232,12 +239,16 @@ Read ==
     /\ act' = [name |-> "Read", m |-> None]
 
 \* The model's reply ends with text. Steers waiting on it continue the
-\* turn; otherwise the turn ends, and steers its worker never read run next.
+\* turn. With ReadAtEnd the worker reads the log before the turn ends, so
+\* the steers stored for it that it had not read continue it too. Otherwise
+\* the turn ends, and steers its worker never read run next.
 ModelText ==
     /\ phase = "gen"
-    /\ IF queue # <<>>
-          THEN /\ turns' = [turns EXCEPT ![Run] = Placed(turns[Run], queue)]
-               /\ UNCHANGED <<phase, worker, unread>>
+    /\ LET late == IF ReadAtEnd THEN unread ELSE <<>>
+       IN IF queue \o late # <<>>
+          THEN /\ turns' = [turns EXCEPT ![Run] = Placed(turns[Run], queue \o late)]
+               /\ unread' = IF ReadAtEnd THEN <<>> ELSE unread
+               /\ UNCHANGED <<phase, worker>>
           ELSE /\ Finish("end", unread)
                /\ unread' = <<>>
     /\ queue' = <<>>
@@ -299,18 +310,28 @@ Cancel ==
     /\ UNCHANGED <<sent, retried, dup, preStart, alone, tools, handoffs>>
     /\ act' = [name |-> "Cancel", m |-> None]
 
-\* The deadline cuts off the request in flight and the next delivery
-\* continues the turn; the resumed request carries the steers it had taken,
-\* and the ones stored since, which that delivery reads.
+\* The deadline cuts off the request in flight, or a call that waits in
+\* `call` for its intent to be stored, and the next delivery continues the
+\* turn with the steers it had taken and the ones stored since, which that
+\* delivery reads. A cut-off request runs again and carries them. A cut-off
+\* call with effects never runs: the model hears it may have partly run,
+\* in a request that carries them. A call that is safe to run twice runs
+\* again, and they wait for it.
 Handoff ==
-    /\ phase \in {"gen", "args"}
+    /\ phase \in {"gen", "args", "call"}
     /\ handoffs < MaxHandoffs
-    /\ turns' = [turns EXCEPT ![Run] = Placed(turns[Run], queue \o unread)]
-    /\ queue' = <<>>
+    /\ \/ /\ turns' = [turns EXCEPT ![Run] = Placed(turns[Run], queue \o unread)]
+          /\ queue' = <<>>
+          /\ phase' = "gen"
+          /\ UNCHANGED tools
+       \/ /\ phase = "call"
+          /\ queue' = queue \o unread
+          /\ phase' = "tool"
+          /\ tools' = tools + 1
+          /\ UNCHANGED turns
     /\ unread' = <<>>
-    /\ phase' = "gen"
     /\ handoffs' = handoffs + 1
-    /\ UNCHANGED <<sent, worker, retried, dup, preStart, alone, handedBack, tools, cancels>>
+    /\ UNCHANGED <<sent, worker, retried, dup, preStart, alone, handedBack, cancels>>
     /\ act' = [name |-> "Handoff", m |-> None]
 
 Next ==

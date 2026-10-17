@@ -286,7 +286,11 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
       case "ended":
         // A turn that ended before writing a record of its own, such as one
         // the harness refused or its cancel stopped first. Its outcome is on
-        // the UI stream.
+        // the UI stream, written after this, so it is the session's last
+        // turn to end, as one a record ends is: a holder that died before
+        // that line leaves it to the next worker (endUnshown). An entry a
+        // replaced worker wrote again for a turn already taken moves nothing.
+        if (!consumed.has(entry.messageId)) lastTurnId = entry.messageId;
         consume(entry.messageId);
         break;
       case "stopped":
@@ -739,12 +743,6 @@ const nameInUse = (name, factory) => Object.assign(
   { code: "FX_AGENT_NAME_IN_USE", agent: name },
 );
 
-// Whether this process is a development server, where reloading a module
-// creates its agents again with new functions in their options. There a new
-// definition of a name replaces the old one; everywhere else it is refused
-// (SEC-2).
-const inDevelopment = () => globalThis.process?.env?.NODE_ENV === "development";
-
 // Whether two agents' options are one configuration: the same values, and
 // the same functions and objects other than plain ones. `onEvent` only
 // watches the agent, so it is left out.
@@ -774,14 +772,27 @@ function sameDefinition(a, b, depth = 0) {
 // so they must be one agent (`tests/tla/sdk/TenantIsolation.tla`
 // RunsOnSenderAgent). Agents created without a durability share their
 // factory's default, so they are on one store even before one of them has
-// learned which store that is. In development, `member` replaces them
-// instead: they leave the name, and what reaches them from now on goes to
-// it (`tests/tla/sdk/TenantIsolation.tla` Register, with Development).
+// learned which store that is. With `replaces`, in a development server, the
+// newest definition takes the name instead: the older agents leave it, and
+// what reaches them from now on goes to the newest. So an agent that learns
+// its store only now, after a newer agent took that store, is the one that
+// leaves (`tests/tla/sdk/TenantIsolation.tla` Register and Resolve, with
+// Development; ReplacedByNewer).
 const sameStore = (a, b) => a.store === b.store || (a.defaults !== null && a.defaults === b.defaults);
-function claimName(name, member, factory) {
-  const others = (agentsByName.get(name)?.members ?? []).filter((other) => other !== member && sameStore(other, member) && !sameDefinition(other.definition, member.definition));
+function claimName(name, member, factory, replaces) {
+  const members = agentsByName.get(name)?.members ?? [];
+  const others = members.filter((other) => other !== member && sameStore(other, member) && !sameDefinition(other.definition, member.definition));
   if (others.length === 0) return;
-  if (!inDevelopment()) throw nameInUse(name, factory);
+  if (!replaces) throw nameInUse(name, factory);
+  // A name's agents are listed in the order they were created, and one being
+  // created is not listed yet.
+  const at = members.indexOf(member);
+  const newest = at < 0 ? undefined : others.findLast((other) => members.indexOf(other) > at);
+  if (newest) {
+    member.retire();
+    newest.emit("agent.replaced", { agent: name, replaced: 1 });
+    return;
+  }
   for (const other of others) other.retire();
   member.emit("agent.replaced", { agent: name, replaced: others.length });
 }
@@ -1450,12 +1461,13 @@ class SessionWorker {
       return undefined;
     }
     for (let claims = 0; claims < 8; claims += 1) {
-      // A holder that died between the record that ended the session's
-      // last turn and that turn's turn_end line left no reader seeing the
-      // turn end. That is work: once no live worker holds the session, this
-      // delivery claims it to write that end before running anything else
-      // (`tests/tla/sdk/DurableSession.tla` EndLine, with Repair). Asked only
-      // where the answer changes what this delivery does.
+      // A holder that died between the record or `ended` entry that ended
+      // the session's last turn and that turn's turn_end line left no reader
+      // seeing the turn end. That is work: once no live worker holds the
+      // session, this delivery claims it to write that end before running
+      // anything else (`tests/tla/sdk/DurableSession.tla` EndLine, with
+      // Repair, and with Refused for a turn that ends before any record).
+      // Asked only where the answer changes what this delivery does.
       const unshown = !this.running && (!state.hasWork || !state.lease) && (await this.endUnshown(log, state));
       const missingEnd = unshown ? state.lastTurnId : null;
       // A session with no open turn starts its next prompt at once: the
@@ -1716,8 +1728,8 @@ class SessionWorker {
       : null;
     let harness = null;
     let harnessRun = runOf(null);
-    // What the harness waits on after each tool call: the inputs stored
-    // since the turn last read the log (drive()).
+    // What the harness waits on after each tool call and before a turn
+    // ends: the inputs stored since the turn last read the log (drive()).
     const inputs = () => this.takeInputs?.() ?? Promise.resolve();
     this.settled = () => (harness ? harness.settled() : Promise.resolve());
     // A harness that throws instead of returning a turn cannot run one; the
@@ -1852,7 +1864,7 @@ class SessionWorker {
         else if (spent && !(open.calls?.length > 0)) turn.cancel();
         // A new turn takes the steers sent while it waited to start.
         const joining = fresh ? { ...state, steers: state.pending[0]?.joiners ?? [], endOpen: state.pending[0]?.ends === true } : state;
-        const outcome = await this.drive(log, harness, turn, messageId, joining, ui);
+        const outcome = await this.drive(log, harness, turn, messageId, joining, ui, !fresh);
         turnNow = null;
         if (outcome === "fenced") return "fenced";
         if (outcome === "yielded") {
@@ -1945,8 +1957,9 @@ class SessionWorker {
   // Streams one turn to the session's viewers and applies the steers and
   // cancels the log receives while it runs. Returns "fenced", "yielded",
   // `{ stopped }` when its harness stopped under it, or `{ result }` for a
-  // turn that ended, whose end the caller writes.
-  async drive(log, harness, turn, messageId, state, ui) {
+  // turn that ended, whose end the caller writes. `resumed` says the turn
+  // continues one an earlier worker ran.
+  async drive(log, harness, turn, messageId, state, ui, resumed = false) {
     // The inputs `state` was folded from are placed already: the fold gave
     // each a turn, joined it to one, or spent it. The poll applies only the
     // inputs stored after them. After an early start, that includes this
@@ -2002,7 +2015,10 @@ class SessionWorker {
     // reaches the model: a read of its own, started now, so every steer or
     // cancel stored while the tool ran reaches the turn first, from any
     // server. A watch or poll may come too late for the next model request
-    // (API-53; `tests/tla/sdk/DurableSteer.tla` SteerInNextRequest).
+    // (API-53; `tests/tla/sdk/DurableSteer.tla` SteerInNextRequest). It
+    // waits on it again before a turn ends, so a steer stored while the last
+    // reply streamed continues the turn instead of running as one of its own
+    // (API-50; `tests/tla/sdk/DurableSteer.tla` ReadAtEnd, NoParkedSteer).
     this.takeInputs = () => (stopped ? Promise.resolve() : take().catch(() => {}));
     for (const steer of state.steers) {
       applied.add(steer.key);
@@ -2015,9 +2031,30 @@ class SessionWorker {
     const unwatch = log.watch?.(() => { void apply(); });
     const timer = this.backend.pollMs ? setInterval(() => { void apply(); }, this.backend.pollMs) : null;
     void apply();
+    // A resumed turn's engine shows each input the turn it continues took and
+    // never placed, as it places it. A worker that died after that line
+    // landed and before the record placing the input showed it already, so
+    // the first such line reads which ones the stream shows, and each input
+    // shows once (DUR-23, DUR-38). An earlier worker's line can show only
+    // before this worker's turn_resume, which has landed. A stream that
+    // cannot be read shows the line again rather than lose it.
+    let shown = null;
+    const showsOnce = async (event) => {
+      if (!resumed || event.type !== "user_message" || typeof event.id !== "string") return true;
+      if (!shown) {
+        try {
+          shown = await userMessagesShown(log, messageId, await log.ui.length());
+        } catch {
+          shown = new Set();
+        }
+      }
+      if (shown.has(event.id)) return false;
+      shown.add(event.id);
+      return true;
+    };
     let result;
     try {
-      for await (const event of turn) ui.push({ ...event, messageId });
+      for await (const event of turn) if (await showsOnce(event)) ui.push({ ...event, messageId });
       result = await turn.result;
     } catch (error) {
       if (isFenced(error)) return "fenced";
@@ -2110,15 +2147,14 @@ async function retryOutcome(log, state, messageId, from, { sent }) {
   return { unsure: true };
 }
 
-// The end a turn's worker wrote, among the first `count` lines of the
-// stream, as a reader shows them; null when none did.
-async function turnEndIn(log, messageId, count) {
-  if (count === 0) return null;
+// Calls `visit` with each line a reader shows among the first `count` lines
+// of the stream, in order.
+async function eachShownLine(log, count, visit) {
+  if (count === 0) return;
   const shows = uiRanker();
   const reader = log.ui.read(0).getReader();
   let buffered = "";
   let seen = 0;
-  let found = null;
   try {
     while (seen < count) {
       const { value, done } = await reader.read();
@@ -2130,15 +2166,34 @@ async function turnEndIn(log, messageId, count) {
         seen += 1;
         let event;
         try { event = JSON.parse(line); } catch { continue; }
-        if (shows(event) && event.type === "turn_end" && event.messageId === messageId) found = event;
+        if (shows(event)) visit(event);
       }
     }
   } finally {
     void reader.cancel().catch(() => {});
   }
+}
+
+// The end a turn's worker wrote, among the first `count` lines of the
+// stream, as a reader shows them; null when none did.
+async function turnEndIn(log, messageId, count) {
+  let found = null;
+  await eachShownLine(log, count, (event) => {
+    if (event.type === "turn_end" && event.messageId === messageId) found = event;
+  });
   if (!found) return null;
   const { type: _type, ...rest } = found;
   return rest;
+}
+
+// The ids of the inputs whose user_message line for turn `messageId` a
+// reader shows among the first `count` lines of the stream.
+async function userMessagesShown(log, messageId, count) {
+  const ids = new Set();
+  await eachShownLine(log, count, (event) => {
+    if (event.type === "user_message" && event.messageId === messageId && typeof event.id === "string") ids.add(event.id);
+  });
+  return ids;
 }
 
 // How long a retried turn waits for an end the log already holds.
@@ -2317,7 +2372,9 @@ function turnView({ messageId, resumeRequest = null, start }) {
  *   `inputs`, when given, is called after each tool call returns, and its
  *   result reaches the model only once the promise `inputs()` returns
  *   settles: by then every steer and cancel stored while the call ran has
- *   reached the running turn.
+ *   reached the running turn. It is called again before a turn ends, and
+ *   the turn ends only once that promise settles, so a steer stored while
+ *   the last reply streamed continues the turn.
  * - `seed` (optional): the bytes of a checkpoint a new session starts from.
  * - `settings(sessionOptions)` (optional): what an `agent.session()` call
  *   sets over the agent's options for the turns it starts, as JSON the core
@@ -2356,8 +2413,14 @@ function turnView({ messageId, resumeRequest = null, start }) {
  * `defaultShared` says it hands every such agent the same one, as Node's
  * does, so that agents created without a durability share a store. `name` is
  * the factory's name in errors, and `label` the agent's.
+ *
+ * `development()` says whether the process is a development server, whose
+ * reloads create its agents again with new functions in their options. Where
+ * it returns true, a new definition of a name on a store replaces the older
+ * ones; everywhere else it is refused (SEC-2). It is asked each time an agent
+ * is created or learns its store. Without it, every process refuses.
  */
-export function createDurableAgentFactory({ harness, defaultDurability, defaultShared = false, name = "createAgent", label = "agent" }) {
+export function createDurableAgentFactory({ harness, defaultDurability, defaultShared = false, development = () => false, name = "createAgent", label = "agent" }) {
   return function createDurableAgent(options = {}) {
     if (!options || typeof options !== "object" || Array.isArray(options)) {
       throw new TypeError(`${name}() options must be an object`);
@@ -2410,7 +2473,7 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
           member.store = storeOf(chosen);
           if (!retired) {
             try {
-              claimName(agentName, member, name);
+              claimName(agentName, member, name, development() === true);
             } catch (error) {
               leaveGroup(agentsByName, agentName, registered, member);
               throw error;
@@ -2467,7 +2530,7 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
       // A delivery a replaced agent hands on to this one.
       deliver: async (delivered, meta) => deliverHere(await backend(), delivered, meta),
     };
-    claimName(agentName, member, name);
+    claimName(agentName, member, name, development() === true);
     const registered = joinGroup(agentsByName, agentName, member);
     // One delivery of `message` to the session's worker here: from the
     // queue, with `delivery` naming the queue's message and attempt, or with

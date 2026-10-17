@@ -185,9 +185,10 @@ All untrusted values crossing the native boundary are bounded before allocation 
 | Output queue | 8 MiB |
 | Encoded output message | 64 MiB |
 | Fetch request body and serialized metadata | 24 MiB |
-| One attachment | 4 MiB |
-| Pending inbound attachments | 8, totaling at most 8 MiB |
-| Pending outbound attachments | 4, totaling at most 8 MiB |
+| One attachment | 32 MiB |
+| Pending inbound attachments | 8, totaling at most 64 MiB |
+| Pending outbound attachments | 4, totaling at most 64 MiB |
+| Prompt images the core takes from attachments | 4 MiB each, 8 MiB per prompt |
 | Fetch response queue | 8 MiB |
 | Gateway error body | 1 MiB |
 | One output drain | 1 MiB |
@@ -195,6 +196,8 @@ All untrusted values crossing the native boundary are bounded before allocation 
 | ACP tool result | 64 KiB text; 8 MiB tagged rich result |
 | ACP history | 100 turns |
 | Agent steps | 64 |
+
+One attachment holds a kernel checkpoint, a journal snapshot or the journal records a session opens from, each up to 32 MiB, since a conversation keeps its prompts' images. A journal opens from a snapshot and its records attached together, so the inbound total is twice that. Prompt images share the table, and the core bounds them as it takes them, below the table's limits.
 
 The fetch request budget covers the full model request, including retained history and metadata. It holds the largest prompt libfx accepts, an 8 MiB frame with 6 MiB of images, 8 MiB once base64 encoded, and leaves 8 MiB for instructions, tools and earlier turns. The body crosses to Node unencoded beside its metadata, so the transfer adds no separate bound; accepting one tool result does not reserve space for later requests.
 

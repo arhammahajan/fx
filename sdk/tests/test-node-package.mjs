@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 import { strict as assert } from "node:assert";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { cp, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -24,6 +25,88 @@ function run(command, args, options = {}) {
   return result;
 }
 
+// The packager takes the docs from a server in this process, so it runs
+// without blocking this process.
+function packageLibfx(outputDir, env) {
+  return new Promise((done, fail) => {
+    const child = spawn(process.execPath, [resolve(repoRoot, "sdk/scripts/package-libfx.mjs"), outputDir], {
+      cwd: repoRoot,
+      env: { ...process.env, ...env },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let output = "";
+    for (const stream of [child.stdout, child.stderr]) {
+      stream.setEncoding("utf8");
+      stream.on("data", (chunk) => { output += chunk; });
+    }
+    child.on("error", fail);
+    child.on("close", (status) => done({ status, output }));
+  });
+}
+
+// A docs site on this machine, so that no test depends on fx.sh. Its llms.txt
+// has fx.sh's format: libfx entries, one of them nested, among other pages.
+// The pages link to one another, with anchors, to a page outside libfx, and
+// to a libfx page the index does not list. `{site}` stands for the site's
+// address. Each page is [path on the site, packaged file, title, text the
+// site serves, text the package holds].
+const docsPage = (title, text) => `---\ntitle: ${title}\n---\n\n${text}\n`;
+const docsPages = [
+  ["/docs/lib.md", "index.md", "Overview",
+    "Start with the [quick start]({site}/docs/lib/quick-start.md), then read [durability]({site}/docs/lib/durability.md#sessions).",
+    "Start with the [quick start](quick-start.md), then read [durability](durability.md#sessions)."],
+  ["/docs/lib/quick-start.md", "quick-start.md", "Quick start",
+    "The [fx CLI]({site}/docs.md) is another product. Every option is in the [API reference]({site}/docs/lib/api.md).",
+    "The [fx CLI]({site}/docs.md) is another product. Every option is in the [API reference](api.md)."],
+  ["/docs/lib/durability.md", "durability.md", "Durability",
+    "On Vercel, see [Durability on Vercel]({site}/docs/lib/durability/vercel.md). Back to the [overview]({site}/docs/lib.md).",
+    "On Vercel, see [Durability on Vercel](durability/vercel.md). Back to the [overview](index.md)."],
+  ["/docs/lib/durability/vercel.md", "durability/vercel.md", "Durability on Vercel",
+    "Its options are in the [API reference]({site}/docs/lib/api.md#vercel), next to [durability]({site}/docs/lib/durability.md) and [a draft]({site}/docs/lib/draft.md).",
+    "Its options are in the [API reference](../api.md#vercel), next to [durability](../durability.md) and [a draft]({site}/docs/lib/draft.md)."],
+  ["/docs/lib/api.md", "api.md", "API reference",
+    "`createFxAgent(options)` creates an agent. Back to the [overview]({site}/docs/lib.md).",
+    "`createFxAgent(options)` creates an agent. Back to the [overview](index.md)."],
+];
+const llmsTxt = `# fx documentation
+
+> fx is a coding agent for your terminal.
+
+## getting started
+
+- [Quick start]({site}/docs.md): Install fx and send your first prompt.
+## libfx / getting started
+
+- [Overview]({site}/docs/lib.md): Run the fx agent from JavaScript.
+- [Quick start]({site}/docs/lib/quick-start.md): Install libfx and stream your first reply.
+## libfx / build an agent
+
+- [Durability]({site}/docs/lib/durability.md): Keep sessions running through crashes.
+- [Durability on Vercel]({site}/docs/lib/durability/vercel.md): Run durable sessions on Vercel.
+## libfx / reference
+
+- [API reference]({site}/docs/lib/api.md): Interfaces and options.
+
+## Project and policies
+
+- [Changelog]({site}/changelog.md): New features and fixes in fx.
+`;
+const docsRequests = [];
+let unavailableDocsPath = null;
+const docsServer = createServer((request, response) => {
+  const path = request.url.split("?")[0];
+  docsRequests.push(path);
+  const page = docsPages.find(([sitePath]) => sitePath === path);
+  const text = path === "/llms.txt" ? llmsTxt : page && docsPage(page[2], page[3]);
+  if (path === unavailableDocsPath || !text) {
+    response.writeHead(path === unavailableDocsPath ? 503 : 404).end();
+    return;
+  }
+  response.writeHead(200, { "content-type": "text/markdown; charset=utf-8" }).end(text.replaceAll("{site}", docsSite));
+});
+await new Promise((ready) => docsServer.listen(0, "127.0.0.1", ready));
+const docsSite = `http://127.0.0.1:${docsServer.address().port}`;
+
 try {
   const workflow = await readFile(resolve(repoRoot, ".github/workflows/publish-libfx.yml"), "utf8");
   const packageJob = workflow.split("\n  package:\n")[1]?.split("\n  publish:\n")[0];
@@ -32,9 +115,28 @@ try {
   const assembly = packageJob.indexOf("- name: Assemble package");
   assert.ok(bunSetup >= 0 && bunSetup < assembly, "publisher must install Bun before building the CommonJS entry");
 
-  // As the publisher packages it, with the docs required.
+  // PKG-5: the publisher requires the docs, and takes them from fx.sh.
   assert.match(packageJob, /LIBFX_REQUIRE_DOCS=1 node sdk\/scripts\/package-libfx\.mjs/, "publisher must require the libfx docs");
-  run(process.execPath, [resolve(repoRoot, "sdk/scripts/package-libfx.mjs"), packageDir], { env: { ...process.env, LIBFX_REQUIRE_DOCS: "1" } });
+  assert.doesNotMatch(workflow, /LIBFX_DOCS_SITE/, "publisher must take the docs fx.sh publishes");
+
+  // When the docs site cannot give a page, a build that requires the docs
+  // fails, and any other build packages without them.
+  unavailableDocsPath = "/docs/lib/api.md";
+  const unavailable = new RegExp(`packaging the libfx docs: ${docsSite.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/docs/lib/api\\.md answered HTTP 503`);
+  const required = await packageLibfx(join(temp, "package-docs-required"), { LIBFX_DOCS_SITE: docsSite, LIBFX_REQUIRE_DOCS: "1" });
+  assert.notEqual(required.status, 0, "a build that requires the docs must fail without them");
+  assert.match(required.output, unavailable);
+  const optional = await packageLibfx(join(temp, "package-docs-optional"), { LIBFX_DOCS_SITE: docsSite, LIBFX_REQUIRE_DOCS: "" });
+  assert.equal(optional.status, 0, optional.output);
+  assert.match(optional.output, new RegExp(`warning: packaging libfx without its docs: ${unavailable.source}`));
+  assert.ok(!existsSync(join(temp, "package-docs-optional", "docs")), "a build without the docs leaves no partial docs");
+  unavailableDocsPath = null;
+
+  // As the publisher packages it, with the docs required.
+  docsRequests.length = 0;
+  const packaged = await packageLibfx(packageDir, { LIBFX_DOCS_SITE: docsSite, LIBFX_REQUIRE_DOCS: "1" });
+  assert.equal(packaged.status, 0, packaged.output);
+  assert.deepEqual(docsRequests, ["/llms.txt", ...docsPages.map(([sitePath]) => sitePath)], "the packager fetches the index, then each libfx page it lists");
 
   const manifest = JSON.parse(await readFile(join(packageDir, "package.json"), "utf8"));
   const typed = (types, entry) => ({ types: `./types/${types}`, default: entry });
@@ -82,15 +184,33 @@ try {
     /package is missing the libfx docs/,
   );
 
-  // PKG-5: the docs ship in the package, and their links to one another
-  // open the packaged pages.
-  const docsIndex = await readFile(join(packageDir, "docs/README.md"), "utf8");
-  const docPages = [...docsIndex.matchAll(/^- \[[^\]]+\]\(([^)]+)\)/gm)].map((match) => match[1]);
-  for (const page of ["index.md", "quick-start.md", "durability.md", "api.md"]) assert.ok(docPages.includes(page), `docs/README.md lists ${page}`);
-  for (const page of docPages) {
-    const text = await readFile(join(packageDir, "docs", page), "utf8");
-    assert.match(text, /^---\ntitle: /, `docs/${page} is a docs page`);
-    assert.doesNotMatch(text, /\]\(https:\/\/fx\.sh\/docs\/lib(\/[a-z0-9-]+)*\.md/, `docs/${page} links to the packaged pages`);
+  // PKG-5: the docs ship in the package: an index in the site's order, and
+  // each libfx page as the site served it, with its links to the other
+  // packaged pages opening them.
+  assert.equal(await readFile(join(packageDir, "docs/README.md"), "utf8"), `# libfx docs
+
+The libfx pages of the fx docs, as fx.sh published them when this package was built. The latest version of each page is at ${docsSite}/docs/lib.
+
+## Getting started
+
+- [Overview](index.md): Run the fx agent from JavaScript.
+- [Quick start](quick-start.md): Install libfx and stream your first reply.
+
+## Build an agent
+
+- [Durability](durability.md): Keep sessions running through crashes.
+- [Durability on Vercel](durability/vercel.md): Run durable sessions on Vercel.
+
+## Reference
+
+- [API reference](api.md): Interfaces and options.
+`);
+  assert.deepEqual(
+    [...archiveFiles].filter((path) => path.startsWith("docs/")).sort(),
+    ["docs/README.md", ...docsPages.map(([, file]) => `docs/${file}`)].sort(),
+  );
+  for (const [, file, title, , text] of docsPages) {
+    assert.equal(await readFile(join(packageDir, "docs", file), "utf8"), docsPage(title, text).replaceAll("{site}", docsSite), `docs/${file}`);
   }
 
   // PERF-14: no packaged file carries a copy of undici. Its client names its
@@ -205,7 +325,9 @@ try {
   const esm = run(process.execPath, ["esm.mjs"], { cwd: consumerDir });
   const cjsResult = run(process.execPath, ["--no-experimental-require-module", "cjs.cjs"], { cwd: consumerDir });
   assert.deepEqual(JSON.parse(cjsResult.stdout), JSON.parse(esm.stdout));
-  console.log("Node package passed: publisher prerequisites, archive validation, packaged docs, no bundled undici, the Vercel World over node:http, conditional exports, relocated CJS, literal native assets, and bare imports");
+  console.log("Node package passed: publisher prerequisites, archive validation, docs packaged from a local docs site and required by the publisher, no bundled undici, the Vercel World over node:http, conditional exports, relocated CJS, literal native assets, and bare imports");
 } finally {
+  docsServer.closeAllConnections();
+  docsServer.close();
   await rm(temp, { recursive: true, force: true });
 }

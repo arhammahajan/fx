@@ -14,10 +14,10 @@
 // Each walk starts one agent on a fresh local() World directory. Every model
 // request streams only what the driver sends it, every tool call waits until
 // the driver ends it, each queue delivery waits until the driver lets it
-// run, and a call with effects that a reply ends in starts only once the
-// driver lets its intent be stored, so the driver decides the interleaving.
-// After each
-// step it reads back what the model was sent, in the newest request, which
+// run, and a call that a reply ends in starts only once the driver lets its
+// intent be stored, so the driver decides the interleaving. Where the model
+// lets a step end in more than one state, the walk aims for one of them and
+// the driver brings it about. After each step it reads back what the model was sent, in the newest request, which
 // carries the whole conversation: a message that started a turn on the
 // session's stream opens that turn, and every other message joins the turn
 // before it. With how each turn ended, from the stream, and what the model is
@@ -102,7 +102,7 @@ const until = async (check, ms = stepTimeoutMs) => {
 //
 // While `reads.holding`, every read of the session log through this World
 // waits until the driver lets it go, so the worker does not read a steer the
-// model has as unread before the model's Read or ToolEnd.
+// model has as unread before the model's Read, ToolEnd or ModelText.
 //
 // While `records.holding`, the engine's journal records wait to be stored,
 // and inputs do not. A call with effects starts only once its intent is
@@ -276,12 +276,21 @@ async function harness() {
       idempotent: false,
       inputSchema: { type: "object", properties: { to: { type: "string" } } },
       execute: (toolInput, context) => held(`sent to ${toolInput.to}`, context),
+    }, {
+      // A call that is safe to run twice and writes, which also starts only
+      // once its intent is stored, and runs again when a deadline cut it off.
+      name: "save",
+      description: "Saves a note",
+      idempotent: true,
+      writes: true,
+      inputSchema: { type: "object", properties: { note: { type: "string" } } },
+      execute: (toolInput, context) => held(`saved ${toolInput.note}`, context),
     }],
   };
   const agent = createFxAgent({ ...options, durability });
-  // Another server on the same store. A steer sent while the model writes a
-  // tool call or the tool runs comes from it, so the worker hears of it only
-  // by reading the log, as the model's `unread` has it.
+  // Another server on the same store. A steer the model leaves unread comes
+  // from it, so the worker hears of it only by reading the log, as the
+  // model's `unread` has it.
   const sender = createFxAgent({ ...options, durability: storeOnly(durabilityKind === "world" ? await appWorldAt(dir) : local({ dir })) });
 
   async function streamLines() {
@@ -363,8 +372,8 @@ async function harness() {
   }
 
   // What the user sends: a message, the same steer again, or a cancel.
-  // `before` is the model's state before the step.
-  async function performInput({ name, m }, before) {
+  // `aim` is the model's state the step should end in.
+  async function performInput({ name, m }, aim) {
     if (name === "Cancel") {
       reads.release();
       await session.cancel();
@@ -376,11 +385,13 @@ async function harness() {
       void turn.result.catch(() => {});
       sessionId = (await turn.accepted).sessionId;
       await until(() => gate.held.length > 0);
-    } else if (before.turns.some((turn) => turn.state === "running") && ["args", "call", "tool"].includes(before.phase)) {
+    } else if (aim.unread.includes(m) || reads.holding) {
       // A steer the model has unread comes from the other server, and the
-      // worker reads nothing until the model's Read or the tool's end, so
-      // only a read it makes itself before the result goes on can find the
-      // steer.
+      // worker reads nothing until the model's Read, so only a read it makes
+      // itself, before a tool's result goes on or before the turn ends, can
+      // find the steer. While a reply streams, that is how a steer another
+      // server sends near the reply's end reaches the turn. While reads are
+      // held, every steer comes from there, as this agent's own reads wait.
       reads.holding = true;
       await sender.session(sessionId).steer(textOf(m), { messageId: m });
     } else {
@@ -389,11 +400,12 @@ async function harness() {
     }
   }
 
-  // One step of the model, done to the code.
-  async function perform({ name, m }, before) {
+  // One step of the model, done to the code, which should end in the
+  // model's state `aim`.
+  async function perform({ name, m }, aim) {
     pinned = null;
     if (name === "Send" || name === "Retry" || name === "Cancel") {
-      await performInput({ name, m }, before);
+      await performInput({ name, m }, aim);
       await sleep(inputMs);
       return;
     }
@@ -406,7 +418,14 @@ async function harness() {
       gate.release();
       await until(() => open.length > 0);
     } else if (name === "ModelText") {
+      // Reads made from now on go through, so the worker's read before the
+      // turn ends finds the steers it had not read; the polls held before go
+      // only once the next request is out, which the view then shows.
+      reads.holding = false;
+      const at = requests.length;
       open.at(-1).end([{ type: "text-delta", id: "reply", delta: "done" }, finish("stop")]);
+      if (aim.phase === "gen") await until(() => requests.length > at && open.length > 0);
+      reads.release();
     } else if (name === "ToolArgs") {
       const request = open.at(-1);
       toolCalls += 1;
@@ -417,13 +436,16 @@ async function harness() {
         { type: "tool-input-delta", id: request.toolId, delta: "{\"key\":\"al" },
       ]);
     } else if (name === "ReplyCall") {
-      // The reply ends in a call with effects, with no streamed arguments;
-      // its intent is held, so the tool waits to start.
+      // The reply ends in a call it streamed no arguments for, one with
+      // effects or one safe to run twice that writes, which a deadline in
+      // `call` resumes differently; its intent is held, so the tool waits to
+      // start.
       const request = open.at(-1);
       toolCalls += 1;
       records.holding = true;
+      const call = random() < 0.5 ? { toolName: "email", input: { to: "alpha" } } : { toolName: "save", input: { note: "alpha" } };
       request.end([
-        { type: "tool-call", toolCallId: `call-${toolCalls}`, toolName: "email", input: { to: "alpha" } },
+        { type: "tool-call", toolCallId: `call-${toolCalls}`, ...call },
         finish("tool-calls"),
       ]);
       await until(() => records.held.length > 0);
@@ -455,9 +477,14 @@ async function harness() {
       reads.release();
       const before = requests.length;
       agent[durableInternals].stopAtDeadline(sessionId);
+      // In `call` the turn stops before its call starts; the call's intent
+      // lands as the worker lets the session go. The next delivery runs a
+      // call safe to run twice again and tells the model a call with effects
+      // may have partly run.
+      records.release();
       await until(() => {
         gate.release();
-        return requests.length > before && open.length > 0;
+        return (requests.length > before && open.length > 0) || calls.length > 0;
       });
     } else {
       throw new Error(`no driver step for ${name}`);
@@ -516,9 +543,16 @@ for (let walk = 1; walk <= walks; walk += 1) {
       const fresh = options.filter((entry) => entry.fresh);
       const pool = fresh.length > 0 ? fresh : options;
       const { act } = pool[Math.floor(random() * pool.length)];
+      // The state the step aims for, by an edge no walk has covered when
+      // there is one: where the model lets the step end in more than one
+      // state, the driver brings this one about.
+      const aims = [...current].flatMap((from) => successors(from).filter((to) => sameAct(actOf(to), act)).map((to) => ({ from, to })));
+      const freshAims = aims.filter(({ from, to }) => !covered.has(`${from}>${to}`));
+      const aimPool = freshAims.length > 0 ? freshAims : aims;
+      const aim = aimPool[Math.floor(random() * aimPool.length)];
       const label = `${act.name}${act.m === "none" ? "" : `(${act.m})`}`;
       if (verbose) console.log(`walk ${walk}: ${label}`);
-      await code.perform(act, graph.states.get([...current][0]));
+      await code.perform(act, graph.states.get(aim.to));
       const seen = await code.observe();
       if (verbose) console.log(`  shows ${seen}`);
       path.push(label);

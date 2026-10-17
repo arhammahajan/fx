@@ -35,5 +35,10 @@ const built = readFileSync(output, "utf8");
 const imports = built.match(/\bimport\(/g)?.length ?? 0;
 const hints = readFileSync(resolve(repoRoot, "sdk/node.js"), "utf8").match(/import\(\/\* webpackIgnore: true \*\/ \/\* turbopackIgnore: true \*\//g)?.length ?? 0;
 if (hints === 0 || imports < hints) throw new Error(`node.cjs has ${imports} import() calls for the ${hints} hinted ones in node.js; check the build`);
+// Bun replaces `process.env.NODE_ENV` with the mode it builds in. A build
+// that fixed it would make every process that loads node.cjs a development
+// server, where a new agent replaces another of its name (SEC-2), so the
+// entry must still read it when it runs.
+if (!/\.NODE_ENV === "development"/.test(built)) throw new Error("node.cjs no longer reads NODE_ENV when it runs; check `development` in node.js");
 writeFileSync(output, built.replace(/\bimport\(/g, "import(/* webpackIgnore: true */ /* turbopackIgnore: true */ "));
 console.log(`built CommonJS Node entry in ${output}`);

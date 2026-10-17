@@ -3,7 +3,7 @@ import { strict as assert } from "node:assert";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createFxEngine, supportsJspi } from "../node.js";
+import { createFxEngine, createMemoryPersistence, supportsJspi } from "../node.js";
 import { createFxEngine as createSharedAgent, maxPromptFrameBytes, promptFrameBytes } from "../fx-sdk.js";
 
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
@@ -394,10 +394,16 @@ for (const resizeImage of [undefined, (image) => image]) {
   assert.deepEqual(files, [{ type: "file", mediaType: "image/png", data: { type: "data", data: pngData } }]);
   await restored.close();
 
-  // Oversized and empty restore checkpoints fail with the same errors on both backends.
+  // Oversized and empty restore checkpoints fail with the same errors on both
+  // backends. One at the 32 MiB limit reaches the core, which finds it is not
+  // a checkpoint.
   await assert.rejects(
-    createAgent(mockGateway(), { model: "sdk/vision-model", checkpoint: new Uint8Array(4 * 1024 * 1024 + 1) }),
+    createAgent(mockGateway(), { model: "sdk/vision-model", checkpoint: new Uint8Array(32 * 1024 * 1024 + 1) }),
     (error) => error.message === "libfx checkpoint is too large",
+  );
+  await assert.rejects(
+    createAgent(mockGateway(), { model: "sdk/vision-model", checkpoint: new Uint8Array(32 * 1024 * 1024) }),
+    (error) => error.message === "Invalid or non-fresh libfx checkpoint",
   );
   await assert.rejects(
     createAgent(mockGateway(), { model: "sdk/vision-model", checkpoint: new Uint8Array(0) }),
@@ -609,6 +615,32 @@ for (const resizeImage of [undefined, (image) => image]) {
     assert.deepEqual(fileParts(body).map((part) => part.data.data.length), [quarter.length, quarter.length], label);
     assert.ok(JSON.stringify(body.prompt).includes(text), `${label}: the text reached the model`);
     await agent.close();
+  }
+}
+
+// DUR-23 and API-42: a journaled session whose prompt filled the image budget
+// opens again with its images in history and takes the next prompt, from the
+// checkpoint its turn saved, or from the records alone when the store keeps
+// no checkpoints.
+{
+  const quarter = pngWithEncodedLength(4 * 1024 * 1024);
+  const image = { type: "image", data: quarter, mimeType: "image/png" };
+  for (const checkpoints of [true, false]) {
+    const label = checkpoints ? "from a checkpoint" : "from the records";
+    const store = createMemoryPersistence();
+    const persistence = checkpoints ? store : { load: () => store.load(), append: (record) => store.append(record) };
+    const gateway = mockGateway();
+    const first = await createAgent(gateway, { model: "sdk/vision-model", persistence });
+    assert.equal((await runPrompt(first, [{ type: "text", text: "two images" }, image, image])).stopReason, "end_turn", label);
+    await first.close();
+    const saved = store.checkpoint !== null;
+    const second = await createAgent(gateway, { model: "sdk/vision-model", persistence });
+    const result = await runPrompt(second, "and now?");
+    assert.equal(result.stopReason, "end_turn", `${label}: ${result.error?.message}`);
+    assert.equal(gateway.state.chatBodies.length, 2, label);
+    assert.deepEqual(fileParts(gateway.state.chatBodies[1]).map((part) => part.data.data.length), [quarter.length, quarter.length], `${label}: the history keeps the images`);
+    assert.equal(saved, checkpoints, `${label}: the first turn's end saved a checkpoint`);
+    await second.close();
   }
 }
 

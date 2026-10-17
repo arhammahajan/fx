@@ -71,6 +71,13 @@
 (* session and writes the missing turn_end; without it nothing reads a     *)
 (* done session again (Witness-NoEndRepair).                               *)
 (*                                                                         *)
+(* With Refused, the harness refuses the turn's input, as fx refuses a     *)
+(* malformed prompt: the turn ends before any record, through an `ended`   *)
+(* entry outside the chain, which even a replaced worker's write lands,    *)
+(* then its turn_end line. A crash between the two needs the same repair   *)
+(* (Witness-NoRefusedRepair); libfx had it only for a turn a record ended, *)
+(* which on this graph is no repair at all.                                *)
+(*                                                                         *)
 (* `act` names each step and its worker, so a driver can replay any path   *)
 (* of the state graph against the real code and compare every state:       *)
 (* tests/tla/drivers/drive.mjs.                                            *)
@@ -91,8 +98,10 @@ CONSTANTS
     Heartbeat,   \* whether a holder renews a short lease while it runs
     QueueHeld,   \* whether only the queue's redelivery of a frozen holder's
                  \* message frees its lease
-    Repair       \* whether a worker writes the turn_end a crashed holder
+    Repair,      \* whether a worker writes the turn_end a crashed holder
                  \* left unwritten
+    Refused      \* whether the harness refuses the turn's input, so it ends
+                 \* before any record
 
 ASSUME Tool \in {"lookup", "write", "send"}
 ASSUME WritesWait \in BOOLEAN
@@ -103,6 +112,7 @@ ASSUME CutoffBound \in BOOLEAN
 ASSUME Heartbeat \in BOOLEAN
 ASSUME QueueHeld \in BOOLEAN
 ASSUME Repair \in BOOLEAN
+ASSUME Refused \in BOOLEAN
 ASSUME ~(QueueHeld /\ Heartbeat)
 
 None == "none"
@@ -268,14 +278,22 @@ Claim(w) ==
 \* moves only let the model do more. A step
 \* cut off MaxCutoffs times in a row is not run again: a call is answered
 \* as possibly run, and a model request cancels the turn, whose end only
-\* the chain's head writes.
+\* the chain's head writes. With Refused, a turn that has recorded nothing
+\* ends at once: its `ended` entry is outside the chain, so it lands whether
+\* or not w still heads it.
 Announce(w) ==
     /\ pc[w] = "announce"
     /\ ~frozen[w]
     /\ LET from == seen[w].progress
            spent == CutoffBound /\ seen[w].cutoffs >= MaxCutoffs
            rerun == from = "intent" /\ Idempotent /\ ~spent
-       IN IF spent /\ from \in {"start", "result"}
+       IN IF Refused /\ from = "start"
+          THEN \* turn_start; turn_end follows in EndLine
+               /\ progress' = "done"
+               /\ pc' = [pc EXCEPT ![w] = "ending"]
+               /\ ui' = Append(ui, Line(w))
+               /\ UNCHANGED <<runs, lease, chain, cutoffs, lapse>>
+          ELSE IF spent /\ from \in {"start", "result"}
           THEN /\ UNCHANGED runs
                /\ IF Heads(w)
                      THEN /\ progress' = "done"
@@ -527,7 +545,10 @@ EveryCallAfterIntent == runs > 0 => progress # "start"
 \* id after a crash lost its intent.
 IdsAtMostOne == ids <= 1
 
-\* Only the chain's head ends the turn.
+\* Only the chain's head ends the turn. It is about the record that ends a
+\* turn, which only the head writes: a refused turn's `ended` entry is
+\* outside the chain, so a worker replaced while it refused the turn can
+\* write it too, and the refuse graph does not check this.
 DoneByHead == progress = "done" => \E w \in Workers : pc[w] \in {"ending", "done"}
 
 \* No reader hides a line its writer wrote while it headed the chain.

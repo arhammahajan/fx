@@ -35,12 +35,17 @@ const max_output_message_bytes = 64 * 1024 * 1024;
 // in sdk/fx-sdk.js), with 8 MiB for instructions, tools and earlier turns.
 const max_fetch_request_bytes = 24 * 1024 * 1024;
 const max_fetch_response_bytes = 8 * 1024 * 1024;
-// One attachment holds one prompt image or one kernel checkpoint, the larger.
+// One attachment holds one prompt image, or one kernel checkpoint, journal
+// load or snapshot, the larger. The core bounds prompt images further when it
+// takes them (`max_attached_image_bytes` in `src/acp/prompt.zig`).
 const max_attachment_bytes = agent_checkpoint.max_checkpoint_bytes;
 const max_inbound_attachments = 8;
-const max_inbound_attachment_bytes = 8 * 1024 * 1024;
+// A journal opens from its snapshot and the events after it, attached
+// together.
+const max_inbound_attachment_bytes = 2 * max_attachment_bytes;
 const max_outbound_attachments = 4;
-const max_outbound_attachment_bytes = 8 * 1024 * 1024;
+// A snapshot and a checkpoint the host asked for may wait to be taken at once.
+const max_outbound_attachment_bytes = 2 * max_attachment_bytes;
 const max_api_key_bytes = 64 * 1024;
 const max_model_bytes = 1024;
 // Matches types.ReasoningEffort.max_name_bytes.

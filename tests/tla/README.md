@@ -76,7 +76,7 @@ tests/tla/sdk/check.sh                                  # the SDK specs; writes 
 bun tests/tla/drivers/drive.mjs send --walks 40         # one durable-session graph; see .github/workflows/ci.yml for the rest
 bun tests/tla/drivers/drive-agents.mjs --walks 60       # agent routing
 bun tests/tla/drivers/drive-tenants.mjs --walks 60      # tenants in one process
-bun tests/tla/drivers/drive-tenants.mjs --development   # the same under NODE_ENV=development, where a new agent replaces the old
+bun tests/tla/drivers/drive-tenants.mjs --development   # the same in a development server, where the newest agent replaces the old
 bun tests/tla/drivers/drive-steer.mjs ideal --walks 20  # steering
 bun test ./tests/tla/drivers/shell_command/             # a driver written as bun tests; see each check.sh for its own
 ```

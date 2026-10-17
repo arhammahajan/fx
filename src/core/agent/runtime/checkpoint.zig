@@ -15,7 +15,14 @@ const version: u16 = 2;
 const json_only_version: u16 = 1;
 const header_bytes: usize = 4 + 2 + 2 + 4 + Sha256.digest_length;
 const length_bytes: usize = 4;
-pub const max_checkpoint_bytes: usize = 4 * 1024 * 1024;
+/// The most bytes one kernel checkpoint holds, and with it one journal load
+/// and one snapshot (`journal.zig`). History keeps every prompt's images, so
+/// this holds more than one model request on the native addon carries
+/// (24 MiB, `max_fetch_request_bytes` in `src/napi_core_main.zig`), which
+/// sends the whole history, with 8 MiB more for what the journal records
+/// beside it. That is twice the largest prompt libfx accepts: an 8 MiB frame
+/// and 8 MiB of base64 images.
+pub const max_checkpoint_bytes: usize = 32 * 1024 * 1024;
 pub const max_history_turns: usize = 1024;
 
 pub const Error = Allocator.Error || error{

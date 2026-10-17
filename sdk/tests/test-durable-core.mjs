@@ -220,14 +220,13 @@ const createAgent = createDurableAgentFactory({ harness: scriptedHarness(), defa
 
 // Agents that record which of them opened each session's engine, by `tag`.
 const openedBy = [];
-const createTaggedAgent = createDurableAgentFactory({
-  harness: ({ tag }) => {
-    const plugged = scriptedHarness()();
-    return { open: (args) => { openedBy.push([tag, args.sessionId]); return plugged.open(args); } };
-  },
-  defaultDurability: async () => memory(),
-  name: "createTaggedAgent",
-});
+const taggedHarness = ({ tag }) => {
+  const plugged = scriptedHarness()();
+  return { open: (args) => { openedBy.push([tag, args.sessionId]); return plugged.open(args); } };
+};
+const createTaggedAgent = createDurableAgentFactory({ harness: taggedHarness, defaultDurability: async () => memory(), name: "createTaggedAgent" });
+// The same, as a factory whose process is a development server.
+const createDevTaggedAgent = createDurableAgentFactory({ harness: taggedHarness, defaultDurability: async () => memory(), development: () => true, name: "createTaggedAgent" });
 const openersOf = (sessionId) => [...new Set(openedBy.filter(([, id]) => id === sessionId).map(([tag]) => tag))];
 
 async function durabilityFor(options = {}) {
@@ -417,19 +416,6 @@ test("a retried message runs its turn once", async () => {
   assert.equal(ran.length - before, 3, "the retry ran nothing");
   await agent.close();
 });
-
-// Runs `fn` with NODE_ENV set to `value`, or unset, then puts it back.
-async function withNodeEnv(value, fn) {
-  const saved = process.env.NODE_ENV;
-  if (value === undefined) delete process.env.NODE_ENV;
-  else process.env.NODE_ENV = value;
-  try {
-    return await fn();
-  } finally {
-    if (saved === undefined) delete process.env.NODE_ENV;
-    else process.env.NODE_ENV = saved;
-  }
-}
 
 // A step a test holds until it lets it go.
 function holdStep(word) {
@@ -1209,12 +1195,15 @@ if (durabilityKind === "memory") {
   });
 }
 
-// memory(), with a worker that dies right after the first record that ends a
-// turn: from then until the test sets `dies.dead` back, no write but a
-// sender's input lands, and no line reaches the stream.
-function deadAfterEnd(base, dies) {
+// memory(), with a worker that dies right after the first entry that ends a
+// turn while `dies.armed` is set, by default a record: from then until the
+// test sets `dies.dead` back, no write but a sender's input lands, and no
+// line reaches the stream.
+const recordEnds = (entry) => entry?.k === "record" && (entry.marks ?? []).some((mark) => mark.end === true);
+// The entry that ends a turn which wrote no record of its own.
+const endedEntry = (entry) => entry?.k === "ended";
+function deadAfterEnd(base, dies, ends = recordEnds) {
   let wrapped = null;
-  const ends = (entry) => entry?.k === "record" && (entry.marks ?? []).some((mark) => mark.end === true);
   return {
     ...base,
     create() {
@@ -1268,6 +1257,62 @@ if (durabilityKind === "memory") {
     assert.equal(ends("turn-b"), 1);
     const at = (type, id) => lines.findIndex((line) => line.type === type && line.messageId === id);
     assert.ok(at("turn_end", "turn-a") < at("turn_start", "turn-b"), "the first turn ended for its viewers before the next one started");
+    await agent.close();
+  });
+
+  // DUR-20, DUR-25: a turn that ends before writing any record ends through
+  // an `ended` entry in the log, then its turn_end line, and the next worker
+  // writes that line when its holder died between the two, as for a turn a
+  // record ended (`tests/tla/sdk/DurableSession.tla` with Refused, EndLine).
+  // Each retry here would otherwise wait 30 s for an end nobody writes.
+  const endsForItsViewers = async (session, input, messageId, first) => {
+    let timer;
+    const retried = await Promise.race([
+      session.prompt(input, { messageId }).result,
+      new Promise((_resolve, reject) => { timer = setTimeout(() => reject(new Error("the retry waited for an end nobody writes")), 5000); }),
+    ]).finally(() => clearTimeout(timer));
+    // How it ended is not in the log.
+    assert.equal(retried.stopReason, "unknown");
+    assert.equal((await first.result).stopReason, "unknown");
+    const lines = await readLines(session.stream(0), 100);
+    assert.equal(lines.filter((line) => line.type === "turn_end" && line.messageId === messageId).length, 1);
+    assert.equal((await session.prompt("after", { messageId: `${messageId}-after` }).result).stopReason, "end_turn");
+  };
+
+  test("a prompt the harness refused, whose worker died before its turn_end line, ends for its viewers when the session is next delivered", async () => {
+    const dies = { armed: true, dead: false };
+    const agent = createAgent({ durability: deadAfterEnd(memory(), dies, endedEntry) });
+    const session = agent.session();
+    const first = session.prompt("refuse", { messageId: "turn-r" });
+    await first.accepted;
+    while (!dies.dead) await sleep(10);
+    await sleep(landMs);
+    dies.dead = false;
+    await endsForItsViewers(session, "refuse", "turn-r", first);
+    await agent.close();
+  });
+
+  test("a prompt its own cancel stopped before it started, whose worker died before its turn_end line, ends for its viewers when the session is next delivered", async () => {
+    const dies = { armed: false, dead: false };
+    const agent = createAgent({ durability: deadAfterEnd(memory(), dies, endedEntry) });
+    const session = agent.session();
+    // The prompt waits behind a running turn, and its cancel lands first.
+    const held = holdStep("alpha-1");
+    const running = session.prompt("alpha", { messageId: "turn-a" });
+    await held.holding;
+    const waiting = new AbortController();
+    const first = session.prompt("beta", { messageId: "turn-b", signal: waiting.signal });
+    await first.accepted;
+    waiting.abort();
+    const log = await agent[Symbol.for("libfx.durableInternals")].openLog(session.id);
+    while (!(await log.read()).some(({ entry }) => entry.type === "cancel" && entry.target === "turn-b")) await sleep(10);
+    dies.armed = true;
+    held.release();
+    assert.equal((await running.result).stopReason, "end_turn");
+    while (!dies.dead) await sleep(10);
+    await sleep(landMs);
+    dies.dead = false;
+    await endsForItsViewers(session, "beta", "turn-b", first);
     await agent.close();
   });
 }
@@ -1812,68 +1857,98 @@ if (durabilityKind === "memory") {
     await chat.close();
   });
 
-  // Decision D1: SEC-2 keeps the refusal wherever NODE_ENV is not exactly
-  // "development".
-  test("SEC-2: outside development, another configuration under a name is refused whatever NODE_ENV holds", async () => {
-    for (const value of [undefined, "", "production", "test", "Development", "development "]) {
-      await withNodeEnv(value, async () => {
+  // Decision D1: SEC-2 keeps the refusal unless the runtime that builds the
+  // factory says the process is a development server. The core reads no
+  // environment; sdk/tests/test-durable.mjs checks how Node decides.
+  test("SEC-2: a factory refuses another configuration under a name unless its development() returns true", async () => {
+    const strict = createDurableAgentFactory({ harness: taggedHarness, defaultDurability: async () => memory(), development: () => false, name: "createTaggedAgent" });
+    const loose = createDurableAgentFactory({ harness: taggedHarness, defaultDurability: async () => memory(), development: () => "development", name: "createTaggedAgent" });
+    // Not even where the process environment says development, as a
+    // browser bundle's shim may.
+    const saved = process.env.NODE_ENV;
+    process.env.NODE_ENV = "development";
+    try {
+      for (const create of [createTaggedAgent, strict, loose]) {
         const durability = memory();
-        const support = createTaggedAgent({ durability, name: "support", tag: "acme" });
-        assert.throws(() => createTaggedAgent({ durability, name: "support", tag: "evil" }), (error) => error?.code === "FX_AGENT_NAME_IN_USE", `NODE_ENV=${JSON.stringify(value)}`);
+        const support = create({ durability, name: "support", tag: "acme" });
+        assert.throws(() => create({ durability, name: "support", tag: "evil" }), (error) => error?.code === "FX_AGENT_NAME_IN_USE");
         await support.close();
-      });
+      }
+    } finally {
+      if (saved === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = saved;
     }
   });
 
   test("in development, an agent with other options replaces the one its name had: that one's running turn ends there, and later turns run on the new one", async () => {
-    await withNodeEnv("development", async () => {
-      const durability = memory();
-      const internals = Symbol.for("libfx.durableInternals");
-      const old = createTaggedAgent({ durability, name: "support", tag: "old" });
-      const session = old.session();
-      const held = holdStep("first-1");
-      const running = session.prompt("first");
-      const events = [];
-      let fresh;
-      try {
-        await held.holding;
-        fresh = createTaggedAgent({ durability, name: "support", tag: "new", onEvent: (event) => events.push(event) });
-      } finally {
-        held.release();
-      }
-      assert.deepEqual(events.filter((event) => event.type === "agent.replaced").map(({ agent, replaced }) => ({ agent, replaced })), [{ agent: "support", replaced: 1 }]);
-      assert.equal((await textOf(running)).text, "first-0 first-1 first-2");
-      assert.deepEqual(openersOf(session.id), ["old"], "the turn the old agent was running ended there");
-      while (old[internals].liveWorkers() > 0) await sleep(5);
-      // A module loaded before still prompts through the old agent; its
-      // turn runs on the new one, as one sent through the new agent does.
-      assert.equal((await textOf(old.session(session.id).prompt("second"))).text, "second-0 second-1 second-2");
-      assert.equal((await textOf(fresh.session(session.id).prompt("third"))).text, "third-0 third-1 third-2");
-      assert.deepEqual(openersOf(session.id), ["old", "new"]);
-      // A third configuration replaces the new one too, and the old agent's
-      // deliveries follow the name to it.
-      const third = createTaggedAgent({ durability, name: "support", tag: "third" });
-      while (fresh[internals].liveWorkers() > 0) await sleep(5);
-      assert.equal((await textOf(old.session(session.id).prompt("fourth"))).text, "fourth-0 fourth-1 fourth-2");
-      assert.deepEqual(openersOf(session.id), ["old", "new", "third"]);
-      for (const agent of [old, fresh, third]) await agent.close();
-    });
+    const durability = memory();
+    const internals = Symbol.for("libfx.durableInternals");
+    const old = createDevTaggedAgent({ durability, name: "support", tag: "old" });
+    const session = old.session();
+    const held = holdStep("first-1");
+    const running = session.prompt("first");
+    const events = [];
+    let fresh;
+    try {
+      await held.holding;
+      fresh = createDevTaggedAgent({ durability, name: "support", tag: "new", onEvent: (event) => events.push(event) });
+    } finally {
+      held.release();
+    }
+    assert.deepEqual(events.filter((event) => event.type === "agent.replaced").map(({ agent, replaced }) => ({ agent, replaced })), [{ agent: "support", replaced: 1 }]);
+    assert.equal((await textOf(running)).text, "first-0 first-1 first-2");
+    assert.deepEqual(openersOf(session.id), ["old"], "the turn the old agent was running ended there");
+    while (old[internals].liveWorkers() > 0) await sleep(5);
+    // A module loaded before still prompts through the old agent; its
+    // turn runs on the new one, as one sent through the new agent does.
+    assert.equal((await textOf(old.session(session.id).prompt("second"))).text, "second-0 second-1 second-2");
+    assert.equal((await textOf(fresh.session(session.id).prompt("third"))).text, "third-0 third-1 third-2");
+    assert.deepEqual(openersOf(session.id), ["old", "new"]);
+    // A third configuration replaces the new one too, and the old agent's
+    // deliveries follow the name to it.
+    const third = createDevTaggedAgent({ durability, name: "support", tag: "third" });
+    while (fresh[internals].liveWorkers() > 0) await sleep(5);
+    assert.equal((await textOf(old.session(session.id).prompt("fourth"))).text, "fourth-0 fourth-1 fourth-2");
+    assert.deepEqual(openersOf(session.id), ["old", "new", "third"]);
+    for (const agent of [old, fresh, third]) await agent.close();
   });
 
   test("in development, an agent created without a name replaces an earlier one with other options, on the shared default store", async () => {
-    await withNodeEnv("development", async () => {
-      const shared = memory();
-      const tagged = createDurableAgentFactory({ harness: ({ tag }) => scriptedHarness()(), defaultDurability: async () => shared, defaultShared: true, name: "createDefaultAgent" });
-      const first = tagged({ tag: "key-a" });
-      await first.newSessionId();
-      const events = [];
-      const second = tagged({ tag: "key-b", onEvent: (event) => events.push(event) });
-      assert.equal(events.filter((event) => event.type === "agent.replaced").length, 1);
-      // The earlier agent, now replaced, opens nothing under the name again.
-      const turn = first.session().prompt("hello");
-      assert.equal((await textOf(turn)).text, "hello-0 hello-1 hello-2");
-      for (const agent of [first, second]) await agent.close();
-    });
+    const shared = memory();
+    const tagged = createDurableAgentFactory({ harness: ({ tag }) => scriptedHarness()(), defaultDurability: async () => shared, defaultShared: true, development: () => true, name: "createDefaultAgent" });
+    const first = tagged({ tag: "key-a" });
+    await first.newSessionId();
+    const events = [];
+    const second = tagged({ tag: "key-b", onEvent: (event) => events.push(event) });
+    assert.equal(events.filter((event) => event.type === "agent.replaced").length, 1);
+    // The earlier agent, now replaced, opens nothing under the name again.
+    const turn = first.session().prompt("hello");
+    assert.equal((await textOf(turn)).text, "hello-0 hello-1 hello-2");
+    for (const agent of [first, second]) await agent.close();
+  });
+
+  // Decision D1: a chain of replacements ends at the newest agent. An agent
+  // created without a durability learns its store only when first used, so
+  // a newer agent on that store, created after it, may be registered first
+  // (`tests/tla/sdk/TenantIsolation.tla` Resolve, ReplacedByNewer).
+  test("in development, an older agent that learns its store after a newer one took it gives way to the newer one", async () => {
+    const shared = memory();
+    const tagged = createDurableAgentFactory({ harness: taggedHarness, defaultDurability: async () => shared, defaultShared: true, development: () => true, name: "createDefaultAgent" });
+    const replaced = [];
+    const watch = (label) => (event) => { if (event.type === "agent.replaced") replaced.push([label, event.replaced]); };
+    // A module loaded before an edit, whose agent takes the default store.
+    const older = tagged({ name: "support", tag: "older", onEvent: watch("older") });
+    // The module after the edit names the store.
+    const newer = tagged({ name: "support", tag: "newer", durability: shared, onEvent: watch("newer") });
+    assert.deepEqual(replaced, [], "neither knows yet that the other is on its store");
+    // A route that loaded the module before uses its agent now.
+    const session = older.session();
+    assert.equal((await textOf(session.prompt("first"))).text, "first-0 first-1 first-2");
+    assert.deepEqual(replaced, [["newer", 1]], "the newer agent replaced the older one");
+    assert.deepEqual(openersOf(session.id), ["newer"], "the turn sent through the older agent ran on the newer one");
+    assert.equal((await textOf(newer.session(session.id).prompt("second"))).text, "second-0 second-1 second-2");
+    assert.deepEqual(openersOf(session.id), ["newer"]);
+    for (const agent of [older, newer]) await agent.close();
   });
 
   test("a session stores its context as it was when the session opened", async () => {
@@ -1903,21 +1978,19 @@ if (durabilityKind === "local") {
   // loaded the module before still prompts through the old agent, whose
   // World's queue delivers to it.
   test("in development, an agent on a new local() over the same directory replaces the old one, and prompts sent through the old one run on it", async () => {
-    await withNodeEnv("development", async () => {
-      const dir = await mkdtemp(join(tmpdir(), "libfx-core-reload-"));
-      dirs.push(dir);
-      const internals = Symbol.for("libfx.durableInternals");
-      const old = createTaggedAgent({ durability: local({ dir }), name: "support", tag: "old-module" });
-      const first = old.session();
-      assert.equal((await textOf(first.prompt("alpha"))).text, "alpha-0 alpha-1 alpha-2");
-      const fresh = createTaggedAgent({ durability: local({ dir }), name: "support", tag: "new-module" });
-      while (old[internals].liveWorkers() > 0) await sleep(5);
-      assert.equal((await textOf(old.session(first.id).prompt("beta"))).text, "beta-0 beta-1 beta-2");
-      assert.equal((await textOf(fresh.session(first.id).prompt("gamma"))).text, "gamma-0 gamma-1 gamma-2");
-      assert.deepEqual(openersOf(first.id), ["old-module", "new-module"]);
-      await old.close();
-      await fresh.close();
-    });
+    const dir = await mkdtemp(join(tmpdir(), "libfx-core-reload-"));
+    dirs.push(dir);
+    const internals = Symbol.for("libfx.durableInternals");
+    const old = createDevTaggedAgent({ durability: local({ dir }), name: "support", tag: "old-module" });
+    const first = old.session();
+    assert.equal((await textOf(first.prompt("alpha"))).text, "alpha-0 alpha-1 alpha-2");
+    const fresh = createDevTaggedAgent({ durability: local({ dir }), name: "support", tag: "new-module" });
+    while (old[internals].liveWorkers() > 0) await sleep(5);
+    assert.equal((await textOf(old.session(first.id).prompt("beta"))).text, "beta-0 beta-1 beta-2");
+    assert.equal((await textOf(fresh.session(first.id).prompt("gamma"))).text, "gamma-0 gamma-1 gamma-2");
+    assert.deepEqual(openersOf(first.id), ["old-module", "new-module"]);
+    await old.close();
+    await fresh.close();
   });
 }
 

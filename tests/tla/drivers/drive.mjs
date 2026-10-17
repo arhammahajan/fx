@@ -6,8 +6,13 @@
 // walk can crash a worker between the record that ends its turn and that
 // line, and check that another worker writes the end it left missing.
 //
-//   bun tests/tla/drivers/drive.mjs [send|lookup|write|cutoff|leased|queue] [--walks N] [--seed S] [--backend native|wasm]
+//   bun tests/tla/drivers/drive.mjs [send|lookup|write|cutoff|leased|queue|refuse] [--walks N] [--seed S] [--backend native|wasm]
 //     [--durability local|world|vercel] [--hooks]
+//
+// The refuse graph is the send graph with Refused: the prompt is one fx
+// refuses, a text block with no text, so its turn ends before any record,
+// through an `ended` entry, and its turn_end line waits for EndLine like
+// any other.
 //
 // The lookup and cutoff graphs run a lookup, which starts before its intent
 // is stored: the driver holds that intent's record, so the call runs while
@@ -62,8 +67,11 @@ const option = (name, fallback) => {
   const index = args.indexOf(`--${name}`);
   return index >= 0 ? args[index + 1] : fallback;
 };
-const graphName = args.find((arg) => ["send", "lookup", "write", "cutoff", "leased", "queue"].includes(arg)) ?? "send";
-const tool = graphName === "cutoff" ? "lookup" : graphName === "leased" || graphName === "queue" ? "send" : graphName;
+const graphName = args.find((arg) => ["send", "lookup", "write", "cutoff", "leased", "queue", "refuse"].includes(arg)) ?? "send";
+const tool = graphName === "cutoff" ? "lookup" : ["leased", "queue", "refuse"].includes(graphName) ? "send" : graphName;
+// The walk's prompt: one that asks for the tool, or on the refuse graph one
+// the harness refuses before its engine stores anything.
+const promptInput = graphName === "refuse" ? [{ type: "text" }] : `use ${tool}`;
 // The tool as the host declares it, and whether its calls run ahead.
 const toolFlags = { lookup: { idempotent: true }, write: { idempotent: true, writes: true }, send: { idempotent: false } }[tool];
 const runsAhead = tool === "lookup";
@@ -309,7 +317,7 @@ async function harness() {
       const head = sessionId ? await leaseHolder(w) : null;
       const handedOn = Workers.find((v) => v !== w && lapsed[v] && holders[v].includes(head));
       if (!sessionId) {
-        sessionId = await call(w, "prompt", { text: `use ${tool}`, messageId: "turn-1" });
+        sessionId = await call(w, "prompt", { text: promptInput, messageId: "turn-1" });
       } else if (handedOn) {
         // The queue hands the frozen holder's message to w.
         await call(w, "adopt", { message: lapsed[handedOn] });

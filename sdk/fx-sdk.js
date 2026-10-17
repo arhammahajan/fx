@@ -46,10 +46,11 @@ const maxPromptImagesBytes = (maxPromptImagesDataBytes / 4) * 3;
 // Matches the native attachment table: one prompt's images or one checkpoint.
 const maxPendingAttachments = 8;
 const maxOutboundAttachments = 4;
-// Matches the core's kernel checkpoint limit (max_checkpoint_bytes).
-const maxCheckpointBytes = 4 * 1024 * 1024;
+// Matches the core's kernel checkpoint limit (max_checkpoint_bytes), which
+// holds a session's history with its images.
+const maxCheckpointBytes = 32 * 1024 * 1024;
 // Matches the core's journal load limit (journal.max_load_bytes).
-const maxJournalBytes = 4 * 1024 * 1024;
+const maxJournalBytes = 32 * 1024 * 1024;
 // The core's ACP reader drops frames over 8 MiB without a request id to answer
 // (jsonrpc frame_resource_byte_limit), so the SDK must never emit one. Prompt
 // images travel beside the frame, so only text, resources and metadata count.
@@ -248,6 +249,11 @@ export const journalMarksWanted = Symbol.for("libfx.journalMarks");
 // The Gateway catalog an agent fetched, a Map shared by every engine the
 // agent opens, so the agent fetches it once for all its sessions (API-15).
 export const catalogMemory = Symbol.for("libfx.catalogMemory");
+// What a session worker that stores its inputs itself gives its engine: a
+// function the core waits on before a turn ends, which hands the running turn
+// the inputs stored since the worker last read them. A steer sent while the
+// reply streamed then continues the turn (API-50).
+export const turnEndInputs = Symbol.for("libfx.turnEndInputs");
 // Marks an error the core answered a request with, as opposed to one from a
 // core that stopped answering.
 export const coreAnswered = Symbol.for("libfx.coreAnswered");
@@ -1235,6 +1241,13 @@ function createRuntime(options) {
     return Promise.resolve().then(() => options.journalFlush()).then(() => 0, () => -1);
   }
 
+  // Resolves once the session's worker has handed in the inputs it stored
+  // since it last read them; each steer is queued by then.
+  function takeInputs() {
+    if (typeof options.takeInputs !== "function") return 0;
+    return Promise.resolve().then(() => options.takeInputs()).then(() => 0, () => -1);
+  }
+
   let pendingHostToolResult = null;
   function hostToolCall(namePtr, nameLen, argumentsPtr, argumentsLen, outputPtr, outputCap, statusPtr, callIdPtr, callIdLen) {
     pendingHostToolResult = null;
@@ -1655,6 +1668,7 @@ function createRuntime(options) {
     fx_http_request: new WebAssembly.Suspending(httpRequest),
     fx_host_tool_call: new WebAssembly.Suspending(hostToolCall),
     fx_journal_flush: new WebAssembly.Suspending(journalFlush),
+    fx_take_inputs: new WebAssembly.Suspending(takeInputs),
     fx_host_tool_result_read(offset, ptr, cap) {
       if (!pendingHostToolResult || offset < 0 || offset > pendingHostToolResult.length) return -1;
       const chunk = pendingHostToolResult.subarray(offset, offset + cap);
@@ -2214,18 +2228,23 @@ function modelCatalogBody(value) {
   return body;
 }
 
-// Answers a catalog request from `memory`, which maps a request to the body
-// the agent's first such request got. Only a successful response is kept: a
-// request that waited on one that failed fetches for itself.
-async function rememberedCatalog(memory, key, fetchCatalog) {
-  const remembered = memory.get(key);
+// Answers a catalog request from `memory`, which maps a catalog URL to the
+// body the agent's first request for it got. Every request of one agent
+// carries that agent's credentials, so one entry per URL is enough (API-15),
+// and a token that changes on each request, such as a Vercel OIDC token,
+// adds none. Only a successful response is kept: a request that waited on
+// one that failed fetches for itself. A request that waits on another
+// engine's fetch still stops when its own `signal` aborts (API-60).
+async function rememberedCatalog(memory, url, signal, fetchCatalog) {
+  if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+  const remembered = memory.get(url);
   if (remembered) {
-    const body = await remembered;
+    const body = await untilAborted(remembered, signal);
     if (body === null) return fetchCatalog();
     return new Response(body, { status: 200, headers: { "content-type": "application/json" } });
   }
   let settle;
-  memory.set(key, new Promise((resolve) => { settle = resolve; }));
+  memory.set(url, new Promise((resolve) => { settle = resolve; }));
   let body = null;
   try {
     const response = await fetchCatalog();
@@ -2233,9 +2252,20 @@ async function rememberedCatalog(memory, key, fetchCatalog) {
     body = await readBoundedResponseText(response, maxModelCatalogBytes);
     return new Response(body, { status: response.status, headers: response.headers });
   } finally {
-    if (body === null) memory.delete(key);
+    if (body === null) memory.delete(url);
     settle(body);
   }
+}
+
+// `promise`, or an AbortError as soon as `signal` aborts.
+function untilAborted(promise, signal) {
+  if (!signal) return promise;
+  let onAbort;
+  const aborted = new Promise((_, reject) => {
+    onAbort = () => reject(new DOMException("Aborted", "AbortError"));
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  return Promise.race([promise, aborted]).finally(() => signal.removeEventListener("abort", onAbort));
 }
 
 export function normalizeInstructions(value) {
@@ -2632,10 +2662,9 @@ export async function createFxEngine(options = {}) {
     if (options.modelCatalogBody && catalogRequest) {
       return new Response(options.modelCatalogBody, { status: 200, headers: { "content-type": "application/json" } });
     }
-    // So does one this engine's agent already fetched for the same request.
+    // So does one this engine's agent already fetched from the same URL.
     if (catalogRequest && options[catalogMemory]) {
-      const key = [String(input?.url ?? input), ...new Headers(init.headers ?? input?.headers)].join("\n");
-      return rememberedCatalog(options[catalogMemory], key, () => networkFetch(input, init, method, endpoint));
+      return rememberedCatalog(options[catalogMemory], String(input?.url ?? input), init.signal ?? input?.signal, () => networkFetch(input, init, method, endpoint));
     }
     return networkFetch(input, init, method, endpoint);
   };
@@ -2753,6 +2782,7 @@ export async function createFxEngine(options = {}) {
     env: agentEnvironment(options),
     hostToolExecutor: executeHostTool,
     journalFlush: () => journalSettled(),
+    takeInputs: () => options[turnEndInputs]?.(),
     onTransportChunk(byteLength) {
       const turn = activeTurn;
       if (!isCurrentTurn(turn) || !Number.isSafeInteger(byteLength) || byteLength <= 0) return;
@@ -2886,6 +2916,18 @@ export async function createFxEngine(options = {}) {
       if (closing) return;
       send(failure
         ? { jsonrpc: "2.0", id: message.id, error: { code: -32000, message: failure.message } }
+        : { jsonrpc: "2.0", id: message.id, result: {} });
+      return;
+    }
+    if (message.method === "libfx/take_inputs") {
+      // Before a turn ends, the session's worker hands in the inputs it
+      // stored since it last read them. Each steer is written to the core as
+      // it is found, so the core has it before this answer.
+      let failure = null;
+      try { await options[turnEndInputs]?.(); } catch (error) { failure = error; }
+      if (closing) return;
+      send(failure
+        ? { jsonrpc: "2.0", id: message.id, error: { code: -32000, message: String(failure?.message ?? failure) } }
         : { jsonrpc: "2.0", id: message.id, result: {} });
       return;
     }

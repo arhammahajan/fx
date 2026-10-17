@@ -55,7 +55,7 @@ agent.session(sessionId).prompt("Start with the schema.");
 
 - **One turn at a time.** A prompt sent while a turn runs waits behind it, even when it reaches a different server.
 - **Turns finish on their own.** A turn runs to the end whether or not anyone reads its events, and a turn nobody reads holds no connection open: its view starts reading only once you use its events, `readable` or `result`. Stop it with `session.cancel()`, or with the `signal` you passed to `prompt()`.
-- **Steering.** `session.steer(input)` steers the running turn the way the fx CLI does. While the model streams a reply, the steer cuts it short and the turn continues with it. While a tool runs, the steer waits for the tool. A steer sent while a turn waits to start joins that turn, and when no turn runs or waits, the steer becomes the next turn. A steer with images can't join a turn, so the running turn ends `cancelled` at its next safe point and the steer runs next.
+- **Steering.** `session.steer(input)` steers the running turn the way the fx CLI does. While the model streams a reply, the steer cuts it short and the turn continues with it. A steer sent from another server can reach the turn only as the reply ends, and the turn then continues with it after the reply. While a tool runs, the steer waits for the tool. A steer sent while a turn waits to start joins that turn, and when no turn runs or waits, the steer becomes the next turn. A steer with images can't join a turn, so the running turn ends `cancelled` at its next safe point and the steer runs next.
 - **Retries are safe.** Give a prompt or a steer a `messageId`, and a repeated request with the same id runs nothing new. A repeated prompt follows the original turn, and its result has `repeated: true`. One id names one input, so a steer that reuses a prompt's id is rejected with `FX_MESSAGE_ID_IN_USE`. A steer's `user_message` event carries its id as `id` where it joined a turn.
 - **Inputs have a size limit.** A prompt or steer is rejected with `FX_INPUT_TOO_LARGE` before anything is stored when its text and other content, image data aside, take more than the engine's 8 MiB prompt frame, or when the input with its images and the session's `context` and settings comes to more than 16 MiB of JSON. The engine can't take a larger one. Images have their own limits, which apply after `resizeImage`.
 
@@ -144,7 +144,7 @@ export const coding = createFxAgent({ name: "coding", model: "anthropic/claude-o
 
 A session belongs to the agent that created it, and its turns run only on an agent with that name. A prompt sent through another agent, such as `coding.session(supportSessionId).prompt()`, still runs on `support`, and the sending agent's `onEvent` gets a `session.forwarded` event. An agent created without a name is named `default`.
 
-- Agents with the same name are copies of one agent, such as one on each server, and take turns running its sessions. In one process, every agent with a name on a store must have the same configuration: creating one with different options throws `FX_AGENT_NAME_IN_USE`. Agents created without a name or a durability share the name `default` and the default store, so an app with two such agents, or one that serves several customers, gives each agent its own name. Create an agent once, at module scope, or close it when you're done with it. Under `NODE_ENV=development`, where a dev server such as `next dev` loads a module again, a new agent with different options replaces the earlier one instead of throwing: turns the earlier agent is running finish, later turns run on the new one, and the new agent's `onEvent` gets an `agent.replaced` event.
+- Agents with the same name are copies of one agent, such as one on each server, and take turns running its sessions. In one process, every agent with a name on a store must have the same configuration: creating one with different options throws `FX_AGENT_NAME_IN_USE`. Agents created without a name or a durability share the name `default` and the default store, so an app with two such agents, or one that serves several customers, gives each agent its own name. Create an agent once, at module scope, or close it when you're done with it. In Node under `NODE_ENV=development`, where a dev server such as `next dev` loads a module again, a new agent with different options replaces the earlier one instead of throwing: turns the earlier agent is running finish, later turns run on the new one, and the new agent's `onEvent` gets an `agent.replaced` event. The newest agent wins even when an earlier one, created without a durability, learns its store only later. In a browser, creating one always throws.
 - Keep names stable. A session keeps the name it was created with, so renaming an agent leaves its sessions with no agent to run them.
 - A process that gets a turn for a name it has no agent for refuses it with an `FX_NO_AGENT` error naming the agent, and the queue delivers it again.
 - Agents share sessions through their durability. Give agents that share sessions the same durability, or none: agents created without one share the default.
@@ -468,7 +468,7 @@ for await (const event of turn) {
   if (event.type === "text_delta") process.stdout.write(event.delta);
 }
 
-const checkpoint = await engine.checkpoint(); // opaque bytes, up to 4 MiB
+const checkpoint = await engine.checkpoint(); // opaque bytes, up to 32 MiB
 await engine.close();
 
 const restored = await createFxEngine({ apiKey: process.env.AI_GATEWAY_API_KEY, model: "anthropic/claude-haiku-5.5", checkpoint });
@@ -506,7 +506,7 @@ The engine sends one `append()` at a time, and everything that happens while one
 
 `prompt()` and `resume()` take `yieldAt`, a time in milliseconds since the epoch: the turn stops before its next model request after that time, with the stop reason `yielded`, and the next `resume()` continues it without telling the model it was interrupted.
 
-A journal or `checkpoint` from a newer libfx fails with `FxJournalVersionError`. `createMemoryPersistence()` is a reference store for tests.
+A journal or `checkpoint` from a newer libfx fails with `FxJournalVersionError`. The conversation keeps its prompts' images, so a load may read a checkpoint of up to 32 MiB and up to 32 MiB of records after it; more fails with `FX_JOURNAL_TOO_LARGE`. `createMemoryPersistence()` is a reference store for tests.
 
 ## Runtimes
 

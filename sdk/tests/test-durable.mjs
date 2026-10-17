@@ -11,7 +11,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createFxAgent, createFxEngine, memory } from "../node.js";
-import { createFxEngine as createWasmEngine, maxPromptFrameBytes, promptFrameBytes } from "../fx-sdk.js";
+import { catalogMemory, createFxEngine as createWasmEngine, maxPromptFrameBytes, promptFrameBytes } from "../fx-sdk.js";
 import { foldSessionLog } from "../durable.js";
 import { holdWrites } from "./hold-writes.mjs";
 import { testHooks } from "./hooks-fixture.mjs";
@@ -61,6 +61,9 @@ const crashSteer = (kind) => (kind === "image"
   ? [{ type: "text", text: "use lookup with this" }, { type: "image", data: onePixelPng, mimeType: "image/png" }]
   : "use lookup");
 const resumeNotice = "Resuming from unexpected session interruption.";
+// The steer an `unplaced` crash child's turn accepts and never places, and
+// that turn's id.
+const unplacedSteer = { id: "unplaced-steer", turn: "unplaced-turn", text: "and the second key" };
 
 const textOf = (message) => typeof message.content === "string"
   ? message.content
@@ -77,9 +80,9 @@ const answer = (text) => [{ type: "text-delta", id: "answer", delta: text }, fin
 // notice: "use <tool>" calls the tool once, then answers with its result;
 // "loop" calls lookup three times; "stall" never answers; "slow reply"
 // streams its answer a word at a time for a few seconds; "stalled reply"
-// sends one word and goes quiet for `stallMs`; "slow tool call" writes a
-// lookup call's input a little at a time for a few seconds; anything else is
-// echoed.
+// sends one word and goes quiet for `stallMs`; "held reply" sends one word
+// and ends when the test ends it; "slow tool call" writes a lookup call's
+// input a little at a time for a few seconds; anything else is echoed.
 function framesFor(prompt) {
   const users = userTexts(prompt).filter((text) => text !== resumeNotice);
   const text = users.at(-1) ?? "";
@@ -95,6 +98,7 @@ function framesFor(prompt) {
   if (text.startsWith("long ")) return answer(`long: ${text.length}`);
   if (text === "slow reply") return slowReply;
   if (text === "stalled reply") return stalledReply;
+  if (text === "held reply") return heldReply;
   if (text === "slow tool call") return slowToolCall;
   if (text === "loop") {
     if (turnResults.length < 3) return toolCall(`call-${users.length}-${turnResults.length}`, "lookup", { key: `k${turnResults.length}` });
@@ -109,6 +113,9 @@ const slowReply = Symbol("slow reply");
 const slowFrames = 75;
 const slow = [];
 const stalledReply = Symbol("stalled reply");
+// Each held reply's `end()`, which finishes it with text and no tool call.
+const heldReply = Symbol("held reply");
+const heldReplies = [];
 const slowToolCall = Symbol("slow tool call");
 const slowTools = [];
 const stallMs = 4000;
@@ -116,8 +123,10 @@ const stallMs = 4000;
 const requests = [];
 // Each chat request's model and prompt, for the tests of a session's settings.
 const chats = [];
-// Model catalog requests, for the tests of when an agent fetches the catalog.
+// Model catalog requests, for the tests of when an agent fetches the catalog,
+// and the credential each one carried.
 let catalogRequests = 0;
+const catalogAuthorizations = [];
 const server = createServer((request, response) => {
   let body = "";
   request.setEncoding("utf8");
@@ -125,6 +134,7 @@ const server = createServer((request, response) => {
   request.on("end", () => {
     if (request.method === "GET") {
       catalogRequests += 1;
+      catalogAuthorizations.push(request.headers.authorization ?? null);
       response.writeHead(200, { "content-type": "application/json" });
       // It takes images, for the steers that carry one.
       response.end(JSON.stringify({ object: "list", data: [{ id: "durable/model", type: "language", tags: ["vision", "file-input"] }] }));
@@ -140,6 +150,12 @@ const server = createServer((request, response) => {
       response.write(`data: ${JSON.stringify({ type: "text-delta", id: "answer", delta: "first " })}\n\n`);
       const timer = setTimeout(() => response.end(`data: ${JSON.stringify(finish("stop"))}\n\ndata: [DONE]\n\n`), stallMs);
       response.on("close", () => clearTimeout(timer));
+      return;
+    }
+    if (frames === heldReply) {
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.write(`data: ${JSON.stringify({ type: "text-delta", id: "answer", delta: "first " })}\n\n`);
+      heldReplies.push({ end: () => response.end(`data: ${JSON.stringify(finish("stop"))}\n\ndata: [DONE]\n\n`) });
       return;
     }
     if (frames === slowToolCall) {
@@ -346,6 +362,37 @@ const probeLogs = (durability) => {
   }, probe];
 };
 
+// A World durability whose session streams never get the user_message line
+// of input `id`, as when its worker died before that write landed.
+const losingUserMessage = (durability, id) => {
+  const lost = (chunk) => {
+    try {
+      const line = JSON.parse(typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk));
+      return line.type === "user_message" && line.id === id;
+    } catch {
+      return false;
+    }
+  };
+  const bound = (target, key) => {
+    const value = Reflect.get(target, key);
+    return typeof value === "function" ? value.bind(target) : value;
+  };
+  return {
+    ...durability,
+    async world() {
+      const world = await durability.world();
+      const streams = new Proxy(world.streams, {
+        get(target, key) {
+          if (key === "write") return async (runId, name, chunk) => (lost(chunk) ? undefined : target.write(runId, name, chunk));
+          if (key === "writeMulti") return async (runId, name, chunks) => target.writeMulti(runId, name, chunks.filter((chunk) => !lost(chunk)));
+          return bound(target, key);
+        },
+      });
+      return new Proxy(world, { get: (target, key) => (key === "streams" ? streams : bound(target, key)) });
+    },
+  };
+};
+
 // A World durability whose session streams answer "not found" until their
 // first write, as Vercel's World does; `firstWrite` says when that was.
 const streamsAppearOnWrite = (durability) => {
@@ -474,6 +521,40 @@ if (childMode && process.argv[6] === "steer") {
   await gates.get("lookup").started;
   await agent[Symbol.for("libfx.durableInternals")].settled(session.id);
   console.log(JSON.stringify({ sessionId: session.id, executionId: runs.find(([name]) => name === "lookup")?.[1] }));
+  await new Promise(() => {});
+}
+// With `unplaced`, the worker dies before the record that places a steer
+// its turn took has landed. Its turn's lookup waits until the steer is
+// stored, after its intent is. The native engine takes a steer while a
+// tool runs and stores that at once, so there the child waits for the log
+// to show the steer accepted and not placed. Then it dies, before the
+// steer's user_message line; or, with `shown`, it lets the lookup end, and
+// dies once the line the turn writes as its next model request carries the
+// steer has landed, the record placing the steer never landing. The web
+// core takes a steer only at that point, and stores its acceptance with the
+// record that places it.
+if (childMode && process.argv[6] === "unplaced") {
+  const [dir, , show] = process.argv.slice(5);
+  const internals = Symbol.for("libfx.durableInternals");
+  const placing = (entry) => entry.k === "record" && (entry.marks ?? []).some((mark) => mark.placed === unplacedSteer.id);
+  const stored = await durabilityAt(dir);
+  const [durability] = holdWrites(show === "shown" ? stored : losingUserMessage(stored, unplacedSteer.id), placing);
+  const agent = createFxAgent(agentOptions(durability));
+  const lookupGate = gate("lookup");
+  const session = agent.session();
+  void session.prompt("use lookup", { messageId: unplacedSteer.turn }).result.catch(() => {});
+  await lookupGate.started;
+  await agent[internals].settled(session.id);
+  await session.steer(unplacedSteer.text, { messageId: unplacedSteer.id });
+  if (engineBackend === "native") {
+    const log = await agent[internals].openLog(session.id);
+    await until(async () => foldSessionLog(await log.read()).heldIds.includes(unplacedSteer.id), "the turn to accept the steer", 20_000);
+  }
+  if (show === "shown") {
+    lookupGate.open();
+    await until(async () => (await readLines(session.stream(0), 64, 200)).some((line) => line.type === "user_message" && line.id === unplacedSteer.id), "the steer's user_message line", 20_000);
+  }
+  console.log(JSON.stringify({ sessionId: session.id }));
   await new Promise(() => {});
 }
 if (childMode) {
@@ -1055,6 +1136,46 @@ test("a steer stored while a tool runs is in the request right after the tool's 
   assert.ok(!lines.some((line) => line.type === "turn_start" && line.messageId === "pear-steer"), "the steer never waited to run as a turn of its own");
   if (steerer !== agent) await steerer.close();
   await agent.close();
+});
+
+// API-50: input sent during a running turn steers that turn. A steer
+// another server stores while the last reply streams reaches the worker only
+// when it reads the log, which no watch or poll makes it do before the reply
+// ends; the worker reads it before the turn ends, and the turn goes on with
+// it (`tests/tla/sdk/DurableSteer.tla` ReadAtEnd, NoParkedSteer).
+test("a steer stored while the last reply streams continues the turn, from any server", async () => {
+  let agent;
+  let steerer;
+  if (durabilityKind === "memory") {
+    agent = steerer = createFxAgent(agentOptions(unwatched(memory())));
+  } else {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-durable-"));
+    dirs.push(dir);
+    agent = createFxAgent(agentOptions({ ...(await durabilityAt(dir)), pollMs: 3_600_000 }));
+    steerer = createFxAgent(agentOptions(await durabilityAt(dir)));
+  }
+  try {
+    const held = heldReplies.length;
+    const turn = agent.session().prompt("held reply");
+    const { sessionId, messageId } = await turn.accepted;
+    await until(() => heldReplies.length > held, "the reply starts");
+    await steerer.session(sessionId).steer("also say pear", { messageId: "pear-at-end" });
+    const before = requests.length;
+    // The reply ends with text and no tool call, the steer stored and unread.
+    heldReplies[held].end();
+    const { result } = await collect(turn);
+    assert.equal(result.stopReason, "end_turn");
+    // The same turn's next request, after the reply, carries the steer.
+    const next = requests[before] ? userTexts(requests[before]) : [];
+    assert.ok(next.some((text) => text.startsWith("<user_steering>") && text.includes("also say pear")), `API-50: the request after the reply carries the steer: ${JSON.stringify(next)}`);
+    assert.ok(JSON.stringify(requests[before]).includes("first"), "the reply stays in the turn");
+    const lines = await readLines(agent.session(sessionId).stream(0), 64);
+    assert.deepEqual(lines.filter((line) => line.type === "turn_start").map((line) => line.messageId), [messageId], "the steer never ran as a turn of its own");
+    assert.deepEqual(lines.filter((line) => line.type === "user_message").map((line) => [line.id, line.messageId]), [["pear-at-end", messageId]], "API-54: the steer shows in the turn as a user message");
+  } finally {
+    if (steerer !== agent) await steerer.close();
+    await agent.close();
+  }
 });
 
 // The session's lines from the start until `done` holds for one of them.
@@ -1659,6 +1780,75 @@ if (durabilityKind !== "memory") {
       });
     }
   }
+
+  // Runs a crash child with `args` until it prints its session, then kills
+  // it, and returns that session's id.
+  const crashChild = async (dir, args, what) => {
+    const child = spawn(process.execPath, [...process.execArgv, fileURLToPath(import.meta.url), durabilityKind, engineBackend, "--child", dir, ...args], {
+      stdio: ["ignore", "pipe", "inherit"], env: { ...process.env },
+    });
+    const exited = new Promise((resolveExit) => child.once("exit", resolveExit));
+    let output = "";
+    child.stdout.on("data", (chunk) => { output += chunk; });
+    try {
+      await until(() => output.includes("\n"), what, testTimeoutMs / 3);
+    } finally {
+      child.kill("SIGKILL");
+      await exited;
+    }
+    return JSON.parse(output.trim().split("\n")[0]).sessionId;
+  };
+  const unplacedIn = async (agent, sessionId) => foldSessionLog(await (await agent[Symbol.for("libfx.durableInternals")].openLog(sessionId)).read()).heldIds.includes(unplacedSteer.id);
+  const steerLines = (lines) => lines.filter((line) => line.type === "user_message" && line.id === unplacedSteer.id);
+  const resumedTurnLines = (session) => linesUntil(session, (line) => line.type === "turn_end" && line.messageId === unplacedSteer.turn, "the resumed turn's end");
+
+  // DUR-23, DUR-38: a steer the turn accepted is the model's from then on,
+  // and its viewers hear of it where the turn places it. A crash before its
+  // user_message line and the record that places it leaves it to the turn
+  // that resumes, which shows it as it places it (src/acp/prompt.zig, the
+  // resume in handlePrompt). Only the native engine stores a steer accepted
+  // and not placed: the web core stores the two together.
+  if (engineBackend === "native") {
+    test("a steer a crashed turn accepted and never showed shows once when the turn resumes, and reaches the model", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "libfx-durable-unplaced-"));
+      dirs.push(dir);
+      const sessionId = await crashChild(dir, ["unplaced", "unshown"], "the child's turn to accept the steer");
+      const agent = createFxAgent(agentOptions(await durabilityAt(dir)));
+      const session = agent.session(sessionId);
+      assert.ok(await unplacedIn(agent, sessionId), "the crashed turn accepted the steer and never placed it");
+      const resumed = session.resume();
+      const seen = [];
+      for await (const event of resumed) if (event.type === "user_message") seen.push(event.id);
+      assert.equal((await resumed.result).stopReason, "end_turn");
+      assert.deepEqual(seen, [unplacedSteer.id], "the resumed turn's viewer sees the steer once");
+      assert.equal(steerLines(await resumedTurnLines(session)).length, 1, "the stream shows the steer once");
+      assert.equal(userTexts(requests.at(-1)).filter((text) => text.includes(unplacedSteer.text)).length, 1, "the model has the steer once");
+      await agent.close();
+    });
+  }
+
+  // DUR-23, DUR-38: a steer's user_message line and the record that places
+  // it are two writes, so a worker can die after the line lands and before
+  // the record does. The turn that resumes then shows the steer again: the
+  // native engine, which still has it accepted and not placed, as it
+  // resumes, and the web core, which has nothing stored, as the steer joins
+  // the turn again. The stream shows it already, so viewers see it once.
+  test("a steer whose user_message line landed before a crash and whose placing record did not shows once when the turn resumes", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-durable-unplaced-"));
+    dirs.push(dir);
+    const sessionId = await crashChild(dir, ["unplaced", "shown"], "the child's turn to show the steer");
+    const agent = createFxAgent(agentOptions(await durabilityAt(dir)));
+    const session = agent.session(sessionId);
+    if (engineBackend === "native") assert.ok(await unplacedIn(agent, sessionId), "the crashed turn accepted the steer and never placed it");
+    assert.equal((await session.resume().result).stopReason, "end_turn");
+    const lines = await resumedTurnLines(session);
+    const shown = steerLines(lines);
+    assert.equal(shown.length, 1, `the stream shows the steer once: ${JSON.stringify(shown)}`);
+    const resumedAt = lines.find((line) => line.type === "turn_resume" && line.messageId === unplacedSteer.turn);
+    assert.ok(shown[0].epoch < resumedAt.epoch, "the line shown is the one the worker that died wrote");
+    assert.equal(userTexts(requests.at(-1)).filter((text) => text.includes(unplacedSteer.text)).length, 1, "the model has the steer once");
+    await agent.close();
+  });
 }
 
 if (durabilityKind === "local") {
@@ -1813,13 +2003,16 @@ const filesOf = (prompt) => prompt.filter((message) => message.role === "user" &
   .flatMap((message) => message.content).filter((part) => part.type === "file");
 
 // API-42: images that fill the 6 MiB budget travel beside the frame, so a
-// session prompt takes them with its text.
-test("a session prompt whose images fill the 6 MiB budget, with text, reaches the model", async () => {
+// session prompt takes them with its text. DUR-23: the session they leave in
+// history goes on taking prompts; the next one is sent at once, before the
+// first turn's checkpoint lands, so its worker reads every record.
+test("a session prompt whose images fill the 6 MiB budget, with text, reaches the model, and the session takes the next prompt", async () => {
   const agent = createFxAgent(agentOptions(await durabilityFor()));
   try {
     const data = pngOf(3 * 1024 * 1024);
     const sent = requests.length;
-    const { text, result } = await collect(agent.session().prompt([
+    const session = agent.session();
+    const { text, result } = await collect(session.prompt([
       { type: "text", text: "describe these" },
       { type: "image", data, mimeType: "image/png" },
       { type: "image", data, mimeType: "image/png" },
@@ -1828,8 +2021,53 @@ test("a session prompt whose images fill the 6 MiB budget, with text, reaches th
     assert.match(text, /^echo: describe these/);
     assert.equal(requests.length, sent + 1);
     assert.deepEqual(filesOf(requests.at(-1)).map((part) => part.data?.data?.length), [data.length, data.length]);
+    const next = await collect(session.prompt("and now?"));
+    assert.equal(next.result.stopReason, "end_turn", next.result.error?.message);
+    assert.match(next.text, /^echo: and now\?/);
+    // A worker may send its request before its claim lands and lose it, so
+    // the turn may have sent more than one; each carries the whole history.
+    const later = requests.slice(sent + 1);
+    assert.ok(later.length > 0);
+    for (const prompt of later) {
+      assert.deepEqual(userTexts(prompt).at(-1), "and now?");
+      assert.deepEqual(filesOf(prompt).map((part) => part.data?.data?.length), [data.length, data.length], "the history keeps the images");
+    }
   } finally {
     await agent.close();
+  }
+});
+
+// DUR-23 and API-42: prompts within the image limits, one after another,
+// leave a session that any agent on its store continues, from the records
+// or from the checkpoint the last turn saved, with every image in history.
+test("a session whose prompts fill the image budget turn after turn keeps taking prompts, on another agent too", async () => {
+  const durability = await durabilityFor();
+  const one = createFxAgent(agentOptions(durability));
+  const data = pngOf(3 * 1024 * 1024);
+  const images = [{ type: "image", data, mimeType: "image/png" }, { type: "image", data, mimeType: "image/png" }];
+  let id;
+  try {
+    const session = one.session();
+    for (const text of ["first look", "second look"]) {
+      const { result } = await collect(session.prompt([{ type: "text", text }, ...images]));
+      assert.equal(result.stopReason, "end_turn", `${text}: ${result.error?.message}`);
+    }
+    id = session.id;
+    const after = await collect(session.prompt("compare them"));
+    assert.equal(after.result.stopReason, "end_turn", after.result.error?.message);
+    assert.match(after.text, /^echo: compare them/);
+  } finally {
+    await one.close();
+  }
+  const two = createFxAgent(agentOptions(durability));
+  try {
+    const { text, result } = await collect(two.session(id).prompt("still there?"));
+    assert.equal(result.stopReason, "end_turn", result.error?.message);
+    assert.match(text, /^echo: still there\?/);
+    assert.deepEqual(userTexts(requests.at(-1)).slice(-1), ["still there?"]);
+    assert.equal(filesOf(requests.at(-1)).length, 4, "the history keeps every image");
+  } finally {
+    await two.close();
   }
 });
 
@@ -1895,6 +2133,38 @@ test("an option the backend rejects fails the first turn once", async () => {
   assert.equal(requests.length, sent, "no model request was made");
   await agent.close();
 });
+
+if (durabilityKind === "memory") {
+  // Decision D1: Node's createFxAgent tells the durable core it runs in a
+  // development server only where NODE_ENV is exactly "development"; every
+  // other process keeps SEC-2's refusal.
+  test("SEC-2: createFxAgent refuses another configuration under a name unless NODE_ENV is development", async () => {
+    const saved = process.env.NODE_ENV;
+    const setNodeEnv = (value) => {
+      if (value === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = value;
+    };
+    try {
+      for (const value of [undefined, "", "production", "test", "Development", "development "]) {
+        setNodeEnv(value);
+        const durability = memory();
+        const first = createFxAgent(agentOptions(durability, { name: "support", instructions: "first" }));
+        assert.throws(() => createFxAgent(agentOptions(durability, { name: "support", instructions: "second" })), (error) => error?.code === "FX_AGENT_NAME_IN_USE", `NODE_ENV=${JSON.stringify(value)}`);
+        await first.close();
+      }
+      setNodeEnv("development");
+      const durability = memory();
+      const first = createFxAgent(agentOptions(durability, { name: "support", instructions: "first" }));
+      const events = [];
+      const second = createFxAgent(agentOptions(durability, { name: "support", instructions: "second", onEvent: (event) => events.push(event) }));
+      assert.deepEqual(events.filter((event) => event.type === "agent.replaced").map(({ agent, replaced }) => ({ agent, replaced })), [{ agent: "support", replaced: 1 }]);
+      await second.close();
+      await first.close();
+    } finally {
+      setNodeEnv(saved);
+    }
+  });
+}
 
 test("a prompt the engine refuses ends its own turn once, and the session goes on", async () => {
   const agent = createFxAgent(agentOptions(await durabilityFor()));
@@ -2071,6 +2341,90 @@ test("an agent fetches the model catalog at most once, and not at all for a know
   assert.equal((await known.session().prompt("known model").result).stopReason, "end_turn");
   assert.equal(catalogRequests, knownBefore, "a known model id makes no catalog request");
   await known.close();
+});
+
+// An engine as an agent opens one for a delivery, with the agent's catalog
+// memory.
+const catalogEngine = (memory, extra = {}) => createFxEngine({
+  backend: engineBackend,
+  nativeAddon: addon,
+  ...(wasm ? { wasm } : {}),
+  fetch: loopbackFetch,
+  apiKey: "durable-key",
+  gatewayChatUrl: `http://127.0.0.1:${port}/chat`,
+  model: "durable/model",
+  [catalogMemory]: memory,
+  ...extra,
+});
+const isCatalogRequest = (input, init) => String(init?.method ?? "GET").toUpperCase() === "GET" &&
+  new URL(String(input?.url ?? input)).pathname === "/coding-agent/v1/models";
+
+// API-15: a credential that changes on every request, as a Vercel OIDC token
+// does, is still the agent's: its engines fetch the catalog once, and the
+// agent's memory keeps one entry for it.
+test("an agent whose credential changes for each engine fetches the catalog once and remembers it once", async () => {
+  const memory = new Map();
+  const before = catalogRequests;
+  const authBefore = catalogAuthorizations.length;
+  for (const token of ["oidc-1", "oidc-2", "oidc-3"]) {
+    const engine = await catalogEngine(memory, { apiKey: token });
+    try {
+      assert.equal((await engine.prompt(`with ${token}`).result).stopReason, "end_turn");
+    } finally {
+      await engine.close();
+    }
+  }
+  assert.deepEqual(catalogAuthorizations.slice(authBefore), ["Bearer oidc-1"], "the first engine's request fetched it");
+  assert.equal(catalogRequests - before, 1);
+  assert.equal(memory.size, 1);
+});
+
+// API-60: a catalog request that waits on another engine's fetch of the
+// same catalog stops when its own turn is cancelled. It does not wait for
+// that fetch, and sends no request of its own when that fetch fails.
+test("a catalog request waiting on another engine's fetch stops with its cancelled turn", async () => {
+  const memory = new Map();
+  const get = memory.get.bind(memory);
+  let lookups = 0;
+  memory.get = (key) => {
+    lookups += 1;
+    return get(key);
+  };
+  let release;
+  const held = new Promise((resolve) => { release = resolve; });
+  let fetching;
+  const fetched = new Promise((resolve) => { fetching = resolve; });
+  const first = await catalogEngine(memory, {
+    async fetch(input, init) {
+      if (!isCatalogRequest(input, init)) return loopbackFetch(input, init);
+      fetching();
+      await held;
+      return new Response("unavailable", { status: 503 });
+    },
+  });
+  let ownRequests = 0;
+  const second = await catalogEngine(memory, {
+    fetch(input, init) {
+      if (isCatalogRequest(input, init)) ownRequests += 1;
+      return loopbackFetch(input, init);
+    },
+  });
+  try {
+    const waiting = first.prompt("one");
+    void waiting.result.catch(() => {});
+    await fetched;
+    const cancelled = second.prompt("two");
+    await until(() => lookups >= 2, "the second engine to find the first one's fetch");
+    await cancelled.cancel();
+    assert.equal((await cancelled.result).stopReason, "cancelled");
+    release();
+    await waiting.result.catch(() => {});
+    assert.equal(ownRequests, 0, "the cancelled request sent no catalog request of its own");
+  } finally {
+    release();
+    await first.close();
+    await second.close();
+  }
 });
 
 test("a checkpoint restores the conversation in a new agent", async () => {
