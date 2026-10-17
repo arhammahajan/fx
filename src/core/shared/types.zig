@@ -318,8 +318,7 @@ pub const RouteRecoveryStatusTone = enum {
 
 pub const ModelRecoveryCause = enum {
     network_interrupted,
-    /// The network path is provably down; nothing was sent and the turn is
-    /// waiting for connectivity instead of spending retry budget.
+    /// The network path is provably down, so nothing was sent.
     connectivity_lost,
     response_interrupted,
     provider_stream_timeout,
@@ -366,10 +365,6 @@ pub const ModelFailureDiagnostic = struct {
             .request_limit_reached => "ProviderRequestLimitReached",
             .compaction_prepared => "CompactionPrepared",
         };
-    }
-
-    pub fn forCause(cause: ModelRecoveryCause) ModelFailureDiagnostic {
-        return init(defaultTextForCause(cause));
     }
 
     pub fn init(text: []const u8) ModelFailureDiagnostic {
@@ -435,6 +430,11 @@ pub const RouteRecoveryStatus = struct {
         /// carries only the attempt that succeeded. Hosts that report a
         /// result show it; the TUI clears its status line.
         recovered,
+        /// The request ended on an error after the module showed a status,
+        /// with no terminal status of fx's own. It carries only the last
+        /// attempt; the error reaches the host its usual way. Hosts that
+        /// report a result show it; the TUI clears its status line.
+        failed,
         // Terminal outcomes fx reports itself.
         terminal_provider_error,
         unsafe_assistant_output,
@@ -454,6 +454,10 @@ pub const RouteRecoveryStatus = struct {
     attempt: usize = 0,
     cause: ?ModelRecoveryCause = null,
     diagnostic: ?ModelFailureDiagnostic = null,
+    /// With `terminal_provider_error`: the same failure that may never heal
+    /// ended several sends in a row, so fx stopped the request
+    /// (`request_recovery.zig` `repeatedFailure`).
+    repeated: bool = false,
 
     /// Null for `clear`, which hosts receive as the clear event.
     pub fn fromRecovery(status: recovery.Status, attempt: usize) ?RouteRecoveryStatus {
@@ -477,11 +481,51 @@ pub const RouteRecoveryStatus = struct {
         return switch (self.kind) {
             .waiting, .retrying, .need_user => true,
             .recovered,
+            .failed,
             .terminal_provider_error,
             .unsafe_assistant_output,
             .unsafe_tool_start,
             .content_filter,
             => false,
+        };
+    }
+
+    /// What `fx ask --json` reports as `recovery` and ACP as
+    /// `_meta.fx.modelResponseRecovery`. Every key is one word, so both
+    /// spell them the same way, and `need` keeps the module's snake_case
+    /// tags.
+    pub const Report = struct {
+        state: ReportedState,
+        attempt: usize,
+        need: ?recovery.Status.Need = null,
+        /// Omitted when the status has no wording: `recovered` and
+        /// `failed` report only the attempt.
+        message: ?[]const u8 = null,
+
+        pub fn writeJson(self: Report, writer: *std.Io.Writer) !void {
+            try writer.writeAll("{\"state\":");
+            try std.json.Stringify.value(@tagName(self.state), .{}, writer);
+            try writer.print(",\"attempt\":{d}", .{self.attempt});
+            if (self.need) |need| {
+                try writer.writeAll(",\"need\":");
+                try std.json.Stringify.value(@tagName(need), .{}, writer);
+            }
+            if (self.message) |message| {
+                try writer.writeAll(",\"message\":");
+                try std.json.Stringify.value(message, .{}, writer);
+            }
+            try writer.writeByte('}');
+        }
+    };
+
+    /// This status as hosts report it. The message lives in `buf`.
+    pub fn report(self: RouteRecoveryStatus, buf: []u8) Report {
+        const message = self.label(buf);
+        return .{
+            .state = self.reportedState(),
+            .attempt = self.attempt,
+            .need = self.need,
+            .message = if (message.len == 0) null else message,
         };
     }
 
@@ -505,6 +549,7 @@ pub const RouteRecoveryStatus = struct {
             .retrying => .retrying,
             .need_user => .need_user,
             .recovered => .recovered,
+            .failed,
             .terminal_provider_error,
             .unsafe_assistant_output,
             .unsafe_tool_start,
@@ -520,6 +565,7 @@ pub const RouteRecoveryStatus = struct {
             .retrying => .live,
             .waiting, .need_user => .warning,
             .recovered => .success,
+            .failed,
             .terminal_provider_error,
             .unsafe_assistant_output,
             .unsafe_tool_start,
@@ -537,7 +583,7 @@ pub const RouteRecoveryStatus = struct {
             return buf[0..len];
         }
         return switch (self.kind) {
-            .waiting, .retrying, .need_user, .recovered => "",
+            .waiting, .retrying, .need_user, .recovered, .failed => "",
             .terminal_provider_error => self.terminalLabel(buf),
             .unsafe_assistant_output => self.fixedFailureLabel(
                 buf,
@@ -585,6 +631,21 @@ pub const RouteRecoveryStatus = struct {
     }
 
     fn terminalLabel(self: RouteRecoveryStatus, buf: []u8) []const u8 {
+        if (self.repeated) {
+            const repeated_name = if (self.cause) |cause| causeDisplayName(cause) else "Response failed";
+            if (self.diagnostic) |diagnostic| {
+                return std.mem.print(
+                    buf,
+                    "⚠ {s} · {s} · kept failing at the same point · stopped",
+                    .{ repeated_name, diagnostic.humanText() },
+                ) catch "⚠ Response kept failing at the same point";
+            }
+            return std.mem.print(
+                buf,
+                "⚠ {s} · kept failing at the same point · stopped",
+                .{repeated_name},
+            ) catch "⚠ Response kept failing at the same point";
+        }
         const name = if (self.cause) |cause| causeDisplayName(cause) else "Provider unavailable";
         const plural: []const u8 = if (self.attempt == 1) "" else "s";
         if (self.diagnostic) |diagnostic| {
@@ -602,10 +663,15 @@ pub const RouteRecoveryStatus = struct {
     }
 };
 
-fn testRecoveryText(value: []const u8) recovery.Text {
+/// Tests build module status text with this. A string longer than
+/// `recovery.Text` holds fails to compile.
+pub fn testRecoveryText(comptime value: []const u8) recovery.Text {
+    if (value.len > recovery.Text.capacity) {
+        @compileError("recovery text is longer than recovery.Text.capacity: " ++ value);
+    }
     var text: recovery.Text = .{};
     @memcpy(text.bytes[0..value.len], value);
-    text.len = @intCast(value.len);
+    text.len = value.len;
     return text;
 }
 
@@ -659,6 +725,62 @@ test "route recovery terminal label names the cause, diagnostic, and attempts" {
         "⚠ Tool state needs review · context preserved",
         (RouteRecoveryStatus{ .kind = .unsafe_tool_start }).label(&label_buf),
     );
+}
+
+test "a request stopped for repeating the same failure says it kept failing" {
+    var label_buf: [RouteRecoveryStatus.label_max_bytes]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "⚠ Network interrupted · TlsInitializationFailed · kept failing at the same point · stopped",
+        (RouteRecoveryStatus{
+            .kind = .terminal_provider_error,
+            .attempt = 3,
+            .cause = .network_interrupted,
+            .diagnostic = ModelFailureDiagnostic.init("TlsInitializationFailed"),
+            .repeated = true,
+        }).label(&label_buf),
+    );
+    try std.testing.expectEqualStrings(
+        "⚠ Response ended early · stream interrupted · kept failing at the same point · stopped",
+        (RouteRecoveryStatus{
+            .kind = .terminal_provider_error,
+            .attempt = 3,
+            .cause = .response_interrupted,
+            .diagnostic = ModelFailureDiagnostic.init("StreamInterrupted"),
+            .repeated = true,
+        }).label(&label_buf),
+    );
+}
+
+test "recovery reports write the shape fx ask and ACP share" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var label_buf: [RouteRecoveryStatus.label_max_bytes]u8 = undefined;
+
+    const cases = [_]struct { status: RouteRecoveryStatus, json: []const u8 }{
+        .{
+            .status = .{ .kind = .waiting, .text = testRecoveryText("Gateway error · next try in 2s · attempt 1 · 0s"), .attempt = 1 },
+            .json = "{\"state\":\"waiting\",\"attempt\":1,\"message\":\"Gateway error · next try in 2s · attempt 1 · 0s\"}",
+        },
+        .{
+            .status = .{ .kind = .need_user, .need = .content_filter, .text = testRecoveryText("Blocked by the content filter · press Esc and rephrase"), .attempt = 2 },
+            .json = "{\"state\":\"need_user\",\"attempt\":2,\"need\":\"content_filter\",\"message\":\"Blocked by the content filter · press Esc and rephrase\"}",
+        },
+        .{ .status = .{ .kind = .recovered, .attempt = 3 }, .json = "{\"state\":\"recovered\",\"attempt\":3}" },
+        .{ .status = .{ .kind = .failed, .attempt = 2 }, .json = "{\"state\":\"failed\",\"attempt\":2}" },
+        .{
+            .status = .{ .kind = .unsafe_tool_start, .attempt = 1 },
+            .json = "{\"state\":\"failed\",\"attempt\":1,\"message\":\"⚠ Tool state needs review · context preserved\"}",
+        },
+    };
+    for (cases) |case| {
+        out.clearRetainingCapacity();
+        try case.status.report(&label_buf).writeJson(&out.writer);
+        try std.testing.expectEqualStrings(case.json, out.written());
+    }
+
+    out.clearRetainingCapacity();
+    try (RouteRecoveryStatus.Report{ .state = .interrupted, .attempt = 4, .message = "Interrupted turn" }).writeJson(&out.writer);
+    try std.testing.expectEqualStrings("{\"state\":\"interrupted\",\"attempt\":4,\"message\":\"Interrupted turn\"}", out.written());
 }
 
 test "model failure diagnostic translates known transport names only" {
@@ -1567,6 +1689,11 @@ pub const ProviderFailureCause = enum {
     gateway_stream_timeout,
     non_retryable,
     rate_limited,
+    /// A provider error whose error event named no code, so fx cannot tell
+    /// whether a resend can succeed.
+    uncoded_error,
+    /// A stream that finished with an error that no error event explained.
+    unexplained_error_finish,
 };
 
 pub const ProviderServiceTier = enum {

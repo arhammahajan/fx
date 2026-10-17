@@ -366,13 +366,10 @@ fn transientDelay(state: *State, failure: Failure) u32 {
     state.offline_step = 0;
     noteStreak(state, failure.kind);
     escalate(state, failure.kind);
-    // The server's hint replaces the backoff. A rate limit waits exactly as
-    // long as asked; a server error never waits past the ceiling.
+    // The server's hint replaces this wait's backoff step without advancing
+    // it, and no hint waits past the ceiling, a rate limit's included.
     if (failure.retry_after_ms) |hint| {
-        if (hint > 0) return switch (failure.kind) {
-            .rate_limited => hint,
-            else => @min(hint, backoff_ms[backoff_ms.len - 1]),
-        };
+        if (hint > 0) return @min(hint, backoff_ms[backoff_ms.len - 1]);
     }
     const base = backoff_ms[@min(state.backoff_step, backoff_ms.len - 1)];
     state.backoff_step +|= 1;
@@ -764,7 +761,7 @@ test "backoff grows to the 30 second cap and never past it" {
     }
 }
 
-test "rate limits wait exactly as long as the server asks" {
+test "rate limits wait as long as the server asks, capped at the ceiling" {
     var state: State = .{};
     _ = startNew(&state, 0, false);
     _ = step(&state, .{ .failed = .{ .kind = .rate_limited, .retry_after_ms = 20_000 } }, 5_000);
@@ -772,9 +769,16 @@ test "rate limits wait exactly as long as the server asks" {
     try testing.expect(step(&state, .tick, 24_999).send == null);
     try testing.expect(step(&state, .tick, 25_000).send != null);
 
-    // A zero hint carries no information and falls back to the backoff.
-    _ = step(&state, .{ .failed = .{ .kind = .rate_limited, .retry_after_ms = 0 } }, 30_000);
-    try testing.expect(state.wait_until_ms > 30_000);
+    // A longer hint waits the 30 second ceiling.
+    _ = step(&state, .{ .failed = .{ .kind = .rate_limited, .retry_after_ms = 600_000 } }, 30_000);
+    try testing.expectEqual(@as(u64, 60_000), state.wait_until_ms);
+    try testing.expect(step(&state, .tick, 60_000).send != null);
+
+    // Hints never advanced the backoff, so the first unhinted wait is the
+    // first step. A zero hint carries no information and falls back to it.
+    _ = step(&state, .{ .failed = .{ .kind = .rate_limited, .retry_after_ms = 0 } }, 70_000);
+    try testing.expect(state.wait_until_ms > 70_000);
+    try testing.expect(state.wait_until_ms <= 70_000 + backoff_ms[0]);
 }
 
 test "offline retries every few seconds and never escalates" {
@@ -928,7 +932,8 @@ test "a closed window resumes without a question" {
 test "a relaunch during a wait resends at once" {
     var state: State = .{};
     _ = startNew(&state, 0, false);
-    const record = step(&state, .{ .failed = .{ .kind = .rate_limited, .retry_after_ms = 60_000 } }, 1_000).save.?;
+    // The longest wait there is, so the relaunch lands inside it.
+    const record = step(&state, .{ .failed = .{ .kind = .rate_limited, .retry_after_ms = 30_000 } }, 1_000).save.?;
     state = .{};
     const resumed = step(&state, .{ .start = .{ .resume_from = record } }, 10);
     try testing.expect(resumed.save != null);

@@ -16,7 +16,6 @@ const session_codec = @import("../../session/session_codec.zig");
 const result_store = @import("../../session/result_store.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
 const diagnostics = @import("../../workspace/diagnostics.zig");
-const gateway_error_format = @import("../../shared/gateway_error_format.zig");
 const mem_utils = @import("../../shared/mem_utils.zig");
 const text_utils = @import("../../shared/text_utils.zig");
 const file_mutation_contract = @import("../../tooling/file_mutation_contract.zig");
@@ -4739,6 +4738,34 @@ fn pushTerminalAutoRetryStatusIfNeeded(
     });
 }
 
+/// The same failure that may never heal ended several sends in a row
+/// (`request_recovery.zig` `Repeating`), so the request stops the way fx's
+/// no-progress stop always did: it kept failing at the same point. The stop
+/// is final, so its checkpoint goes with it; a resume would otherwise restart
+/// a request the status already calls stopped. The caller then ends the turn
+/// through its terminal path.
+fn stopRepeatedFailure(
+    deps: *const AgentRuntimeDeps,
+    request: *runtime_request_recovery.RequestRecovery,
+    job: QueuedPrompt,
+    config: Config,
+    cause: types.ModelRecoveryCause,
+    diagnostic: types.ModelFailureDiagnostic,
+) !void {
+    try request.replaceStatus(.{
+        .kind = .terminal_provider_error,
+        .attempt = request.attempt(),
+        .cause = cause,
+        .diagnostic = diagnostic,
+        .repeated = true,
+    });
+    restorePromptAfterTerminalFailure(deps, job, config);
+    const effect = deps.recovery_checkpoint orelse return;
+    effect.clear(deps.ctx) catch |err| {
+        debug_trace.logf("agent", "recovery checkpoint clear on repeated failure stop failed err={s}", .{@errorName(err)});
+    };
+}
+
 fn onRequiredVisionStreamToolStart(
     ctx: *anyopaque,
     tool_id: []const u8,
@@ -4974,16 +5001,6 @@ fn providerCompletionDiagnostic(
         completion.provider_failure_detail orelse "",
         fallback,
     );
-}
-
-fn httpFailureDiagnostic(
-    alloc: Allocator,
-    status: std.http.Status,
-    detail: []const u8,
-) !types.ModelFailureDiagnostic {
-    const formatted = try gateway_error_format.formatHttpRecoveryDiagnostic(alloc, status, detail);
-    defer alloc.free(formatted);
-    return types.ModelFailureDiagnostic.init(formatted);
 }
 
 fn traceRouteFailure(
@@ -6763,8 +6780,10 @@ fn processQueuedPromptLoop(
         // line says so. Prefill, language, image-size, and overflow retries
         // stay fx's own and resend inside the same module send.
         var request_recovery = runtime_request_recovery.RequestRecovery.init(deps, config.cancel_flag, step_ctx);
+        // `deinit` clears a status still shown on every exit; an error exit
+        // reports `failed` first.
         defer request_recovery.deinit();
-        errdefer request_recovery.abandon();
+        errdefer request_recovery.endWithError();
         try request_recovery.start(route_fast_mode);
 
         while (true) {
@@ -7384,9 +7403,18 @@ fn processQueuedPromptLoop(
                     recovery_strategy == .reconcile_tool and stream_ctx.saw_tool_start;
                 // Network failures wait and resend through the recovery
                 // module. Any other thrown error keeps its terminal path.
-                const will_auto_retry = !cancel_requested and
-                    network_failure != null and
+                const failure_kind: ?runtime_request_recovery.Failure.Kind = if (network_failure != null)
+                    runtime_request_recovery.failureKind(failure_cause)
+                else
+                    null;
+                const retryable = !cancel_requested and
+                    failure_kind != null and
                     !reconciliation_tool_violation;
+                const repeat_stop = retryable and request_recovery.repeatedFailure(
+                    if (err == error.TlsInitializationFailed) .tls_setup else null,
+                    stream_ctx.streamed_output_bytes,
+                );
+                const will_auto_retry = retryable and !repeat_stop;
                 debug_trace.eventf(
                     "gateway",
                     "stream_error",
@@ -7429,12 +7457,7 @@ fn processQueuedPromptLoop(
                 );
                 var delay_completed = true;
                 if (will_auto_retry) {
-                    // A path that is down sent nothing; a connection that
-                    // broke after connecting may have.
-                    try request_recovery.failed(.{ .kind = switch (network_failure.?.cause) {
-                        .connectivity_lost, .system_resumed => .offline,
-                        .transport_interrupted, .stream_stalled => .dropped,
-                    } });
+                    try request_recovery.failed(.{ .kind = failure_kind.? });
                     delay_completed = try request_recovery.waitForSend() != null;
                 }
                 if (cancel_requested or !delay_completed) {
@@ -7493,7 +7516,9 @@ fn processQueuedPromptLoop(
                     );
                     return;
                 }
-                if (request_recovery.attempt() > 1) {
+                if (repeat_stop) {
+                    try stopRepeatedFailure(deps, &request_recovery, job, config, failure_cause, failure_diagnostic);
+                } else if (request_recovery.attempt() > 1) {
                     try request_recovery.replaceStatus(.{
                         .kind = .terminal_provider_error,
                         .attempt = consumed_attempts,
@@ -7822,7 +7847,8 @@ fn processQueuedPromptLoop(
                 );
                 if (!config.cancel_flag.load(.seq_cst)) {
                     try request_recovery.failed(.{
-                        .kind = if (failure.kind == .rate_limited) .rate_limited else .server,
+                        // Both causes above are transient.
+                        .kind = runtime_request_recovery.failureKind(cause).?,
                         .retry_after_ms = retryAfterMs(failure.retry_after_seconds),
                     });
                     if (try request_recovery.waitForSend() != null) {
@@ -8006,12 +8032,26 @@ fn processQueuedPromptLoop(
                 attempt_failure_diagnostic = diagnostic;
                 const failure_kind: ?runtime_request_recovery.Failure.Kind = if (content_filtered or failure_cause == .non_retryable)
                     null
-                else switch (cause) {
-                    .provider_stream_timeout, .response_interrupted => .dropped,
-                    .rate_limited => .rate_limited,
-                    else => .server,
-                };
-                const retries = failure_kind != null and !config.cancel_flag.load(.seq_cst);
+                else
+                    runtime_request_recovery.failureKind(cause);
+                const retryable = failure_kind != null and !config.cancel_flag.load(.seq_cst);
+                // An unclear ending that keeps happening at the same point
+                // stops after a few sends: a missing finish through the
+                // missing-finish path after the loop, an uncoded or
+                // unexplained provider error through the provider-error path
+                // below. A provider error with a code is never bounded.
+                const repeating: ?runtime_request_recovery.Repeating = if (cause == .response_interrupted)
+                    .missing_finish
+                else if (failure_cause) |known| switch (known) {
+                    .uncoded_error => .uncoded_error,
+                    .unexplained_error_finish => .unexplained_error_finish,
+                    .gateway_stream_timeout, .non_retryable, .rate_limited => null,
+                } else null;
+                const repeat_stop = retryable and request_recovery.repeatedFailure(
+                    repeating,
+                    stream_ctx.streamed_output_bytes,
+                );
+                const retries = retryable and !repeat_stop;
                 if (attempt_disposition == .provider_failure or
                     failure_cause == .gateway_stream_timeout)
                 {
@@ -8110,6 +8150,8 @@ fn processQueuedPromptLoop(
                             &stop_state.terminal_materializing,
                         );
                     }
+                } else if (finish_reason == .provider_error and request_recovery.stoppedRepeating()) {
+                    try stopRepeatedFailure(deps, &request_recovery, job, config, .provider_unavailable, diagnostic);
                 } else if (finish_reason == .provider_error) {
                     if (replay_safe) {
                         try pushTerminalProviderFailureStatus(
@@ -8236,6 +8278,9 @@ fn processQueuedPromptLoop(
         const partial_assistant = current_partial_assistant;
 
         if (streamFailure(stream_result)) |failure| {
+            // Every exit below returns normally, so the request reports its
+            // end here rather than through the step's errdefer.
+            request_recovery.endWithError();
             const detail = if (failure.detail) |body| std.mem.trim(u8, body, " \r\n\t") else "";
             const clipped = detail[0..@min(detail.len, http_error_detail_max_bytes)];
             const http_detail = try runtime_gateway_step.gatewayHttpErrorDetail(
@@ -8307,11 +8352,22 @@ fn processQueuedPromptLoop(
         switch (disposition) {
             .completed, .length_limited => {},
             .interrupted => {
-                try pushTerminalAutoRetryStatusIfNeeded(
-                    &request_recovery,
-                    successful_recovery_strategy != null,
-                    types.ModelFailureDiagnostic.init("StreamInterrupted"),
-                );
+                if (request_recovery.stoppedRepeating()) {
+                    try stopRepeatedFailure(
+                        deps,
+                        &request_recovery,
+                        job,
+                        config,
+                        .response_interrupted,
+                        types.ModelFailureDiagnostic.init("StreamInterrupted"),
+                    );
+                } else {
+                    try pushTerminalAutoRetryStatusIfNeeded(
+                        &request_recovery,
+                        successful_recovery_strategy != null,
+                        types.ModelFailureDiagnostic.init("StreamInterrupted"),
+                    );
+                }
                 debug_trace.eventf("agent", "provider_finish_missing", step_ctx, "content_bytes={d} tool_call_count={d}", .{
                     if (completion.content) |content| content.len else 0,
                     completion.tool_calls.len,
