@@ -2783,7 +2783,8 @@ export async function createFxEngine(options = {}) {
     hostToolExecutor: executeHostTool,
     journalFlush: () => journalSettled(),
     // A cancel or deadline doesn't wait for this read, as it doesn't wait
-    // for a tool: a steer the read finds later becomes the next turn.
+    // for a tool. A steer the read finds later is placed like any steer
+    // stored after the turn ended.
     takeInputs: () => {
       const turn = activeTurn;
       const read = Promise.resolve().then(() => options[turnEndInputs]?.());

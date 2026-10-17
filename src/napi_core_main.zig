@@ -33,8 +33,10 @@ const max_output_bytes = 8 * 1024 * 1024;
 const max_output_message_bytes = 64 * 1024 * 1024;
 // One model request. History keeps every image, and the core leaves a
 // request's oldest images out to keep its body within
-// `request_image_budget.default_max_request_bytes`, so every request the core
-// sends fits, with 2 MiB more for its method, URL and headers.
+// `request_image_budget.default_max_request_bytes`, so a request it can trim
+// that way fits, with 2 MiB more for its method, URL and headers. Text can't
+// be left out: a request whose text alone is over this fails with
+// `HostStreamBackpressure` (`sdk/tests/test-native-core-image-framing.mjs`).
 const max_fetch_request_bytes = request_image_budget.default_max_request_bytes + 2 * 1024 * 1024;
 const max_fetch_response_bytes = 8 * 1024 * 1024;
 // One attachment holds one prompt image, or one kernel checkpoint, journal
