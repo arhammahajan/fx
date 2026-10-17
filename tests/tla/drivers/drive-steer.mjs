@@ -14,8 +14,10 @@
 // Each walk starts one agent on a fresh local() World directory. Every model
 // request streams only what the driver sends it, every tool call waits until
 // the driver ends it, each queue delivery waits until the driver lets it
-// run, and a call that a reply ends in starts only once the driver lets its
-// intent be stored, so the driver decides the interleaving. Where the model
+// run, a call that a reply ends in starts only once the driver lets its
+// intent be stored, and a turn whose last read found nothing ends only once
+// the driver lets its end record be stored, so the driver decides the
+// interleaving. Where the model
 // lets a step end in more than one state, the walk aims for one of them and
 // the driver brings it about. After each step it reads back what the model was sent, in the newest request, which
 // carries the whole conversation: a message that started a turn on the
@@ -107,13 +109,18 @@ const until = async (check, ms = stepTimeoutMs) => {
 // While `records.holding`, the engine's journal records wait to be stored,
 // and inputs do not. A call with effects starts only once its intent is
 // stored, so holding them keeps a reply that ended in such a call in `call`.
-function gatedDeliveries(durability, gate, reads, records) {
+//
+// While `ends.holding`, the record that ends a turn waits to be stored, and
+// the records before it do not. The turn's last read of the log has run by
+// then, so holding it keeps the turn `ending`.
+function gatedDeliveries(durability, gate, reads, records, ends) {
   const decoder = new TextDecoder();
-  const kindOf = (event) => {
+  const entryOf = (event) => {
     const input = event?.eventData?.input;
     if (!(input instanceof Uint8Array)) return null;
-    try { return JSON.parse(decoder.decode(input)).k ?? null; } catch { return null; }
+    try { return JSON.parse(decoder.decode(input)); } catch { return null; }
   };
+  const endsTurn = (entry) => (entry?.marks ?? []).some((mark) => mark?.end === true);
   return {
     ...durability,
     async world() {
@@ -129,7 +136,11 @@ function gatedDeliveries(durability, gate, reads, records) {
           }
           if (key === "create") {
             return async (runId, event, ...rest) => {
-              if (kindOf(event) === "record") await records.pass();
+              const entry = entryOf(event);
+              if (entry?.k === "record") {
+                if (endsTurn(entry)) await ends.pass();
+                await records.pass();
+              }
               return value.call(target, runId, event, ...rest);
             };
           }
@@ -216,8 +227,19 @@ async function harness() {
       for (const go of records.held.splice(0)) go();
     },
   };
+  // The record that ends a turn, which the driver keeps from being stored to
+  // hold the turn `ending`.
+  const ends = {
+    holding: false,
+    held: [],
+    pass() { return ends.holding ? new Promise((go) => ends.held.push(go)) : Promise.resolve(); },
+    release() {
+      ends.holding = false;
+      for (const go of ends.held.splice(0)) go();
+    },
+  };
   const stored = durabilityKind === "world" ? await appWorldAt(dir) : local({ dir });
-  const durability = gatedDeliveries(stored, gate, reads, records);
+  const durability = gatedDeliveries(stored, gate, reads, records, ends);
   // The request right after a tool's result, which ToolEnd compares.
   let pinned = null;
   const options = {
@@ -342,8 +364,12 @@ async function harness() {
       else turns.at(-1)?.ctx.add(m);
     }
     // A reply that ended in a call with effects is in `call` while its intent
-    // waits to be stored and the tool has not started.
-    const phase = calls.length > 0 ? "tool" : records.held.length > 0 ? "call" : open.length > 0 ? open.at(-1).phase : "idle";
+    // waits to be stored and the tool has not started, and a turn is
+    // `ending` while the record that ends it waits.
+    const phase = calls.length > 0 ? "tool"
+      : records.held.length > 0 ? "call"
+        : ends.held.length > 0 ? "ending"
+          : open.length > 0 ? open.at(-1).phase : "idle";
     return JSON.stringify({
       turns: turns.map((turn) => ({ owner: turn.owner, state: stateOf.get(turn.owner) ?? "running", ctx: sorted(turn.ctx) })),
       phase,
@@ -377,14 +403,23 @@ async function harness() {
     if (name === "Cancel") {
       reads.release();
       await session.cancel();
-      // A turn cancelled in `call` stores how it ended.
+      // A turn cancelled in `call` stores how it ended, and one cancelled
+      // while `ending` stores its end.
       records.release();
+      ends.release();
     } else if (m === "p") {
       session = agent.session();
       const turn = session.prompt(textOf("p"), { messageId: "p" });
       void turn.result.catch(() => {});
       sessionId = (await turn.accepted).sessionId;
       await until(() => gate.held.length > 0);
+    } else if (ends.held.length > 0 && !reads.holding && random() < 0.5) {
+      // A steer sent while the turn's end lands, from this agent, whose
+      // worker hears of it at once and hands it on; the turn takes no more
+      // steers, so it stays stored, as the model's unread steer does. The
+      // other times it comes from the other server.
+      if (verbose) console.log("    from this agent while the turn's end lands");
+      await session.steer(textOf(m), { messageId: m });
     } else if (aim.unread.includes(m) || reads.holding) {
       // A steer the model has unread comes from the other server, and the
       // worker reads nothing until the model's Read, so only a read it makes
@@ -420,12 +455,23 @@ async function harness() {
     } else if (name === "ModelText") {
       // Reads made from now on go through, so the worker's read before the
       // turn ends finds the steers it had not read; the polls held before go
-      // only once the next request is out, which the view then shows.
+      // only once the next request is out, which the view then shows. A turn
+      // that read nothing more has its end record held, so it stays
+      // `ending`.
       reads.holding = false;
       const at = requests.length;
+      if (aim.phase === "ending") ends.holding = true;
       open.at(-1).end([{ type: "text-delta", id: "reply", delta: "done" }, finish("stop")]);
       if (aim.phase === "gen") await until(() => requests.length > at && open.length > 0);
+      if (aim.phase === "ending") await until(() => ends.held.length > 0);
       reads.release();
+    } else if (name === "EndLands") {
+      // The record that ends the turn lands; a turn of the steers stored
+      // since starts in the same delivery.
+      reads.release();
+      const at = requests.length;
+      ends.release();
+      if (aim.phase === "gen") await until(() => requests.length > at && open.length > 0);
     } else if (name === "ToolArgs") {
       const request = open.at(-1);
       toolCalls += 1;
@@ -476,16 +522,21 @@ async function harness() {
       // The deadline: the worker stops, and the same message comes back.
       reads.release();
       const before = requests.length;
+      const ending = ends.held.length > 0;
       agent[durableInternals].stopAtDeadline(sessionId);
       // In `call` the turn stops before its call starts; the call's intent
       // lands as the worker lets the session go. The next delivery runs a
       // call safe to run twice again and tells the model a call with effects
-      // may have partly run.
+      // may have partly run. A turn that is `ending` ends as its end lands,
+      // and the next delivery runs the steers stored since, if any.
       records.release();
-      await until(() => {
-        gate.release();
-        return (requests.length > before && open.length > 0) || calls.length > 0;
-      });
+      ends.release();
+      if (!ending || aim.phase === "gen") {
+        await until(() => {
+          gate.release();
+          return (requests.length > before && open.length > 0) || calls.length > 0;
+        });
+      }
     } else {
       throw new Error(`no driver step for ${name}`);
     }
@@ -496,6 +547,7 @@ async function harness() {
     gate.release();
     reads.release();
     records.release();
+    ends.release();
     for (const entry of [...open]) {
       try { entry.end([{ type: "error", errorText: "walk over" }]); } catch {}
     }

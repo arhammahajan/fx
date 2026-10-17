@@ -2978,12 +2978,14 @@ export async function createFxEngine(options = {}) {
     hostToolExecutor: executeHostTool,
     journalFlush: () => journalSettled(),
     // A cancel or deadline doesn't wait for this read, as it doesn't wait
-    // for a tool. A steer the read finds later is placed like any steer
-    // stored after the turn ended.
+    // for a tool. A turn that is no longer current, cancelled or with the
+    // agent closing, can take no steer (startSteer), so it reads nothing and
+    // waits for nothing: what the read would find stays in the log, for the
+    // next turn or for the turn a deadline left open.
     takeInputs: () => {
       const turn = activeTurn;
+      if (!isCurrentTurn(turn)) return Promise.resolve();
       const read = Promise.resolve().then(() => options[turnEndInputs]?.());
-      if (!isCurrentTurn(turn)) return read;
       const controller = new AbortController();
       turn.toolControllers.add(controller);
       const aborted = new Promise((_, reject) => {

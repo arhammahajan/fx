@@ -1654,11 +1654,28 @@ class SessionWorker {
     // Turns this process started or continued for the session, as it showed
     // their turn_start or turn_resume line.
     this.turnsShown = 0;
+    // How many of this process's runs of the session have ended (claim()).
+    this.runsEnded = 0;
   }
 
   // The log folded as `delivery` judges whether a lease's holder lives.
   fold(entries, delivery = null) {
     return foldSessionLog(entries, { now: Date.now(), alive: (lease) => this.backend.alive(lease, delivery) });
+  }
+
+  // The log as a delivery reads it, and folded. A lease of this process is
+  // alive only while its run holds it, and a run lets go only once its last
+  // write, the release, has landed. A read made while a run ended may lack
+  // the release though the fold finds the lease dead, so the session would
+  // look free at a head the release has moved past: a turn started early
+  // there sends a model request, and its claim is then refused. Such a read
+  // is made again.
+  async readLog(log, delivery) {
+    for (;;) {
+      const ended = this.runsEnded;
+      const entries = await log.read();
+      if (ended === this.runsEnded) return { entries, state: this.fold(entries, delivery) };
+    }
   }
 
   // One queue delivery, `delivery` its message's id and attempt when the
@@ -1671,8 +1688,7 @@ class SessionWorker {
   // have the same message delivered again later.
   async consume(message, delivery = null) {
     const log = await this.backend.session(this.sessionId);
-    let entries = await log.read();
-    let state = this.fold(entries, delivery);
+    let { entries, state } = await this.readLog(log, delivery);
     if (!knownMessage(state, message)) {
       this.agent.emit("session.refused", { sessionId: this.sessionId, messageId: message.messageId, reason: "unknown message" });
       return undefined;
@@ -1740,8 +1756,7 @@ class SessionWorker {
       }
       // The turns ran, or another worker's write came before this claim:
       // read the log again.
-      entries = await log.read();
-      state = this.fold(entries, delivery);
+      ({ entries, state } = await this.readLog(log, delivery));
     }
     return { timeoutSeconds: 1 };
   }
@@ -1809,6 +1824,7 @@ class SessionWorker {
     } finally {
       this.backend.holding(this.holder, false);
       this.running = false;
+      this.runsEnded += 1;
     }
   }
 

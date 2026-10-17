@@ -105,11 +105,13 @@ done
 # ReadAfterTool a steer stored while a tool runs misses the request after
 # its result when the worker has not read the log since, without
 # CallWaits a steer sent once a reply ended in a tool call ends the turn and
-# runs as a turn of its own, and without ReadAtEnd so does one another
-# server stores while the last reply streams.
+# runs as a turn of its own, without ReadAtEnd so does one another server
+# stores while the last reply streams, and without LateRunsNext a steer
+# stored after the turn's last read is lost when the worker counts it as
+# taken by the ending turn.
 for pair in NoInterrupt:NoSteerWaitsOnReply NoHandBack:NothingLost \
     NoJoinBeforeStart:PreStartJoins NoDedupe:AtMostOnce NoReadAfterTool:SteerInNextRequest \
-    NoCallWait:NoParkedSteer NoReadAtEnd:NoParkedSteer; do
+    NoCallWait:NoParkedSteer NoReadAtEnd:NoParkedSteer NoLateRunsNext:LateSteerRunsNext; do
     witness="${pair%%:*}" invariant="${pair#*:}"
     if "$java" -cp "$jar" tlc2.TLC -deadlock -workers auto -cleanup -metadir "$work/sw-$witness" \
         -config "SteerWitness-$witness.cfg" DurableSteer.tla 2>&1 | grep -q -E "Invariant $invariant is violated"; then

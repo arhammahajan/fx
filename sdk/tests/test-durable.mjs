@@ -371,6 +371,99 @@ const probeLogs = (durability) => {
   }, probe];
 };
 
+// A durability whose session-log reads a test answers late. After
+// `reads.holdAfterInput(n)`, the next n reads made once an input lands take
+// what the log holds then, and each answers only when the test lets it go,
+// oldest first. Works on memory() and on a World durability: it wraps the
+// memory backend's log, or the World's event listings.
+const lateReads = (durability) => {
+  let armAfterInput = 0;
+  let toHold = 0;
+  const held = [];
+  const arrivals = [];
+  const reads = {
+    holdAfterInput(count) { armAfterInput = count; },
+    // Resolves once `count` reads are held.
+    async next(count = 1) {
+      while (held.length < count) await new Promise((arrived) => arrivals.push(arrived));
+    },
+    answer() { held.shift()?.(); },
+    release() {
+      armAfterInput = 0;
+      toHold = 0;
+      for (const go of held.splice(0)) go();
+    },
+  };
+  const noted = (entry) => {
+    if (entry?.k !== "input" || armAfterInput === 0) return;
+    toHold = armAfterInput;
+    armAfterInput = 0;
+  };
+  const late = async (value) => {
+    if (toHold === 0) return value;
+    toHold -= 1;
+    await new Promise((go) => {
+      held.push(go);
+      for (const arrived of arrivals.splice(0)) arrived();
+    });
+    return value;
+  };
+  const bound = (target, key) => {
+    const value = Reflect.get(target, key);
+    return typeof value === "function" ? value.bind(target) : value;
+  };
+  if (typeof durability.create === "function") {
+    const create = durability.create;
+    const wrapped = new WeakMap();
+    return [{
+      ...durability,
+      create() {
+        const backend = create();
+        if (!wrapped.has(backend)) {
+          wrapped.set(backend, {
+            ...backend,
+            async session(id) {
+              const log = await backend.session(id);
+              return {
+                ...log,
+                read: async () => late(await log.read()),
+                async append(entry) {
+                  const cursor = await log.append(entry);
+                  noted(entry);
+                  return cursor;
+                },
+              };
+            },
+          });
+        }
+        return wrapped.get(backend);
+      },
+    }, reads];
+  }
+  const decoder = new TextDecoder();
+  const entryOf = (event) => {
+    try { return JSON.parse(decoder.decode(event?.eventData?.input)); } catch { return null; }
+  };
+  return [{
+    ...durability,
+    async world() {
+      const world = await durability.world();
+      const events = new Proxy(world.events, {
+        get(target, key) {
+          if (key === "list") return async (...args) => late(await target.list(...args));
+          if (key !== "create") return bound(target, key);
+          return async (runId, event, ...rest) => {
+            const result = await target.create(runId, event, ...rest);
+            noted(entryOf(event));
+            return result;
+          };
+        },
+      });
+      return new Proxy(world, { get: (target, key) => (key === "events" ? events : bound(target, key)) });
+    },
+  }, reads];
+};
+
 // A World durability whose session streams never get the user_message line
 // of input `id`, as when its worker died before that write landed.
 const losingUserMessage = (durability, id) => {
@@ -682,6 +775,51 @@ test("a prompt's model request goes out before its claim lands, and nothing show
   const lines = await readLines(agent.session(sessionId).stream(0), 3);
   assert.deepEqual(lines.map((line) => line.type), ["turn_start", "text_delta", "turn_end"]);
   await agent.close();
+});
+
+// DUR-60 and DUR-18: a prompt sent as the turn before it ends starts in one
+// hop, with one model request. The delivery that runs it reads the log
+// before the last worker's release lands, and that worker lets the session
+// go before the read answers. Its lease, no longer held, no longer stands,
+// so the read would find the session free at a head the release has moved
+// past, and a turn started there loses its claim and its model request.
+test("a prompt stored as the turn before it lets the session go sends one model request", async () => {
+  let holdLeases = false;
+  const [held, writes] = holdWrites(await durabilityFor(), (entry) => entry.k === "release" || (entry.k === "lease" && holdLeases));
+  const [durability, reads] = lateReads(held);
+  const agent = createFxAgent(agentOptions(durability));
+  try {
+    const session = agent.session();
+    const first = collect(session.prompt("first"));
+    // The first turn has ended, and its worker's release waits.
+    await writes.next();
+    assert.equal((await first).result.stopReason, "end_turn");
+    holdLeases = true;
+    reads.holdAfterInput(2);
+    const before = requests.length;
+    const second = collect(session.prompt("and now?"));
+    // The delivery that runs the prompt read the log without the release.
+    await reads.next(1);
+    await writes.releaseHeld();
+    // The first worker let the session go and reads the log again.
+    await reads.next(2);
+    reads.answer();
+    // The turn starts before its claim lands; the claim waits until its
+    // model request is out.
+    await until(() => requests.length > before, "the second turn's model request");
+    await writes.next();
+    holdLeases = false;
+    await writes.releaseHeld();
+    reads.answer();
+    const { text, result } = await second;
+    assert.equal(result.stopReason, "end_turn", result.error?.message);
+    assert.equal(text, "echo: and now?");
+    assert.equal(requests.length - before, 1, "the turn sent one model request");
+  } finally {
+    reads.release();
+    writes.release();
+    await agent.close();
+  }
 });
 
 test("a claim another worker's write came before runs no tool and writes nothing", async () => {
@@ -1184,6 +1322,60 @@ test("a steer stored while the last reply streams continues the turn, from any s
   } finally {
     if (steerer !== agent) await steerer.close();
     await agent.close();
+  }
+});
+
+// Where the steering cut-off falls. The read before a turn ends is its last;
+// a steer stored after it, while the record that ends the turn lands, is too
+// late for the turn, whose engine takes no more steers. It is never lost and
+// never shows in that turn: it runs once, as the next turn, whether this
+// server or another stored it (`tests/tla/sdk/DurableSteer.tla` EndLands,
+// LateSteerRunsNext; DUR-23).
+test("a steer stored after a turn's last read, while its end lands, runs once as the next turn, from either server", async () => {
+  const endsTurn = (entry) => entry?.k === "record" && (entry.marks ?? []).some((mark) => mark?.end === true);
+  for (const from of ["this", "another"]) {
+    let base;
+    if (durabilityKind === "memory") {
+      base = memory();
+    } else {
+      const dir = await mkdtemp(join(tmpdir(), "libfx-durable-"));
+      dirs.push(dir);
+      base = await durabilityAt(dir);
+    }
+    const [held, writes] = holdWrites(base, endsTurn);
+    const agent = createFxAgent(agentOptions(held));
+    const steerer = from === "this" ? agent : createFxAgent(agentOptions(base));
+    const steerId = `late-from-${from}`;
+    try {
+      const turn = agent.session().prompt("quick reply");
+      const { sessionId, messageId } = await turn.accepted;
+      // The reply ended, the turn's last read found nothing, and the record
+      // that ends the turn waits.
+      await writes.next();
+      const before = requests.length;
+      await steerer.session(sessionId).steer("also say pear", { messageId: steerId });
+      // The worker's polls and watches run while the end still lands.
+      await new Promise((wait) => setTimeout(wait, 400 * timeScale));
+      assert.equal(requests.length, before, `${from}: the ending turn sent no model request for the steer`);
+      writes.release();
+      const { result } = await collect(turn);
+      assert.equal(result.stopReason, "end_turn", `${from}: ${result.error?.message}`);
+      let lines = [];
+      await until(async () => {
+        lines = await readLines(agent.session(sessionId).stream(0), 64);
+        return lines.some((line) => line.type === "turn_end" && line.messageId === steerId);
+      }, "the steer's own turn to end");
+      assert.deepEqual(lines.filter((line) => line.type === "turn_start").map((line) => line.messageId), [messageId, steerId], `${from}: the steer runs as the next turn`);
+      assert.ok(!lines.some((line) => line.type === "user_message" && line.id === steerId), `${from}: the steer never joined the ended turn`);
+      assert.deepEqual(lines.filter((line) => line.type === "turn_end").map((line) => [line.messageId, line.stopReason]), [[messageId, "end_turn"], [steerId, "end_turn"]]);
+      const carrying = requests.slice(before).filter((prompt) => userTexts(prompt).includes("also say pear"));
+      assert.equal(carrying.length, 1, `${from}: one model request carries the steer`);
+      assert.deepEqual(userTexts(carrying[0]).slice(-2), ["quick reply", "also say pear"], `${from}: the steer opens its turn after the one before`);
+    } finally {
+      writes.release();
+      if (steerer !== agent) await steerer.close();
+      await agent.close();
+    }
   }
 });
 
@@ -2110,14 +2302,11 @@ test("a session prompt whose images fill the 6 MiB budget, with text, reaches th
     const next = await collect(session.prompt("and now?"));
     assert.equal(next.result.stopReason, "end_turn", next.result.error?.message);
     assert.match(next.text, /^echo: and now\?/);
-    // A worker may send its request before its claim lands and lose it, so
-    // the turn may have sent more than one; each carries the whole history.
+    // DUR-60: one model request, which carries the whole history.
     const later = requests.slice(sent + 1);
-    assert.ok(later.length > 0);
-    for (const prompt of later) {
-      assert.deepEqual(userTexts(prompt).at(-1), "and now?");
-      assert.deepEqual(filesOf(prompt).map((part) => part.data?.data?.length), [data.length, data.length], "the history keeps the images");
-    }
+    assert.equal(later.length, 1, "the turn sent one model request");
+    assert.deepEqual(userTexts(later[0]).at(-1), "and now?");
+    assert.deepEqual(filesOf(later[0]).map((part) => part.data?.data?.length), [data.length, data.length], "the history keeps the images");
   } finally {
     await agent.close();
   }
