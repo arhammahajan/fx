@@ -1178,6 +1178,62 @@ test("a steer stored while the last reply streams continues the turn, from any s
   }
 });
 
+// A cancel doesn't wait for the read of stored inputs before a turn ends, as
+// it doesn't wait for a tool: on wasm that read suspends the core.
+if (durabilityKind !== "memory") {
+  test("a cancel ends the turn while its read of stored inputs waits on the store", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-durable-"));
+    dirs.push(dir);
+    const base = { ...(await durabilityAt(dir)), pollMs: 3_600_000 };
+    let stall = false;
+    let stalled = false;
+    let release;
+    const held = new Promise((go) => { release = go; });
+    const bound = (target, key) => {
+      const value = Reflect.get(target, key);
+      return typeof value === "function" ? value.bind(target) : value;
+    };
+    const durability = {
+      ...base,
+      async world() {
+        const world = await base.world();
+        const events = new Proxy(world.events, {
+          get(target, key) {
+            if (key !== "list") return bound(target, key);
+            return async (...args) => {
+              if (stall) {
+                stall = false;
+                stalled = true;
+                await held;
+              }
+              return target.list(...args);
+            };
+          },
+        });
+        return new Proxy(world, { get: (target, key) => (key === "events" ? events : bound(target, key)) });
+      },
+    };
+    const agent = createFxAgent(agentOptions(durability));
+    try {
+      const replies = heldReplies.length;
+      const turn = agent.session().prompt("held reply");
+      const { sessionId } = await turn.accepted;
+      await until(() => heldReplies.length > replies, "the reply starts");
+      stall = true;
+      heldReplies[replies].end();
+      await until(() => stalled, "the read before the turn ends waits on the store");
+      await agent.session(sessionId).cancel();
+      let timer;
+      const late = new Promise((_resolve, reject) => { timer = setTimeout(() => reject(new Error("the turn still ran 2 s after the cancel")), 2000); });
+      const result = await Promise.race([turn.result, late]).finally(() => clearTimeout(timer));
+      assert.equal(result.stopReason, "cancelled");
+    } finally {
+      release();
+      await agent.close();
+    }
+  });
+}
+
 // The session's lines from the start until `done` holds for one of them.
 async function linesUntil(session, done, label, ms = 15_000 * timeScale) {
   const reader = session.stream(0).getReader();

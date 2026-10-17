@@ -2782,7 +2782,19 @@ export async function createFxEngine(options = {}) {
     env: agentEnvironment(options),
     hostToolExecutor: executeHostTool,
     journalFlush: () => journalSettled(),
-    takeInputs: () => options[turnEndInputs]?.(),
+    // A cancel or deadline doesn't wait for this read, as it doesn't wait
+    // for a tool: a steer the read finds later becomes the next turn.
+    takeInputs: () => {
+      const turn = activeTurn;
+      const read = Promise.resolve().then(() => options[turnEndInputs]?.());
+      if (!isCurrentTurn(turn)) return read;
+      const controller = new AbortController();
+      turn.toolControllers.add(controller);
+      const aborted = new Promise((_, reject) => {
+        controller.signal.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), { once: true });
+      });
+      return Promise.race([read, aborted]).finally(() => turn.toolControllers.delete(controller));
+    },
     onTransportChunk(byteLength) {
       const turn = activeTurn;
       if (!isCurrentTurn(turn) || !Number.isSafeInteger(byteLength) || byteLength <= 0) return;

@@ -9,6 +9,7 @@ const context_contract = @import("core/workspace/context_contract.zig");
 const host = @import("core/hosts/host.zig");
 const host_attachments = @import("core/hosts/host_attachments.zig");
 const agent_checkpoint = @import("core/agent/runtime/checkpoint.zig");
+const request_image_budget = @import("core/agent/runtime/request_image_budget.zig");
 const io_mod = @import("core/shared/io.zig");
 const fetch_state = @import("napi_fetch_state.zig");
 const streamable_http = @import("core/mcp/streamable_http.zig");
@@ -30,10 +31,11 @@ const max_drain_bytes = 1024 * 1024;
 const max_input_bytes = 8 * 1024 * 1024;
 const max_output_bytes = 8 * 1024 * 1024;
 const max_output_message_bytes = 64 * 1024 * 1024;
-// One model request: the largest prompt libfx accepts, an 8 MiB frame and
-// 8 MiB of base64 images (`maxPromptFrameBytes` and `maxPromptImagesDataBytes`
-// in sdk/fx-sdk.js), with 8 MiB for instructions, tools and earlier turns.
-const max_fetch_request_bytes = 24 * 1024 * 1024;
+// One model request. History keeps every image, and the core leaves a
+// request's oldest images out to keep its body within
+// `request_image_budget.default_max_request_bytes`, so every request the core
+// sends fits, with 2 MiB more for its method, URL and headers.
+const max_fetch_request_bytes = request_image_budget.default_max_request_bytes + 2 * 1024 * 1024;
 const max_fetch_response_bytes = 8 * 1024 * 1024;
 // One attachment holds one prompt image, or one kernel checkpoint, journal
 // load or snapshot, the larger. The core bounds prompt images further when it

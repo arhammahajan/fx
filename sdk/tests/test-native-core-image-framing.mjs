@@ -16,10 +16,15 @@ const data = image.toString("base64");
 const images = [1, 2].map(() => ({ type: "image", mimeType: "image/png", data }));
 const result = { type: "libfx.tool-result", text: "two screenshots", images };
 assert.equal(Buffer.byteLength(JSON.stringify({ text: result.text, images })), 7_340_169);
+// The core's request budget, `default_max_request_bytes` in
+// src/core/agent/runtime/request_image_budget.zig.
+const requestBudget = 30 * 1024 * 1024;
 let requests = 0;
 let toolCalls = 0;
+let largestBody = 0;
+const imagesSent = [];
 let agent;
-const timer = setTimeout(() => assert.fail("native image framing timed out"), 10_000);
+const timer = setTimeout(() => assert.fail("native image framing timed out"), 60_000);
 const sse = (...events) => new Response(
   [...events.map((event) => `data: ${JSON.stringify(event)}\n\n`), "data: [DONE]\n\n"].join(""),
   { headers: { "content-type": "text/event-stream" } },
@@ -47,6 +52,11 @@ try {
         return Response.json({ object: "list", data: [{ id: "native/image-model", type: "language", tags: ["tool-use", "vision", "file-input"] }] });
       }
       requests += 1;
+      largestBody = Math.max(largestBody, init.body.length);
+      imagesSent.push(JSON.parse(Buffer.from(init.body).toString("utf8")).prompt
+        .filter((message) => message.role === "user" && Array.isArray(message.content))
+        .flatMap((message) => message.content)
+        .filter((part) => part.type === "file").length);
       // Each prompt calls the tool once, then answers with its images.
       if (requests % 2 === 1) return sse(
         { type: "tool-call", toolCallId: `images${requests}`, toolName: "screenshots", input: {} },
@@ -77,13 +87,16 @@ try {
   assert.equal(toolCalls, 1);
   assert.equal(requests, 2);
 
-  // The raw request budget, 24 MiB, holds the 21 MiB of images three such
-  // turns retain, and not those with this 4 MiB prompt as well.
-  for (const _ of [2, 3]) assert.equal((await agent.prompt("take screenshots").result).stopReason, "end_turn");
-  assert.equal(requests, 6);
-  await assert.rejects(agent.prompt("x".repeat(4 * 1024 * 1024)).result, /HostStreamBackpressure/);
-  assert.equal(requests, 6, "an oversized raw request must not reach host fetch");
-  console.log("native image framing passed: accepted images survive base64 framing; oversized raw requests stay bounded");
+  // History keeps every image: 7 MiB of them each turn. Once a request would
+  // pass the core's budget, the core leaves the oldest images out, and the
+  // native transport carries every request the core sends.
+  for (const _ of [2, 3, 4, 5]) assert.equal((await agent.prompt("take screenshots").result).stopReason, "end_turn");
+  assert.equal((await agent.prompt("x".repeat(4 * 1024 * 1024)).result).stopReason, "end_turn");
+  assert.equal(requests, 12);
+  assert.ok(largestBody <= requestBudget, `every request fits the core's budget: ${largestBody} bytes`);
+  assert.equal(imagesSent[7], 8, "the fourth turn's answer carries all eight images");
+  assert.ok(imagesSent[9] < 10 && imagesSent[11] < 12, `later requests leave the oldest images out: ${imagesSent}`);
+  console.log("native image framing passed: accepted images survive base64 framing; requests past the budget leave the oldest images out");
 } finally {
   clearTimeout(timer);
   await agent?.close();
