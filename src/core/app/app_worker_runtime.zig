@@ -95,7 +95,7 @@ pub const AssistantTextDrainResult = enum {
 /// recovery module's statuses live only in the status row and refresh every
 /// second, so they are never recorded.
 fn recordRouteRecoveryNotice(app: anytype, status: types.RouteRecoveryStatus) !void {
-    if (status.fromModule() or status.kind == .recovered) return;
+    if (status.fromModule() or status.kind == .recovered or status.kind == .failed) return;
     var body: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
     defer body.deinit();
     try writeRouteRecoveryBody(&body.writer, status);
@@ -1136,9 +1136,10 @@ pub fn Runtime(comptime App: type) type {
                             drain_owns_current = false;
                             break :events;
                         }
-                        // The TUI shows nothing for a recovery; the status
-                        // line returns to normal activity.
-                        if (status.kind == .recovered) {
+                        // The TUI shows nothing for how a request ended,
+                        // recovered or failed; the error itself arrives on
+                        // its own. The status line returns to normal activity.
+                        if (status.kind == .recovered or status.kind == .failed) {
                             _ = app.shell.worker_status_state().clear_route_recovery();
                         } else {
                             app.shell.worker_status_state().set_route_recovery(status);
@@ -2345,12 +2346,7 @@ fn tickNoop(app: *FakeApp) !void {
     try Runtime(FakeApp).tick(app, NoopBridge.handlers(app));
 }
 
-fn testRecoveryText(value: []const u8) @FieldType(types.RouteRecoveryStatus, "text") {
-    var text: @FieldType(types.RouteRecoveryStatus, "text") = .{};
-    @memcpy(text.bytes[0..value.len], value);
-    text.len = @intCast(value.len);
-    return text;
-}
+const testRecoveryText = types.testRecoveryText;
 
 fn testWaitingStatus(attempt: usize) types.RouteRecoveryStatus {
     return .{

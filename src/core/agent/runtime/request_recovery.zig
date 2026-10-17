@@ -15,6 +15,10 @@
 //!
 //! This change does not persist `Plan.save`: fx's recovery checkpoint still
 //! owns resume. `Plan.finish` has no record to delete for the same reason.
+//!
+//! The module retries every transient failure for as long as it lasts. Two
+//! failures may never heal, so fx bounds them here, outside the module: see
+//! `Repeating`.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -37,12 +41,51 @@ const ticker_interval_ns: i96 = if (builtin.is_test) 5 * std.time.ns_per_ms else
 /// The virtual boot clock tests start at.
 const test_epoch_ms: u64 = 1_000_000;
 
+/// The module's failure kind for each of fx's transient causes, and null for
+/// a cause that never reaches it. Every failure site in the turn loop reports
+/// through this.
+pub fn failureKind(cause: types.ModelRecoveryCause) ?Failure.Kind {
+    return switch (cause) {
+        // A path that is down sent nothing.
+        .connectivity_lost, .system_resumed => .offline,
+        // A connection that broke after connecting may have sent the request.
+        .network_interrupted, .response_interrupted, .provider_stream_timeout => .dropped,
+        .provider_unavailable => .server,
+        .rate_limited => .rate_limited,
+        .authentication, .request_limit_reached, .compaction_prepared => null,
+    };
+}
+
+/// Failures fx cannot tell apart from a fault that never heals: fx classifies
+/// what has a code and bounds what is unclear. std reports a certificate fx
+/// will never accept as the same `TlsInitializationFailed` as a passing setup
+/// failure, a stream that ends without a finish event may end that way every
+/// time, and a provider error with no code (`uncoded_error`) or no error event
+/// at all (`unexplained_error_finish`) says nothing about a resend. The module
+/// keeps retrying them, so fx stops the request itself when the same one ends
+/// `repeat_stop_sends` sends in a row.
+pub const Repeating = enum { tls_setup, missing_finish, uncoded_error, unexplained_error_finish };
+
+/// Sends in a row that the same `Repeating` failure may end, with no response
+/// progress between them, before fx stops the request.
+pub const repeat_stop_sends: u8 = 3;
+
 pub const RequestRecovery = struct {
     deps: *const runtime_deps.AgentRuntimeDeps,
     cancel_flag: *std.atomic.Value(bool),
     trace_ctx: debug_trace.TraceContext,
     /// Off in tests unless a test exercises the thread itself.
     ticker_enabled: bool = !builtin.is_test,
+
+    // Only the turn loop's thread touches these.
+    /// The `Repeating` failure that ended the latest sends, and how many in a
+    /// row.
+    repeating: ?Repeating = null,
+    repeat_sends: u8 = 0,
+    /// Response bytes the latest of them streamed.
+    repeat_progress_bytes: usize = 0,
+    /// The latest send's ending went to `repeatedFailure`.
+    repeat_noted: bool = false,
 
     mutex: std.Io.Mutex = .init,
     // Everything below is guarded by `mutex`.
@@ -76,8 +119,15 @@ pub const RequestRecovery = struct {
         return .{ .deps = deps, .cancel_flag = cancel_flag, .trace_ctx = trace_ctx };
     }
 
+    /// Every exit of the request ends here, so a module status the host still
+    /// shows is cleared and a retry warning never outlives its request
+    /// (`tests/tla/recovery/Recovery.tla` StatusHonest).
     pub fn deinit(self: *RequestRecovery) void {
         self.endSend();
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        self.clearShownLocked();
     }
 
     /// A new request. `fast` is the request's Fast selection, which makes
@@ -147,23 +197,75 @@ pub const RequestRecovery = struct {
     }
 
     /// fx's own terminal status replaces the module's on the host. Terminal
-    /// failures keep fx's handling and wording in this change.
+    /// failures keep fx's handling and wording in this change. The terminal
+    /// status is the request's result, so nothing reports over it.
     pub fn replaceStatus(self: *RequestRecovery, status: types.RouteRecoveryStatus) !void {
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         self.host_showing = false;
+        self.recovery_shown = false;
         try self.deps.push_route_recovery_status(self.deps.ctx, status);
     }
 
     /// The request ended on an error with no success, cancel, or terminal
-    /// status, for example before a resend reached the transport. Clears a
-    /// module status the host still shows, so a retry warning never outlives
-    /// its request (`tests/tla/recovery/Recovery.tla` StatusHonest).
-    pub fn abandon(self: *RequestRecovery) void {
+    /// status of fx's own, for example an HTTP error after a retry or a
+    /// resend that never reached the transport. After the host showed a
+    /// status, hosts that report a result get `failed`, which also clears the
+    /// TUI's status line; otherwise a module status still shown is cleared.
+    pub fn endWithError(self: *RequestRecovery) void {
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
+        if (!self.recovery_shown) return self.clearShownLocked();
+        self.recovery_shown = false;
+        self.host_showing = false;
+        self.deps.push_route_recovery_status(self.deps.ctx, .{
+            .kind = .failed,
+            .attempt = self.attempts,
+        }) catch |err| {
+            debug_trace.logf("recovery", "failed status publication failed err={s}", .{@errorName(err)});
+        };
+    }
+
+    /// Reports how a failed send ended: `failure` when it is a `Repeating`
+    /// failure and null for any other, with the response bytes the send
+    /// streamed. Returns true when the same failure has now ended
+    /// `repeat_stop_sends` sends in a row with no new response progress, and
+    /// fx stops the request. A send whose ending never reaches this, such as
+    /// an HTTP error or a success, breaks the run at the next `beginSend`.
+    pub fn repeatedFailure(self: *RequestRecovery, failure: ?Repeating, progress_bytes: usize) bool {
+        const class = failure orelse {
+            self.repeating = null;
+            return false;
+        };
+        self.repeat_noted = true;
+        const same = if (self.repeating) |previous|
+            previous == class and self.repeat_progress_bytes == progress_bytes
+        else
+            false;
+        if (same) {
+            self.repeat_sends +|= 1;
+        } else {
+            self.repeating = class;
+            self.repeat_sends = 1;
+            self.repeat_progress_bytes = progress_bytes;
+        }
+        if (self.repeat_sends < repeat_stop_sends) return false;
+        debug_trace.eventf("recovery", "repeated_failure_stop", self.trace_ctx, "failure={s} sends={d} progress_bytes={d}", .{
+            @tagName(class),
+            self.repeat_sends,
+            progress_bytes,
+        });
+        return true;
+    }
+
+    /// `repeatedFailure` stopped the request at its latest failure.
+    pub fn stoppedRepeating(self: *const RequestRecovery) bool {
+        return self.repeating != null and self.repeat_sends >= repeat_stop_sends;
+    }
+
+    fn clearShownLocked(self: *RequestRecovery) void {
         if (!self.host_showing) return;
         self.host_showing = false;
         self.deps.push_event(self.deps.ctx, .clear_route_recovery_status) catch |err| {
@@ -210,6 +312,9 @@ pub const RequestRecovery = struct {
     /// Single-threaded builds, such as wasm, tick from the transport's
     /// cooperative pulse on the turn loop's own thread instead.
     pub fn beginSend(self: *RequestRecovery) void {
+        // The previous send ended some other way than a `Repeating` failure.
+        if (!self.repeat_noted) self.repeating = null;
+        self.repeat_noted = false;
         if (comptime builtin.single_threaded) {
             self.next_beat_ms = self.nowMs() +| tick_ms;
             return;
@@ -567,4 +672,106 @@ test "the in-flight ticker keeps the retrying status counting" {
     const refreshed = fake.route_recovery_statuses.items[before];
     try std.testing.expectEqual(types.RouteRecoveryStatus.Kind.retrying, refreshed.kind);
     try std.testing.expectEqualStrings("Connection lost · retrying · attempt 2 · 2s", refreshed.text.slice());
+}
+
+test "the same repeating failure on three sends in a row stops the request" {
+    var fake = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
+    defer fake.deinit();
+    const deps = fake.deps();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+    defer request.deinit();
+
+    for (0..repeat_stop_sends - 1) |_| {
+        request.beginSend();
+        request.endSend();
+        try std.testing.expect(!request.repeatedFailure(.tls_setup, 0));
+        try std.testing.expect(!request.stoppedRepeating());
+    }
+    request.beginSend();
+    request.endSend();
+    try std.testing.expect(request.repeatedFailure(.tls_setup, 0));
+    try std.testing.expect(request.stoppedRepeating());
+}
+
+test "another ending or new response progress starts the repeat count over" {
+    var fake = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
+    defer fake.deinit();
+    const deps = fake.deps();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+    defer request.deinit();
+
+    const Ending = union(enum) { repeating: struct { Repeating, usize }, other_failure, unreported };
+    // Each run of the same failure at the same point stays under the stop.
+    const endings = [_]Ending{
+        .{ .repeating = .{ .missing_finish, 0 } },
+        .{ .repeating = .{ .missing_finish, 0 } },
+        // A send that ends some other way, such as an HTTP error.
+        .unreported,
+        .{ .repeating = .{ .missing_finish, 0 } },
+        .{ .repeating = .{ .missing_finish, 0 } },
+        .other_failure,
+        .{ .repeating = .{ .missing_finish, 0 } },
+        .{ .repeating = .{ .missing_finish, 0 } },
+        // The response got further this time.
+        .{ .repeating = .{ .missing_finish, 12 } },
+        .{ .repeating = .{ .missing_finish, 12 } },
+        .{ .repeating = .{ .tls_setup, 12 } },
+        .{ .repeating = .{ .tls_setup, 12 } },
+    };
+    for (endings) |ending| {
+        request.beginSend();
+        request.endSend();
+        switch (ending) {
+            .repeating => |failure| try std.testing.expect(!request.repeatedFailure(failure[0], failure[1])),
+            .other_failure => try std.testing.expect(!request.repeatedFailure(null, 0)),
+            .unreported => {},
+        }
+    }
+    try std.testing.expect(!request.stoppedRepeating());
+}
+
+test "an error after a status reports failed and every exit clears the status" {
+    var fake = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
+    defer fake.deinit();
+    const deps = fake.deps();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+
+    {
+        var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+        defer request.deinit();
+        try request.start(false);
+        try request.failed(.{ .kind = .server });
+        _ = (try request.waitForSend()).?;
+        request.endWithError();
+        const last = fake.route_recovery_statuses.items[fake.route_recovery_statuses.items.len - 1];
+        try std.testing.expectEqual(types.RouteRecoveryStatus.Kind.failed, last.kind);
+        try std.testing.expectEqual(@as(usize, 2), last.attempt);
+    }
+    // `failed` already ended the status, so the exit adds no clear.
+    try std.testing.expectEqual(@as(usize, 0), fake.route_recovery_clear_count);
+
+    const shown = fake.route_recovery_statuses.items.len;
+    {
+        var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+        defer request.deinit();
+        try request.start(false);
+        try request.failed(.{ .kind = .dropped });
+        // fx's terminal status reports the result itself.
+        try request.replaceStatus(.{ .kind = .terminal_provider_error, .attempt = 1 });
+        request.endWithError();
+    }
+    try std.testing.expectEqual(shown + 2, fake.route_recovery_statuses.items.len);
+    try std.testing.expectEqual(@as(usize, 0), fake.route_recovery_clear_count);
+
+    {
+        // A request that leaves without an error, such as a compaction handoff,
+        // clears the status it still shows.
+        var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+        defer request.deinit();
+        try request.start(false);
+        try request.failed(.{ .kind = .dropped });
+    }
+    try std.testing.expectEqual(@as(usize, 1), fake.route_recovery_clear_count);
 }

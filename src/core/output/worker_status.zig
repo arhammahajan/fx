@@ -135,12 +135,7 @@ fn store_label(buffer: []u8, len: *usize, label: []const u8) void {
     len.* = label.len;
 }
 
-fn testText(value: []const u8) @FieldType(types.RouteRecoveryStatus, "text") {
-    var text: @FieldType(types.RouteRecoveryStatus, "text") = .{};
-    @memcpy(text.bytes[0..value.len], value);
-    text.len = @intCast(value.len);
-    return text;
-}
+const testText = types.testRecoveryText;
 
 fn expectLabel(state: *const State, label: []const u8, short: ?[]const u8, tone: activity_runtime.ActivityProjection.Tone) !void {
     switch (state.projection().?) {

@@ -3671,8 +3671,9 @@ fn pushRouteRecoveryStatus(raw_ctx: *anyopaque, status: types.RouteRecoveryStatu
             ctx.last_recovery_notice_kind = status.kind;
             break :notice changed and ctx.output_mode != .quiet;
         },
-        // The success itself is the notice; --json reports the recovery.
-        .recovered => false,
+        // The success or the error itself is the notice; --json reports how
+        // the request ended.
+        .recovered, .failed => false,
         .terminal_provider_error => true,
         .unsafe_assistant_output,
         .unsafe_tool_start,
@@ -4411,19 +4412,8 @@ fn renderFinalJsonResult(alloc: Allocator, result: PromptRunResult) ![]u8 {
     }
     if (result.recovery) |recovery| {
         var label_buf: [types.RouteRecoveryStatus.label_max_bytes]u8 = undefined;
-        try out.writer.writeAll(",\"recovery\":{\"state\":");
-        try std.json.Stringify.value(recovery.reportedState(), .{}, &out.writer);
-        try out.writer.print(",\"attempt\":{d}", .{recovery.attempt});
-        if (recovery.need) |need| {
-            try out.writer.writeAll(",\"need\":");
-            try std.json.Stringify.value(@tagName(need), .{}, &out.writer);
-        }
-        // A success reports only the attempt that succeeded.
-        if (recovery.kind != .recovered) {
-            try out.writer.writeAll(",\"message\":");
-            try std.json.Stringify.value(recovery.label(&label_buf), .{}, &out.writer);
-        }
-        try out.writer.writeAll("}");
+        try out.writer.writeAll(",\"recovery\":");
+        try recovery.report(&label_buf).writeJson(&out.writer);
     }
     try out.writer.writeAll("}\n");
     return try out.toOwnedSlice();
@@ -4761,12 +4751,7 @@ fn testProcessQueuedPromptRecoveryLifecycle(_: *agent_runtime.Agent, deps: *cons
     try testPushAssistantText(deps, "assistant text");
 }
 
-fn testRecoveryText(value: []const u8) @FieldType(types.RouteRecoveryStatus, "text") {
-    var text: @FieldType(types.RouteRecoveryStatus, "text") = .{};
-    @memcpy(text.bytes[0..value.len], value);
-    text.len = @intCast(value.len);
-    return text;
-}
+const testRecoveryText = types.testRecoveryText;
 
 fn testProcessQueuedPromptRetryAdmissionFailure(_: *agent_runtime.Agent, deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, _: agent_runtime.Config, _: worker_runtime.QueuedPrompt) !void {
     try std.testing.expect(semantic_presentation == null);

@@ -8,6 +8,7 @@ const permissions = @import("../../../permissions/permissions.zig");
 const worker_runtime = @import("../../worker_runtime.zig");
 const builtin_context = @import("../../../../builtins/context.zig");
 const builtin_gateway = @import("../../../../builtins/gateway.zig");
+const gateway_client = @import("../../../../gateway/client.zig");
 const builtin_tools = @import("../../../../builtins/tools.zig");
 const session_runtime = @import("../../../session/session.zig");
 const session_codec = @import("../../../session/session_codec.zig");
@@ -369,42 +370,16 @@ pub const FakeGateway = struct {
         } };
     }
 
+    /// The production classification, recorded as `src/builtins/gateway.zig`
+    /// records it for the real gateway.
     fn recordNetworkFailureEvidence(
         request: agent_stream_provider.ModelRequest,
         err: anyerror,
     ) void {
-        // Mirrors `networkFailureEvidence` in src/gateway/client.zig: a path
-        // that is down is `connectivity_lost`, a broken connection is
-        // `transport_interrupted`.
-        const cause: agent_stream_provider.NetworkFailureCause = if (err == error.SystemResumed)
-            .system_resumed
-        else if (err == error.UnknownHostName or
-            err == error.NameServerFailure or
-            err == error.NoAddressReturned or
-            err == error.DetectingNetworkConfigurationFailed or
-            err == error.AddressUnavailable or
-            err == error.ConnectionRefused or
-            err == error.ConnectionTimedOut or
-            err == error.HostUnreachable or
-            err == error.NetworkUnreachable or
-            err == error.NetworkDown)
-            .connectivity_lost
-        else if (err == error.TlsInitializationFailed or
-            err == error.ConnectionSetupTimedOut or
-            err == error.ConnectionPending or
-            err == error.WouldBlock or
-            err == error.WriteFailed or
-            err == error.ReadFailed or
-            err == error.HttpConnectionClosing or
-            err == error.ConnectionResetByPeer or
-            err == error.Timeout)
-            .transport_interrupted
-        else
-            return;
-        request.attempt_evidence.network_failure = .{
-            .cause = cause,
-            .delivery = request.delivery.load(),
-        };
+        request.attempt_evidence.network_failure = gateway_client.networkFailureEvidence(
+            err,
+            request.delivery.load(),
+        );
     }
 
     fn failureKind(status: std.http.Status) agent_stream_provider.FailureKind {

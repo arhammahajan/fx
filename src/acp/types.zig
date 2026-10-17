@@ -58,11 +58,7 @@ pub fn writeModelRecoveryInfoUpdate(
         return;
     };
     var label_buf: [core_types.RouteRecoveryStatus.label_max_bytes]u8 = undefined;
-    try writeModelRecoveryObject(writer, recovery.reportedState(), recovery.attempt, recovery.need, switch (recovery.kind) {
-        // A success reports only the attempt that succeeded.
-        .recovered => null,
-        else => recovery.label(&label_buf),
-    });
+    try recovery.report(&label_buf).writeJson(writer);
     try writer.writeAll("}}}");
 }
 
@@ -70,30 +66,12 @@ pub fn writeModelRecoveryInfoUpdate(
 /// load replays.
 pub fn writeInterruptedModelRecoveryInfoUpdate(writer: *std.Io.Writer, attempt: usize) !void {
     try writer.writeAll(model_recovery_update_prefix);
-    try writeModelRecoveryObject(writer, .interrupted, attempt, null, interrupted_turn_message);
+    try (core_types.RouteRecoveryStatus.Report{
+        .state = .interrupted,
+        .attempt = attempt,
+        .message = interrupted_turn_message,
+    }).writeJson(writer);
     try writer.writeAll("}}}");
-}
-
-/// `need` keeps the module's snake_case tags, as `fx ask --json` does.
-fn writeModelRecoveryObject(
-    writer: *std.Io.Writer,
-    state: core_types.RouteRecoveryStatus.ReportedState,
-    attempt: usize,
-    need: @FieldType(core_types.RouteRecoveryStatus, "need"),
-    message: ?[]const u8,
-) !void {
-    try writer.writeAll("{\"state\":");
-    try writeJsonStr(@tagName(state), writer);
-    try writer.print(",\"attempt\":{d}", .{attempt});
-    if (need) |value| {
-        try writer.writeAll(",\"need\":");
-        try writeJsonStr(@tagName(value), writer);
-    }
-    if (message) |text| {
-        try writer.writeAll(",\"message\":");
-        try writeJsonStr(text, writer);
-    }
-    try writer.writeByte('}');
 }
 
 pub const StopReason = enum {
@@ -644,58 +622,21 @@ test "writeSessionUpdate wraps update with sessionId" {
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"sessionUpdate\":\"test\"") != null);
 }
 
-fn testRecoveryText(value: []const u8) @FieldType(core_types.RouteRecoveryStatus, "text") {
-    var text: @FieldType(core_types.RouteRecoveryStatus, "text") = .{};
-    @memcpy(text.bytes[0..value.len], value);
-    text.len = @intCast(value.len);
-    return text;
-}
-
-test "model recovery info update takes the module shape and is clearable" {
+test "model recovery info update wraps the shared report and is clearable" {
+    // The report's shape is `types.zig` "recovery reports write the shape fx
+    // ask and ACP share"; this pins the ACP envelope around it.
     const alloc = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try writeModelRecoveryInfoUpdate(&out.writer, .{
         .kind = .waiting,
-        .text = testRecoveryText("Gateway error · next try in 8s · attempt 4 · 1m 12s"),
+        .text = core_types.testRecoveryText("Gateway error · next try in 8s · attempt 4 · 1m 12s"),
         .attempt = 4,
     });
     try std.testing.expectEqualStrings(
         "{\"sessionUpdate\":\"session_info_update\",\"_meta\":{\"fx\":{\"modelResponseRecovery\":{\"state\":\"waiting\",\"attempt\":4,\"message\":\"Gateway error · next try in 8s · attempt 4 · 1m 12s\"}}}}",
         out.writer.buffered(),
     );
-
-    out.writer.end = 0;
-    try writeModelRecoveryInfoUpdate(&out.writer, .{
-        .kind = .need_user,
-        .need = .content_filter,
-        .text = testRecoveryText("Blocked by the content filter · press Esc and rephrase"),
-        .attempt = 2,
-    });
-    try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"state\":\"need_user\"") != null);
-    try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"need\":\"content_filter\"") != null);
-
-    out.writer.end = 0;
-    try writeModelRecoveryInfoUpdate(&out.writer, .{
-        .kind = .recovered,
-        .attempt = 5,
-    });
-    // `recovered` carries no message, and `need` is omitted unless set.
-    try std.testing.expectEqualStrings(
-        "{\"sessionUpdate\":\"session_info_update\",\"_meta\":{\"fx\":{\"modelResponseRecovery\":{\"state\":\"recovered\",\"attempt\":5}}}}",
-        out.writer.buffered(),
-    );
-
-    out.writer.end = 0;
-    try writeModelRecoveryInfoUpdate(&out.writer, .{
-        .kind = .terminal_provider_error,
-        .attempt = 4,
-        .cause = .system_resumed,
-        .diagnostic = core_types.ModelFailureDiagnostic.init("ConnectionResetByPeer"),
-    });
-    try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"state\":\"failed\"") != null);
-    try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "connection reset") != null);
-    try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "durable") == null);
 
     out.writer.end = 0;
     try writeModelRecoveryInfoUpdate(&out.writer, null);

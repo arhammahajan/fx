@@ -10036,6 +10036,147 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   });
 
+  test("an invalid request error event ends fx ask after one request", async () => {
+    const root = createFixtureRoot("invalid-request-event");
+    const tracePath = join(root.root, "trace.log");
+    const gateway = startGateway(() =>
+      sse(
+        `data: ${JSON.stringify({
+          type: "error",
+          error: { code: "invalid_request_error", message: "INVALID_FIXTURE_REQUEST" },
+        })}\n\n` +
+          'data: {"type":"finish","finishReason":{"unified":"error"}}\n\n' +
+          "data: [DONE]\n\n",
+      )
+    );
+    try {
+      const started = Date.now();
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Return the fixture response."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+
+      // A resend would repeat the same request, so the turn ends at once.
+      expect(result.code).toBe(1);
+      expect(parseAskJson(result.stdout).exit_code).toBe(1);
+      expect(gateway.requestCount()).toBe(1);
+      expect(Date.now() - started).toBeLessThan(10_000);
+      expect(result.stderr).toContain("invalid_request_error: INVALID_FIXTURE_REQUEST");
+      expect(result.stderr).not.toContain("next try in");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  test("a non-retryable error code without a finish ends fx ask after one request", async () => {
+    const root = createFixtureRoot("invalid-request-no-finish");
+    const tracePath = join(root.root, "trace.log");
+    const gateway = startGateway(() =>
+      sse(
+        `data: ${JSON.stringify({
+          type: "error",
+          error: { code: "invalid_request_error", message: "INVALID_WITHOUT_FINISH" },
+        })}\n\n` + "data: [DONE]\n\n",
+      )
+    );
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Return the fixture response."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+
+      // The code wins over the missing finish: the turn ends on its notice.
+      expect(result.code).toBe(1);
+      expect(parseAskJson(result.stdout).exit_code).toBe(1);
+      expect(gateway.requestCount()).toBe(1);
+      expect(result.stderr).toContain("invalid_request_error: INVALID_WITHOUT_FINISH");
+      expect(result.stderr).not.toContain("next try in");
+      expect(result.stderr).not.toContain("kept failing");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  test("a stream that never finishes stops fx ask after three requests", async () => {
+    // Restores the coverage of the old no-progress stop, now fx's own bound
+    // on a failure that may never heal.
+    const root = createFixtureRoot("never-finishes");
+    const tracePath = join(root.root, "trace.log");
+    const gateway = startGateway(() => sse("data: [DONE]\n\n"));
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Return the fixture response."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...fixtureEnv(root, gateway, tracePath),
+            FX_TRACE_SCOPES: "agent,core,gateway,stream,recovery",
+          },
+          timeoutMs: 20_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+      const trace = readFileSync(tracePath, "utf8");
+      const stop = "⚠ Response ended early · stream interrupted · kept failing at the same point · stopped";
+
+      expect(result.code).toBe(1);
+      expect(json.exit_code).toBe(1);
+      expect(gateway.requestCount()).toBe(3);
+      expect(json.recovery).toEqual({ state: "failed", attempt: 3, message: stop });
+      expect(result.stderr).toContain(stop);
+      expect(trace).toContain("termination cause=done_without_finish");
+      expect(trace).toContain("event=repeated_failure_stop");
+      expect(trace).toContain("failure=missing_finish sends=3");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("an HTTP error after a retry reports the request failed", async () => {
+    const root = createFixtureRoot("retry-then-bad-request");
+    const tracePath = join(root.root, "trace.log");
+    let requestIndex = 0;
+    const gateway = startGateway(() =>
+      requestIndex++ === 0
+        ? unavailableResponse("1")
+        : new Response(JSON.stringify({ error: { message: "bad request body" } }), {
+            status: 400,
+            headers: { "content-type": "application/json" },
+          })
+    );
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Return the fixture response."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+
+      expect(result.code).toBe(1);
+      expect(gateway.requestCount()).toBe(2);
+      // Not the `retrying` the request showed before the error.
+      expect(json.recovery).toEqual({ state: "failed", attempt: 2 });
+      expect(result.stderr).toContain("bad request body");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 20_000);
+
   test("missing provider finish recovers across framing and content variants", async () => {
     const cases = [
       {
