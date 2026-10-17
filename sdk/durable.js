@@ -1459,7 +1459,15 @@ function uiWriter(log, onError, epoch) {
 // settings, from the input that started it or from the open turn.
 const runOf = (input) => ({ context: input?.context ?? null, settings: input?.settings ?? null });
 
-const errorSummary = (error) => ({ name: error?.name ?? "Error", message: String(error?.message ?? error), ...(error?.code ? { code: error.code } : {}) });
+// An unsupported model setting's error also names the model and the setting,
+// as the error an engine rejects with does.
+const errorSummary = (error) => ({
+  name: error?.name ?? "Error",
+  message: String(error?.message ?? error),
+  ...(error?.code ? { code: error.code } : {}),
+  ...(typeof error?.model === "string" ? { model: error.model } : {}),
+  ...(typeof error?.capability === "string" ? { capability: error.capability } : {}),
+});
 // The harness contract: a fenced write rejects with this code.
 const isFenced = (error) => error?.code === "FX_FENCED";
 

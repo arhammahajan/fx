@@ -30,6 +30,10 @@ export interface FxErrorSummary {
   name: string;
   message: string;
   code?: string | number;
+  /** For an unsupported model setting: the model. */
+  model?: string;
+  /** For an unsupported model setting: `effort`, `fast`, or `ultrafast`. */
+  capability?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -318,6 +322,8 @@ export type FxEngineEvent = FxEventBase & (
   | { type: "checkpoint.mismatch"; sessionId: string; changed: Array<keyof FxCheckpointMeta>; saved: unknown; current: FxCheckpointMeta }
   | { type: "output.backpressure"; bufferedBytes: number; bufferedEvents: number }
   | { type: "output.discarded"; reason: "cancelled"; bytes: number }
+  /** A notice fx gives beside a turn's reply, such as an Ultrafast tier the provider did not confirm. It is never part of the reply. */
+  | { type: "turn.notice"; sessionId: string; text: string }
 );
 
 /** A durable session's diagnostic: a failed write or engine, a takeover, or a function deadline; or, in development, a replaced agent. */
@@ -585,6 +591,8 @@ export interface FxResumeOptions {
 export interface FxEngineTurnResult {
   stopReason: FxStopReason;
   usage: FxUsage;
+  /** With `refused`: the provider's error. */
+  error?: FxErrorSummary;
 }
 
 /** A steer: resolves to `{ id }` once accepted, and carries the same `id` at once. */

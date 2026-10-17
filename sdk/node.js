@@ -711,8 +711,11 @@ async function createWithFallback(surface, nativeMethod, wasmFactory, defaultWas
       } catch (error) {
         nativeError = error;
         overLimit = surface === "agent" && nativeLimit(error);
+        // WebAssembly reads the same catalog, so it would refuse the model
+        // setting too.
         if (!overLimit && (backend === "native" || error?.code === "LIBFX_MODEL_UNSUPPORTED_FAST" ||
           error?.code === "LIBFX_MODEL_UNSUPPORTED_EFFORT" ||
+          error?.code === "LIBFX_MODEL_UNSUPPORTED_ULTRAFAST" ||
           typeof error?.code === "string" && error.code.startsWith("LIBFX_MODEL_METADATA_"))) throw error;
       }
     }

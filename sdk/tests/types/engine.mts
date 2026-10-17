@@ -80,6 +80,7 @@ export async function engine(): Promise<FxEngine> {
   const result = await turn.result;
   assertType<Equal<typeof result, FxEngineTurnResult>>();
   assertType<Equal<typeof result.stopReason, "end_turn" | "max_output_tokens" | "max_model_turns" | "refused" | "cancelled" | "yielded">>();
+  if (result.stopReason === "refused") console.log(result.error?.message);
 
   agent.prompt([
     { type: "text", text: "What does this screenshot show?" },
@@ -264,6 +265,7 @@ export async function events(): Promise<void> {
         assertType<Equal<typeof event.skipped, "too_large" | "too_many_turns" | "invalid" | undefined>>();
       }
       if (event.type === "journal.error") console.log(event.error);
+      if (event.type === "turn.notice") assertType<Equal<typeof event.text, string>>();
       // @ts-expect-error session events come from createFxAgent(), not an engine
       if (event.type === "session.error") console.log(event);
     },

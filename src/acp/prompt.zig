@@ -176,6 +176,8 @@ test "a libfx prompt holds at most its limit of images and image bytes" {
     try std.testing.expect(!fitsLibfxPrompt(&over));
 }
 
+const content_filter_failure_message = "The provider's content filter stopped the response; rephrase the prompt or choose another model";
+
 fn promptExecutionFailure(err: anyerror) anyerror!TerminalOutcome {
     return switch (err) {
         error.ModelImageCapabilityUnavailable,
@@ -265,6 +267,8 @@ const AcpContext = struct {
     message_id: acp_types.MessageIdBuffer = undefined,
     message_kind: ?AgentMessageKind = null,
     stop_reason: acp_types.StopReason = .end_turn,
+    /// The provider's content filter stopped a response of this turn.
+    content_filtered: bool = false,
     auto_classifier: permission_auto_classifier.Classifier =
         permission_auto_classifier.Classifier.disabled(),
     /// Mode and permission policy captured at prompt dispatch so mid-turn
@@ -355,15 +359,23 @@ const AcpContext = struct {
     }
 
     /// A notice the client shows outside the conversation (ACP v1).
-    fn sendNotice(self: *AcpContext, text: []const u8) !void {
+    fn sendNotice(self: *AcpContext, severity: []const u8, text: []const u8) !void {
         const plain = try stripAnsiAlloc(self.alloc, text);
         defer if (plain.ptr != text.ptr) self.alloc.free(plain);
         // The tag is for the model; a notice's title stands alone.
         const title = std.mem.trimStart(u8, std.mem.cutPrefix(u8, plain, "[context]") orelse plain, " ");
         var out: std.Io.Writer.Allocating = .init(self.alloc);
         defer out.deinit();
-        try acp_types.writeNotice(&out.writer, "info", if (title.len > 0) title else plain);
+        try acp_types.writeNotice(&out.writer, severity, if (title.len > 0) title else plain);
         try self.sendUpdate(out.writer.buffered());
+    }
+
+    /// Text fx adds beside a libfx turn's reply. A libfx host streams the
+    /// reply as the model wrote it, so the text goes as a notice instead; a
+    /// blank separator is dropped (API-48).
+    fn sendLibfxNotice(self: *AcpContext, text: []const u8) !void {
+        const trimmed = std.mem.trim(u8, text, " \t\r\n");
+        if (trimmed.len > 0) try self.sendNotice("info", trimmed);
     }
 
     fn sendModelRecoveryStatus(
@@ -1280,6 +1292,11 @@ pub fn handlePrompt(
             endJournalTurn(alloc, state.alloc, session, journal_failed_stop_reason) catch |end_err| {
                 debug_trace.logf("session", "event=libfx_journal_turn_end_failed err={s} turn_err={s}", .{ @errorName(end_err), @errorName(err) });
             };
+            // A libfx host shows this message as the turn's error (QUAL-18).
+            if (err == error.ModelError and ctx.content_filtered and state.cfg.minimal_kernel) return .{ .rpc_error = .{
+                .code = ErrorCode.internal_error,
+                .message = content_filter_failure_message,
+            } };
             return promptExecutionFailure(err);
         }
     };
@@ -3423,11 +3440,13 @@ fn pushRouteRecoveryStatus(
     status: types.RouteRecoveryStatus,
 ) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    if (status.kind == .content_filter) ctx.content_filtered = true;
     try ctx.sendModelRecoveryStatus(status);
 }
 
 fn pushText(raw_ctx: *anyopaque, emission: agent_runtime.TextEmission) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    if (emission == .operational and ctx.state.cfg.minimal_kernel) return ctx.sendLibfxNotice(emission.operational) catch {};
     const text, const message_id = switch (emission) {
         .assistant_started => {
             ctx.message_kind = null;
@@ -3491,6 +3510,7 @@ fn pushToolLifecycle(raw_ctx: *anyopaque, event: types.ToolLifecycleEvent) !void
 
 fn pushSystemNotice(raw_ctx: *anyopaque, text: []const u8) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    if (ctx.state.cfg.minimal_kernel) return ctx.sendLibfxNotice(text) catch {};
     ctx.sendAgentText(ctx.operationalMessageId(), text) catch {};
 }
 
@@ -3500,7 +3520,7 @@ fn pushContextNotice(raw_ctx: *anyopaque, text: []const u8) !void {
     if (!try session.session_rt.claimContextNotice(ctx.alloc, text)) return;
     // ACP v1 Session Notices where the client shows them;
     // otherwise a message, as ACP allows.
-    if (ctx.state.client_notices) return ctx.sendNotice(text) catch {};
+    if (ctx.state.client_notices) return ctx.sendNotice("info", text) catch {};
     try pushSystemNotice(raw_ctx, text);
 }
 
@@ -3520,11 +3540,48 @@ fn pushHttpError(raw_ctx: *anyopaque, status: std.http.Status, detail: []const u
     else
         null;
     defer if (owned_message) |message| ctx.alloc.free(message);
+    if (ctx.state.cfg.minimal_kernel) {
+        // The provider's error is why a libfx turn ends refused: its host
+        // reports it in the turn's result, not as reply text. A rejection of
+        // credentials the host adds keeps the server's body, which reached
+        // the core with them masked; any other stays detail-free.
+        const host_masked = if (credential_source) |source| source == .host_managed else false;
+        const shown = if (owned_message != null and !host_masked) "" else detail;
+        const message = try libfxHttpErrorText(ctx.alloc, status, shown, owned_message);
+        defer ctx.alloc.free(message);
+        return ctx.sendNotice("error", message) catch {};
+    }
     const msg = owned_message orelse if (detail.len > 0)
         std.mem.print(&buf, "HTTP {d}: {s}", .{ @backingInt(status), detail }) catch "HTTP error"
     else
         std.mem.print(&buf, "HTTP {d}", .{@backingInt(status)}) catch "HTTP error";
     ctx.sendAgentText(ctx.operationalMessageId(), msg) catch {};
+}
+
+/// A provider's HTTP error as a libfx turn reports it: the server's own body
+/// after the status, behind fx's reading of an authentication failure when
+/// there is one. Caller owns the result.
+fn libfxHttpErrorText(alloc: Allocator, status: std.http.Status, detail: []const u8, auth_text: ?[]const u8) ![]u8 {
+    const code = @backingInt(status);
+    if (auth_text) |text| {
+        if (detail.len == 0) return alloc.dupe(u8, text);
+        return alloc.print("{s}: {s}", .{ text, detail });
+    }
+    if (detail.len == 0) return alloc.print("HTTP {d}", .{code});
+    return alloc.print("HTTP {d}: {s}", .{ code, detail });
+}
+
+test "a libfx turn's HTTP error keeps the server's own message" {
+    const alloc = std.testing.allocator;
+    const plain = try libfxHttpErrorText(alloc, .bad_request, "{\"error\":{\"message\":\"bad\"}}", null);
+    defer alloc.free(plain);
+    try std.testing.expectEqualStrings("HTTP 400: {\"error\":{\"message\":\"bad\"}}", plain);
+    const auth = try libfxHttpErrorText(alloc, .unauthorized, "invalid api key", "host managed authentication failed · HTTP 401");
+    defer alloc.free(auth);
+    try std.testing.expectEqualStrings("host managed authentication failed · HTTP 401: invalid api key", auth);
+    const bare = try libfxHttpErrorText(alloc, .too_many_requests, "", null);
+    defer alloc.free(bare);
+    try std.testing.expectEqualStrings("HTTP 429", bare);
 }
 
 fn formatToolExecutionError(_: *anyopaque, arena: Allocator, tool_name: []const u8, err: anyerror) ![]const u8 {

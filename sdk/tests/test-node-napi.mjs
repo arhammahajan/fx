@@ -38,6 +38,7 @@ const scripts = [
   "test-agent-step-limit.mjs",
   "test-agent-effort.mjs",
   "test-agent-fast.mjs",
+  "test-agent-ultrafast-options.mjs",
   "test-agent-images.mjs",
   "test-agent-tool-start.mjs",
   "test-agent-reserved-tool-names.mjs",
@@ -48,6 +49,8 @@ const scripts = [
 for (const script of scripts) {
   const args = [fileURLToPath(new URL(script, import.meta.url))];
   if (script === "test-native-core-workers.mjs") args.unshift("--expose-gc");
+  // So that backend auto could fall back to WebAssembly.
+  if (script === "test-agent-ultrafast-options.mjs") args.unshift("--experimental-wasm-jspi");
   const result = spawnSync(process.execPath, args, {
     cwd: repoRoot,
     stdio: "inherit",

@@ -76,7 +76,7 @@ A turn's result says how it ended:
 const { stopReason, usage, error } = await turn.result;
 ```
 
-`stopReason` is `end_turn`, `max_output_tokens`, `max_model_turns`, `refused` or `cancelled`. It's `error` when the turn failed, with the reason in `error`. The record that ends a turn says how it ended, so a turn whose process stopped right after that record still reports it. Only a turn an earlier libfx ended reports `unknown`, since its record doesn't say.
+`stopReason` is `end_turn`, `max_output_tokens`, `max_model_turns`, `refused` or `cancelled`. It's `error` when the turn failed, with the reason in `error`. The record that ends a turn says how it ended, so a turn whose process stopped right after that record still reports it. Only a turn an earlier libfx ended reports `unknown`, since its record doesn't say. A turn the provider refused has the provider's error in `error` too. A cancelled turn ends every tool call it started with a `tool_end`.
 
 ### Streaming to a browser
 
@@ -414,7 +414,7 @@ A session stores each prompt as JSON before it runs, so a session prompt takes i
 
 ## Diagnostics
 
-`onEvent` receives diagnostics apart from the model's output: request timing and retries, and session events such as `session.deadline` when a turn stops for a function's time limit. The `FxAgentEvent` type lists them all.
+`onEvent` receives diagnostics apart from the model's output: request timing and retries, notices fx gives beside a reply as `turn.notice`, such as an Ultrafast tier the provider didn't confirm, and session events such as `session.deadline` when a turn stops for a function's time limit. The `FxAgentEvent` type lists them all.
 
 ## Instrumentation hooks
 

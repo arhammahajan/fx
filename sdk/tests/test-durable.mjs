@@ -1752,6 +1752,29 @@ test("cancel stops the running turn; dropping its view does not", async () => {
   await agent.close();
 });
 
+test("a cancel while a tool runs ends the call the turn showed: its tool_start gets a tool_end", async () => {
+  const agent = createFxAgent(agentOptions(await durabilityFor()));
+  const held = gate("lookup");
+  const session = agent.session();
+  const turn = session.prompt("use lookup while it is cancelled");
+  const events = [];
+  const reading = (async () => { for await (const event of turn) events.push(event); })();
+  await held.started;
+  await session.cancel();
+  await reading;
+  held.open();
+  gates.delete("lookup");
+  assert.equal((await turn.result).stopReason, "cancelled");
+  // A UI closes every call it opened (API-48), with the core's own result.
+  const starts = events.filter((event) => event.type === "tool_start");
+  const ends = events.filter((event) => event.type === "tool_end");
+  assert.equal(starts.length, 1, JSON.stringify(events));
+  assert.deepEqual(ends.map((event) => event.id), starts.map((event) => event.id), JSON.stringify(events));
+  assert.equal(ends[0].isError, true);
+  assert.match(ends[0].content ?? "", /Cancelled/);
+  await agent.close();
+});
+
 test("a turn's end saves a checkpoint once the records since the last reach 64 KiB, and the next turn starts from it", async () => {
   const saves = [];
   const opens = [];

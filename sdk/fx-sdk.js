@@ -2,7 +2,7 @@ import { CoreOutput, maxCoreMessageBytes } from "./core-output.js";
 import { codexSubscription } from "./chatgpt.js";
 import { customProviderDefinition, customProviderSpec } from "./custom-provider.js";
 import { grokSubscription } from "./grok.js";
-import { createSubscriptionAuthorizer, credentialMemory } from "./subscription.js";
+import { createSubscriptionAuthorizer, credentialMemory, refreshFailed } from "./subscription.js";
 import { loadModule } from "./wasm-module.js";
 import { toolObservation } from "./tool-observation.js";
 
@@ -2308,6 +2308,9 @@ function normalizeHostTools(value) {
       throw new TypeError(`tool ${name} providerExecuted must be a boolean`);
     }
     if (providerExecuted === true) {
+      if (name !== "web_search") {
+        throw new TypeError(`provider tool ${name} is not supported: web_search is the only provider tool, so define ${name} as a host tool with execute() instead`);
+      }
       if (execute !== undefined) throw new TypeError(`provider-executed tool ${name} must not define execute()`);
       descriptors.push({ name, providerExecuted: true });
       continue;
@@ -2824,7 +2827,7 @@ export async function createFxEngine(options = {}) {
   const hostFetch = options.fetch ?? globalThis.fetch?.bind(globalThis);
   // Adds the host's credentials to the provider's own requests.
   const providerAuth = subscriptionProviders.has(options.provider)
-    ? createSubscriptionAuthorizer([codexSubscription, grokSubscription], { credentials: options.credentials, onCredentials: options.onCredentials, refreshLock: options.refreshLock, fetch: hostFetch, memory: options[credentialMemory] })
+    ? createSubscriptionAuthorizer([codexSubscription, grokSubscription], { credentials: options.credentials, onCredentials: options.onCredentials, refreshLock: options.refreshLock, fetch: hostFetch, memory: options[credentialMemory], sessionId: () => sessionId ?? undefined })
     : options.customProvider && options.credentials
       ? createSubscriptionAuthorizer([customProviderSpec(options.customProvider, () => sessionId)], { credentials: options.credentials, fetch: hostFetch })
       : null;
@@ -2875,6 +2878,7 @@ export async function createFxEngine(options = {}) {
         const response = spec
           ? await providerAuth.fetch(spec, endpoint, hostFetch, input, init)
           : await hostFetch(input, init);
+        if (spec && activeTurn) activeTurn.refreshError = null;
         const headers = response.headers;
         emit("transport.response", {
           attempt,
@@ -2891,6 +2895,12 @@ export async function createFxEngine(options = {}) {
         const elapsedMs = performance.now() - startedAt;
         emit("transport.error", { attempt, elapsedMs, error: errorName });
         if (init.signal?.aborted) throw new DOMException("Aborted", "AbortError");
+        // A failed refresh may have spent the refresh token, so the request
+        // is not sent again; the turn it fails reports why.
+        if (error?.[refreshFailed]) {
+          if (activeTurn) activeTurn.refreshError = error;
+          throw error;
+        }
         if (attemptIndex === 1) throw error;
         emit("transport.retry", {
           attempt,
@@ -3524,6 +3534,8 @@ export async function createFxEngine(options = {}) {
   function normalizeTurn(rawTurn, answered = []) {
     const toolNames = new Map();
     const started = new Set();
+    const ended = new Set();
+    let handoff = false;
     const eventFor = (update) => {
       if (update.sessionUpdate === "agent_message_chunk") {
         const delta = update.content?.text;
@@ -3553,6 +3565,7 @@ export async function createFxEngine(options = {}) {
       if (update.sessionUpdate === "tool_call_update" &&
         (update.status === "completed" || update.status === "failed")) {
         const content = update.content?.find((entry) => entry.content?.type === "text")?.content?.text;
+        ended.add(update.toolCallId);
         return {
           type: "tool_end",
           id: update.toolCallId,
@@ -3566,11 +3579,15 @@ export async function createFxEngine(options = {}) {
     const result = rawTurn.result.then((value) => ({
       stopReason: value.stopReason,
       usage: normalizeTurnUsage(value.usage),
+      ...(value.error ? { error: value.error } : {}),
     }));
     void result.catch(() => {});
     return {
       id: rawTurn.id ?? null,
-      cancel(cancelOptions) { rawTurn.cancel(cancelOptions); },
+      cancel(cancelOptions) {
+        if (cancelOptions?.reason === "handoff") handoff = true;
+        rawTurn.cancel(cancelOptions);
+      },
       steer(input, id) {
         if (id !== undefined && !validTurnId(id)) throw new TypeError(`steer id must be ${turnIdRule}`);
         return rawTurn.steer(normalizeSteeringInput(input), id);
@@ -3585,6 +3602,13 @@ export async function createFxEngine(options = {}) {
           for await (const update of rawTurn) {
             const event = eventFor(update);
             if (event) yield event;
+          }
+          // A cancelled turn ends every call it showed. One the core never
+          // ended, such as a provider search the cancel cut off, ends failed,
+          // with no result. A handed-off turn's calls continue elsewhere.
+          if (handoff || (await rawTurn.result.catch(() => null))?.stopReason !== "cancelled") return;
+          for (const id of started) {
+            if (!ended.has(id)) yield { type: "tool_end", id, name: toolNames.get(id) || "tool", isError: true };
           }
         })();
         return {
@@ -3714,6 +3738,10 @@ export async function createFxEngine(options = {}) {
       }).finally(() => { pendingSteeringCount--; pendingSteeringBytes -= bytes; });
     };
     const toolControllers = new Set();
+    // Calls whose start the turn's events showed and whose end they did not.
+    const shownCalls = new Set();
+    // The provider's error a refused turn ended with (API-48, QUAL-18).
+    let providerError = null;
     let finished = false;
     let cancelled = false;
     const turn = {
@@ -3721,7 +3749,20 @@ export async function createFxEngine(options = {}) {
       // turn started with.
       id: resuming ? openTurnId : promptOptions.turnId ?? null,
       push(update, size = encoder.encode(JSON.stringify(update)).length) {
-        if (cancelled || finished) { discardedBytes += size; return; }
+        // A libfx core sends the text fx adds beside the reply as notices:
+        // the provider's error goes in the result, any other to onEvent.
+        if (update?.sessionUpdate === "notice") {
+          const text = String(update.title ?? "");
+          if (update.severity === "error") providerError = text;
+          else if (!cancelled && !finished) emit("turn.notice", { sessionId, text });
+          return;
+        }
+        const ended = update?.sessionUpdate === "tool_call_update" && (update.status === "completed" || update.status === "failed");
+        if (cancelled || finished) {
+          // A call the events showed still gets the end the core gave it,
+          // unless the turn was handed off for another agent to continue.
+          if (finished || handedOff || !ended || !shownCalls.has(update.toolCallId)) { discardedBytes += size; return; }
+        }
         if (size > maxCoreMessageBytes) throw new RangeError("core output message exceeds 64 MiB");
         if (queue.length && (queue.length >= maxUnreadEvents || size > maxUnreadEventBytes - queuedBytes)) {
           const capacity = new Promise((resolveCapacity) => { resumeOutput = resolveCapacity; });
@@ -3731,6 +3772,8 @@ export async function createFxEngine(options = {}) {
           }
           return capacity.then(() => turn.push(update, size));
         }
+        if (update?.sessionUpdate === "tool_call") shownCalls.add(update.toolCallId);
+        else if (ended) shownCalls.delete(update.toolCallId);
         const waiter = waiters.shift();
         if (waiter) waiter.resolve({ value: update, done: false });
         else { queue.push({ update, size }); queuedBytes += size; }
@@ -3739,6 +3782,9 @@ export async function createFxEngine(options = {}) {
       transportAttempts: 0,
       transportBytes: 0,
       lastTransportActivityAt: null,
+      // A failed refresh that stopped one of the turn's requests, until a
+      // later request with credentials succeeds.
+      refreshError: null,
       get cancelled() { return cancelled; },
       failImagePrep(error) {
         rejectImagePrep?.(error);
@@ -3889,7 +3935,8 @@ export async function createFxEngine(options = {}) {
           if (turn.id) lastTurnId = turn.id;
           openTurnId = null;
         }
-        return { stopReason: cancelled ? "cancelled" : value.stopReason, usage: value.usage };
+        const refused = !cancelled && value.stopReason === "refused" && providerError !== null;
+        return { stopReason: cancelled ? "cancelled" : value.stopReason, usage: value.usage, ...(refused ? { error: { name: "Error", message: providerError } } : {}) };
       })
       .catch(async (error) => {
         cancelImagePrep = null;
@@ -3903,7 +3950,11 @@ export async function createFxEngine(options = {}) {
           throw terminalError;
         }
         if (cancelled && error.message === "Cancelled") return { stopReason: "cancelled" };
-        terminalError = error;
+        // The core says only that a request failed; the refresh says why.
+        terminalError = turn.refreshError ?? error;
+        if (terminalError !== error) {
+          try { terminalError[coreAnswered] = true; } catch {}
+        }
         throw terminalError;
       })
       .finally(() => {
