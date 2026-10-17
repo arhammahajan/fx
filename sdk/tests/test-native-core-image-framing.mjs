@@ -89,7 +89,7 @@ try {
 
   // History keeps every image: 7 MiB of them each turn. Once a request would
   // pass the core's budget, the core leaves the oldest images out, and the
-  // native transport carries every request the core sends.
+  // native transport carries each request it trims that way.
   for (const _ of [2, 3, 4, 5]) assert.equal((await agent.prompt("take screenshots").result).stopReason, "end_turn");
   assert.equal((await agent.prompt("x".repeat(4 * 1024 * 1024)).result).stopReason, "end_turn");
   assert.equal(requests, 12);
@@ -97,9 +97,11 @@ try {
   assert.equal(imagesSent[7], 8, "the fourth turn's answer carries all eight images");
   assert.ok(imagesSent[9] < 10 && imagesSent[11] < 12, `later requests leave the oldest images out: ${imagesSent}`);
 
-  // Text is never left out of a request, so one whose text alone is over the
-  // native transport limit, 32 MiB, fails before it reaches host fetch.
+  // Text is never left out of a request. The native transport limit, 32 MiB,
+  // carries one over the core's budget, and one whose text alone is over the
+  // limit fails before it reaches host fetch.
   let textRequests = 0;
+  let largestTextBody = 0;
   const textOnly = await createFxEngine({
     backend: "native",
     nativeAddon: addon,
@@ -112,6 +114,7 @@ try {
         return Response.json({ object: "list", data: [{ id: "native/image-model", type: "language", tags: ["tool-use", "vision", "file-input"] }] });
       }
       textRequests += 1;
+      largestTextBody = Math.max(largestTextBody, init.body.length);
       return sse(
         { type: "text-delta", delta: "ok" },
         { type: "finish", finishReason: { unified: "stop", raw: "stop" } },
@@ -119,9 +122,10 @@ try {
     },
   });
   try {
-    const text = "x".repeat(7 * 1024 * 1024);
+    const text = "x".repeat(7.75 * 1024 * 1024);
     for (const _ of [1, 2, 3, 4]) assert.equal((await textOnly.prompt(text).result).stopReason, "end_turn");
     assert.equal(textRequests, 4);
+    assert.ok(largestTextBody > requestBudget + 1024 * 1024, `a request over the core's budget still reaches fetch: ${largestTextBody} bytes`);
     await assert.rejects(textOnly.prompt(text).result, /HostStreamBackpressure/);
     assert.equal(textRequests, 4, "a request over the transport limit must not reach host fetch");
   } finally {
