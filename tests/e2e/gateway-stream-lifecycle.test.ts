@@ -7248,6 +7248,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const tracePath = join(root.root, "trace.log");
       writeFileSync(join(root.workspace, "notes.txt"), "pooled connection fixture\n");
       const sockets = new Set<Socket>();
+      // The launch warm-up connection usually carries the first request, but
+      // it can also sit unused, so count only connections that carried one.
+      const requestSockets = new Set<Socket>();
       let connections = 0;
       let requests = 0;
       let socketFailure: Error | undefined;
@@ -7262,6 +7265,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         let request = Buffer.alloc(0);
         let requestHandled = false;
         socket.on("data", (chunk) => {
+          requestSockets.add(socket);
           if (requestHandled) return;
           if (request.length + chunk.length > 1024 * 1024) {
             socketFailure ??= new Error("pooled connection fixture request exceeded 1 MiB");
@@ -7341,7 +7345,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(json.recovery).toBeUndefined();
         expect(result.stderr).not.toContain("Network interrupted");
         expect(result.stderr).not.toContain("retrying request");
-        expect(connections).toBe(2);
+        expect(connections).toBeGreaterThanOrEqual(2);
+        expect(requestSockets.size).toBe(2);
         expect(requests).toBe(2);
         expect(socketFailure).toBeUndefined();
         expect(trace).toContain("event=stale_connection_retry");

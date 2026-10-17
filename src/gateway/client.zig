@@ -783,7 +783,7 @@ fn markPooledConnectionClosing(req: *std.http.Client.Request, request: StreamReq
 }
 
 /// Writes the request head and body and flushes them to the connection.
-fn sendGatewayRequestBody(req: *std.http.Client.Request, payload: []const u8, send_buf: []u8) anyerror!void {
+fn sendGatewayRequestBody(req: *std.http.Client.Request, payload: []const u8, send_buf: []u8) std.Io.Writer.Error!void {
     var body_writer = try req.sendBodyUnflushed(send_buf);
     try body_writer.writer.writeAll(payload);
     try body_writer.end();
@@ -811,43 +811,84 @@ fn prepareFreshConnectionRetry(
 
 const StaleConnectionStage = enum { send, head };
 
-/// A pooled connection that the server closed while it sat idle fails as
-/// soon as fx writes the request or reads the response head, before any
-/// response byte arrives. Servers close idle connections without reading what
-/// arrives next, so the request goes out once more on a fresh connection and
-/// the failure is never reported. A failure after the first head byte, on a
-/// fresh connection, or overridden by cancellation, a wake from sleep, or a
-/// watchdog verdict is reported as before.
-fn isStaleConnectionFailure(
+/// A connection the server closed while idle fails within one round trip of
+/// the write. A head failure later than this may follow a request the server
+/// read, so it is reported instead of resent.
+const stale_connection_head_window_ms: i64 = 5_000;
+
+/// What one failed request on a pooled connection looked like.
+const StaleConnectionEvidence = struct {
     stage: StaleConnectionStage,
     reused: bool,
+    /// The error the request failed with.
     transport_error: anyerror,
+    /// The same failure after cancellation, wake, and watchdog evidence.
     reported_error: anyerror,
-    head_bytes: usize,
-) bool {
-    if (!reused or reported_error != transport_error) return false;
-    return switch (stage) {
-        .send => true,
-        .head => head_bytes == 0 and
-            (transport_error == error.HttpConnectionClosing or transport_error == error.ReadFailed),
+    /// The error the socket stored. std reports every socket error as
+    /// `ReadFailed` or `WriteFailed`, including a cancelled read or write.
+    socket_error: ?anyerror = null,
+    /// Response bytes already received, decoded or still undecrypted.
+    received_bytes: usize = 0,
+    /// Time from the end of the send to the head failure.
+    elapsed_ms: i64 = 0,
+};
+
+/// A pooled connection that the server closed while it sat idle fails as
+/// soon as fx writes the request or reads the response head, before any
+/// response byte arrives, and the socket says the peer closed it. Servers
+/// close idle connections without reading what arrives next, so the request
+/// goes out once more on a fresh connection and the failure is never
+/// reported. Everything else is reported as before: a fresh connection, a
+/// cancelled read or write such as a request deadline, any other socket or
+/// TLS error, any received response byte, a head failure outside the window,
+/// and failures that cancellation, a wake from sleep, or a watchdog overrode.
+fn isStaleConnectionFailure(evidence: StaleConnectionEvidence) bool {
+    if (!evidence.reused or evidence.reported_error != evidence.transport_error) return false;
+    const peer_closed = if (evidence.socket_error) |cause| isPeerClosedError(cause) else false;
+    return switch (evidence.stage) {
+        .send => peer_closed,
+        .head => evidence.received_bytes == 0 and
+            evidence.elapsed_ms <= stale_connection_head_window_ms and
+            ((evidence.transport_error == error.ReadFailed and peer_closed) or
+                (evidence.transport_error == error.HttpConnectionClosing and evidence.socket_error == null)),
     };
 }
 
-test "only a reused connection that fails before the first response byte is stale" {
-    try std.testing.expect(isStaleConnectionFailure(.send, true, error.WriteFailed, error.WriteFailed, 0));
-    try std.testing.expect(isStaleConnectionFailure(.head, true, error.HttpConnectionClosing, error.HttpConnectionClosing, 0));
-    try std.testing.expect(isStaleConnectionFailure(.head, true, error.ReadFailed, error.ReadFailed, 0));
+fn isPeerClosedError(err: anyerror) bool {
+    return err == error.ConnectionResetByPeer or err == error.SocketUnconnected;
+}
 
-    // A fresh connection failing is a real network problem.
-    try std.testing.expect(!isStaleConnectionFailure(.send, false, error.WriteFailed, error.WriteFailed, 0));
-    try std.testing.expect(!isStaleConnectionFailure(.head, false, error.HttpConnectionClosing, error.HttpConnectionClosing, 0));
-    // Cancellation and wake evidence outrank the socket error.
-    try std.testing.expect(!isStaleConnectionFailure(.send, true, error.WriteFailed, error.Cancelled, 0));
-    try std.testing.expect(!isStaleConnectionFailure(.head, true, error.ReadFailed, error.SystemResumed, 0));
-    // Once the server has started answering, resending could run the request twice.
-    try std.testing.expect(!isStaleConnectionFailure(.head, true, error.ReadFailed, error.ReadFailed, 17));
-    try std.testing.expect(!isStaleConnectionFailure(.head, true, error.HttpRequestTruncated, error.HttpRequestTruncated, 0));
-    try std.testing.expect(!isStaleConnectionFailure(.head, true, error.HttpHeadersInvalid, error.HttpHeadersInvalid, 0));
+test "only a reused connection the peer closed before the first response byte is stale" {
+    const stale = [_]StaleConnectionEvidence{
+        .{ .stage = .send, .reused = true, .transport_error = error.WriteFailed, .reported_error = error.WriteFailed, .socket_error = error.ConnectionResetByPeer },
+        .{ .stage = .send, .reused = true, .transport_error = error.WriteFailed, .reported_error = error.WriteFailed, .socket_error = error.SocketUnconnected },
+        .{ .stage = .head, .reused = true, .transport_error = error.HttpConnectionClosing, .reported_error = error.HttpConnectionClosing },
+        .{ .stage = .head, .reused = true, .transport_error = error.ReadFailed, .reported_error = error.ReadFailed, .socket_error = error.ConnectionResetByPeer, .elapsed_ms = 4_999 },
+    };
+    for (stale) |evidence| try std.testing.expect(isStaleConnectionFailure(evidence));
+
+    const reported = [_]StaleConnectionEvidence{
+        // A fresh connection failing is a real network problem.
+        .{ .stage = .send, .reused = false, .transport_error = error.WriteFailed, .reported_error = error.WriteFailed, .socket_error = error.ConnectionResetByPeer },
+        .{ .stage = .head, .reused = false, .transport_error = error.HttpConnectionClosing, .reported_error = error.HttpConnectionClosing },
+        // A request deadline cancels the socket read or write in place.
+        .{ .stage = .send, .reused = true, .transport_error = error.WriteFailed, .reported_error = error.WriteFailed, .socket_error = error.Canceled },
+        .{ .stage = .head, .reused = true, .transport_error = error.ReadFailed, .reported_error = error.ReadFailed, .socket_error = error.Canceled },
+        // Other socket errors, and TLS errors that leave no socket error.
+        .{ .stage = .head, .reused = true, .transport_error = error.ReadFailed, .reported_error = error.ReadFailed, .socket_error = error.NetworkDown },
+        .{ .stage = .head, .reused = true, .transport_error = error.ReadFailed, .reported_error = error.ReadFailed },
+        .{ .stage = .send, .reused = true, .transport_error = error.WriteFailed, .reported_error = error.WriteFailed },
+        // Cancellation and wake evidence outrank the socket error.
+        .{ .stage = .send, .reused = true, .transport_error = error.WriteFailed, .reported_error = error.Cancelled, .socket_error = error.ConnectionResetByPeer },
+        .{ .stage = .head, .reused = true, .transport_error = error.ReadFailed, .reported_error = error.SystemResumed, .socket_error = error.ConnectionResetByPeer },
+        // Once the server has started answering, resending could run the request twice.
+        .{ .stage = .head, .reused = true, .transport_error = error.ReadFailed, .reported_error = error.ReadFailed, .socket_error = error.ConnectionResetByPeer, .received_bytes = 17 },
+        .{ .stage = .head, .reused = true, .transport_error = error.HttpRequestTruncated, .reported_error = error.HttpRequestTruncated },
+        .{ .stage = .head, .reused = true, .transport_error = error.HttpHeadersInvalid, .reported_error = error.HttpHeadersInvalid },
+        // A head that dies long after the send may follow a request the server read.
+        .{ .stage = .head, .reused = true, .transport_error = error.HttpConnectionClosing, .reported_error = error.HttpConnectionClosing, .elapsed_ms = 5_001 },
+    };
+    for (reported) |evidence| try std.testing.expect(!isStaleConnectionFailure(evidence));
 }
 
 const ConnectionSetupTiming = struct {
@@ -1733,7 +1774,13 @@ fn streamGatewayCompletionCoreWithOptions(
                 system_resumed.load(.seq_cst),
                 err,
             );
-            if (!stale_retry_used and isStaleConnectionFailure(.send, reused_connection, err, reported, 0)) {
+            if (!stale_retry_used and isStaleConnectionFailure(.{
+                .stage = .send,
+                .reused = reused_connection,
+                .transport_error = err,
+                .reported_error = reported,
+                .socket_error = req.connection.?.stream_writer.err,
+            })) {
                 stale_retry_used = true;
                 attempt_limit += 1;
                 delivery_ambiguous = true;
@@ -1744,6 +1791,7 @@ fn streamGatewayCompletionCoreWithOptions(
         };
         debug_trace.eventf("gateway", "after_request_send", trace_ctx, "attempt={d} payload_bytes={d}", .{ attempt + 1, payload.len });
         debug_trace.eventf("gateway", "after_send", trace_ctx, "attempt={d} payload_bytes={d}", .{ attempt + 1, payload.len });
+        const sent_at = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
 
         if (active_connected_watch) |watch| {
             if (watch.arm_response_head()) |err| {
@@ -1763,8 +1811,17 @@ fn streamGatewayCompletionCoreWithOptions(
             if (mapped == error.Cancelled or mapped == error.SystemResumed) {
                 return @as(anyerror!StreamResult, mapped);
             }
-            const head_bytes = req.reader.in.buffered().len;
-            if (!stale_retry_used and isStaleConnectionFailure(.head, reused_connection, err, mapped, head_bytes)) {
+            const conn = req.connection.?;
+            if (!stale_retry_used and isStaleConnectionFailure(.{
+                .stage = .head,
+                .reused = reused_connection,
+                .transport_error = err,
+                .reported_error = mapped,
+                .socket_error = conn.stream_reader.err,
+                // TLS keeps an incomplete record undecrypted in the socket buffer.
+                .received_bytes = req.reader.in.buffered().len + conn.stream_reader.interface.buffered().len,
+                .elapsed_ms = sent_at.durationTo(std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake)).raw.toMilliseconds(),
+            })) {
                 stale_retry_used = true;
                 attempt_limit += 1;
                 delivery_ambiguous = true;
@@ -6807,6 +6864,7 @@ const LoopbackGatewayMode = enum {
     keep_alive_reuse,
     keep_alive_close_after_response,
     keep_alive_truncated_head_on_reuse,
+    keep_alive_head_stall_on_reuse,
     reset_mid_request,
     reset_after_head_read,
     slow_terminal_chunk,
@@ -7147,16 +7205,25 @@ const LoopbackGatewayFixture = struct {
                 _ = self.requests_served.fetchAdd(1, .seq_cst);
                 try writeLoopbackGatewayBytes(zio, stream, "HTTP/1.1 200 OK\r\n");
                 stream.shutdown(zio, .both) catch {};
-                // A wrongful resend would connect here and succeed. Teardown
-                // wakes or fails this accept when the client reports instead.
-                var resent = self.server.accept(zio) catch |err| {
-                    if (self.stopping.load(.seq_cst)) return;
-                    return err;
-                };
+                // A wrongful resend would connect here and succeed.
+                var resent = (try self.acceptUnexpected(zio)) orelse return;
                 defer resent.close(zio);
-                if (self.stopping.load(.seq_cst)) return;
-                _ = self.accepted_count.fetchAdd(1, .seq_cst);
                 self.serveKeepAliveOnce(zio, resent);
+            },
+            .keep_alive_head_stall_on_reuse => {
+                self.markStage();
+                var socket_buffer: [4096]u8 = undefined;
+                var reader = stream.reader(zio, &socket_buffer);
+                try readKeepAliveRequest(&reader.interface);
+                _ = self.requests_served.fetchAdd(1, .seq_cst);
+                try writeKeepAliveResponse(zio, stream);
+                // Read the next request on the pooled connection and never
+                // answer it. A resend after the caller's deadline would
+                // connect here.
+                try readKeepAliveRequest(&reader.interface);
+                _ = self.requests_served.fetchAdd(1, .seq_cst);
+                var resent = (try self.acceptUnexpected(zio)) orelse return;
+                resent.close(zio);
             },
             .reset_mid_request => {
                 // Read one byte, then RST: the client fails mid-send or at
@@ -7238,6 +7305,21 @@ const LoopbackGatewayFixture = struct {
             _ = self.requests_served.fetchAdd(1, .seq_cst);
             writeKeepAliveResponse(zio, stream) catch return;
         }
+    }
+
+    /// Accepts and counts a connection the client should never open. Returns
+    /// null when teardown wakes or fails the accept instead.
+    fn acceptUnexpected(self: *@This(), zio: std.Io) !?std.Io.net.Stream {
+        var extra = self.server.accept(zio) catch |err| {
+            if (self.stopping.load(.seq_cst)) return null;
+            return err;
+        };
+        if (self.stopping.load(.seq_cst)) {
+            extra.close(zio);
+            return null;
+        }
+        _ = self.accepted_count.fetchAdd(1, .seq_cst);
+        return extra;
     }
 
     fn serveKeepAliveOnce(self: *@This(), zio: std.Io, stream: std.Io.net.Stream) void {
@@ -7679,10 +7761,60 @@ test "a pooled connection the server closed while idle is resent once on a fresh
     defer second.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("ok", second.completion.content.?);
     try std.testing.expect(second.completion.delivery_ambiguous);
+    // Only the fresh connection is pooled; the dead one was destroyed.
+    try std.testing.expectEqual(@as(usize, 1), pool.freeConnectionCount());
     try std.testing.expectEqual(@as(usize, 2), harness.fixture.accepted_count.load(.seq_cst));
     try std.testing.expectEqual(@as(usize, 2), harness.fixture.requests_served.load(.seq_cst));
     harness.fixture.deinit();
     if (harness.fixture.failure) |err| return err;
+}
+
+test "a deadline on a reused connection ends the request without a resend" {
+    var harness = try ConnectionSetupHarness.init(.keep_alive_head_stall_on_reuse, false);
+    defer harness.deinit();
+    try harness.start();
+
+    var pool = http_pool.HttpPool.init(std.testing.allocator);
+    defer _ = pool.deinit();
+
+    var first = try pooledLoopbackCall(&pool, harness.url);
+    defer first.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("ok", first.completion.content.?);
+
+    // The server reads the next request on the pooled connection and never
+    // answers. The deadline cancels the head read, which std reports as a
+    // read failure on a reused connection with no response bytes. That is
+    // not a closed connection, so the request must end without a resend.
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var callback_ctx: u8 = 0;
+    const started = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+    const second = streamGatewayCompletionBounded(
+        std.testing.allocator,
+        .{
+            .api_key = "test-key",
+            .model = "test/model",
+            .retry_count = 1,
+            .chat_url = harness.url,
+            .payload = "{}",
+            .shared_pool = &pool,
+        },
+        @ptrCast(&callback_ctx),
+        discardConnectionSetupTestChunk,
+        null,
+        testAwakeDeadlineAfter(300),
+        &cancel_flag,
+    );
+    const elapsed_ms = started.durationTo(std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake)).raw.toMilliseconds();
+    if (second) |ok_result| {
+        var r = ok_result;
+        r.deinit(std.testing.allocator);
+        return error.TestExpectedDeadline;
+    } else |err| try std.testing.expectEqual(error.Timeout, err);
+    harness.fixture.deinit();
+    if (harness.fixture.failure) |err| return err;
+    try std.testing.expectEqual(@as(usize, 1), harness.fixture.accepted_count.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 2), harness.fixture.requests_served.load(.seq_cst));
+    try std.testing.expect(elapsed_ms < 1_000);
 }
 
 test "a pooled connection that dies after the response starts is reported, not resent" {

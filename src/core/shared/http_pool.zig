@@ -282,7 +282,7 @@ pub const HttpPool = struct {
 };
 
 /// A request opened on the pool, and whether it reuses an idle connection.
-pub const PooledRequest = struct {
+const PooledRequest = struct {
     request: std.http.Client.Request,
     reused: bool,
 };
