@@ -184,7 +184,7 @@ try {
   });
   assert.deepEqual(manifest.exports["./node"], nodeEntry);
   assert.deepEqual(manifest.exports["./browser"], typed("browser.d.ts", "./browser.js"));
-  assert.deepEqual(manifest.exports["./wasm"], typed("wasm.d.ts", "./fx-sdk.js"));
+  assert.deepEqual(manifest.exports["./wasm"], typed("wasm.d.ts", "./wasm.js"));
   assert.deepEqual(manifest.exports["./mcp"], typed("mcp.d.ts", "./mcp.js"));
   assert.deepEqual(manifest.exports["./skills"], typed("skills.d.ts", "./skills.js"));
   assert.deepEqual(manifest.exports["./skills/node"], typed("skills-node.d.ts", "./skills-node.js"));

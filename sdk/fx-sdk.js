@@ -233,7 +233,7 @@ export function normalizeAgentOptions(value) {
   for (const name of ["onCredentials", "refreshLock"]) {
     if (!subscription && options[name] !== undefined) throw new TypeError(`${name} needs provider "codex" or "grok"`);
   }
-  for (const name of ["credentials", "onCredentials", "refreshLock"]) {
+  for (const name of ["credentials", "onCredentials", "refreshLock", "fetch", "onEvent"]) {
     if (options[name] !== undefined && typeof options[name] !== "function") throw new TypeError(`${name} must be a function`);
   }
   Object.assign(options, normalizeModelChoice(options));
@@ -293,6 +293,11 @@ const imageWindowLimits = Symbol.for("libfx.imageWindow");
 // Marks an error the core answered a request with, as opposed to one from a
 // core that stopped answering.
 export const coreAnswered = Symbol.for("libfx.coreAnswered");
+// `{ name, store }`: the durable agent an engine runs turns for, which the
+// Node.js loader counts its native runtime toward (`runtimeShareKey` in
+// node.js). An engine created without one counts toward the engines its
+// JavaScript realm created outside an agent.
+export const runtimeAgent = Symbol.for("libfx.runtimeAgent");
 
 /**
  * Another writer took over the session after this agent loaded it. A

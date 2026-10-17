@@ -42,6 +42,7 @@ const libfxFiles = [
   ["sdk/browser.js", "browser.js"],
   ["sdk/node.js", "node.js"],
   ["sdk/fx-sdk.js", "fx-sdk.js"],
+  ["sdk/wasm.js", "wasm.js"],
   ["sdk/durable.js", "durable.js"],
   ["sdk/fx-harness.js", "fx-harness.js"],
   ["sdk/wasm-module.js", "wasm-module.js"],

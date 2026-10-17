@@ -11,6 +11,7 @@ const scripts = [
   "test-native-core-workers.mjs",
   "test-native-core-worker-termination.mjs",
   "test-native-core-security.mjs",
+  "test-native-runtime-share.mjs",
   "test-native-core-exit-code.mjs",
   "test-native-core.mjs",
   "test-native-core-config-isolation.mjs",

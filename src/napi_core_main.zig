@@ -12,6 +12,7 @@ const agent_checkpoint = @import("core/agent/runtime/checkpoint.zig");
 const request_image_budget = @import("core/agent/runtime/request_image_budget.zig");
 const io_mod = @import("core/shared/io.zig");
 const fetch_state = @import("napi_fetch_state.zig");
+const runtime_shares = @import("napi_runtime_shares.zig");
 const streamable_http = @import("core/mcp/streamable_http.zig");
 const host_stream_provider = @import("gateway/host_stream_provider.zig");
 const host_openai_codex = @import("gateway/host_openai_codex.zig");
@@ -60,7 +61,6 @@ const max_model_bytes = 1024;
 const max_effort_bytes = 64;
 const max_path_bytes = 16 * 1024;
 const max_url_bytes = 16 * 1024;
-const max_active_runtimes = 64;
 const runtime_handle_type_tag = c.napi_type_tag{
     .lower = 0x4c4942465852544d,
     .upper = 0xa71d7c52e9314b08,
@@ -394,9 +394,12 @@ const FetchBridge = struct {
     status: u16 = 0,
     ready: ?*ReadyNotifier = null,
 
+    /// Drops the pending request, and the buffers' capacity above a modest
+    /// size: once handed over or dropped, a large request's bytes are not
+    /// kept for the runtime's next one.
     fn clearPendingRequest(self: *FetchBridge) void {
-        self.request.clearRetainingCapacity();
-        self.request_body.clearRetainingCapacity();
+        fetch_state.clearBuffer(&self.request, std.heap.c_allocator);
+        fetch_state.clearBuffer(&self.request_body, std.heap.c_allocator);
     }
 
     fn advance_handle(self: *FetchBridge) void {
@@ -443,7 +446,7 @@ const FetchBridge = struct {
         try self.request.appendSlice(std.heap.c_allocator, metadata);
         try self.request_body.appendSlice(std.heap.c_allocator, body);
         self.response_offset = 0;
-        self.response.clearRetainingCapacity();
+        fetch_state.clearBuffer(&self.response, std.heap.c_allocator);
         self.phase = decision.phase;
         self.advance_handle();
         self.wake.broadcast(io);
@@ -529,7 +532,7 @@ const FetchBridge = struct {
         self.clearPendingRequest();
         self.phase = decision.phase;
         self.status = 0;
-        self.response.clearRetainingCapacity();
+        fetch_state.clearBuffer(&self.response, std.heap.c_allocator);
         self.response_offset = 0;
         self.wake.broadcast(io);
         self.ready.?.notify();
@@ -670,6 +673,9 @@ const Runtime = struct {
     home: []u8,
     workspace_root: []u8,
     gateway_chat_url: []u8,
+    /// The key of the agent its runtime slot is held for, or null for none
+    /// (`napi_runtime_shares.zig`).
+    share: ?[]u8,
     ready: ReadyNotifier,
     thread: std.Thread,
     exited: std.atomic.Value(bool) = .init(false),
@@ -795,8 +801,11 @@ const Runtime = struct {
         self.alloc.free(self.home);
         self.alloc.free(self.workspace_root);
         self.alloc.free(self.gateway_chat_url);
-        self.alloc.destroy(self);
-        releaseRuntimeSlot();
+        const alloc = self.alloc;
+        const share = self.share;
+        alloc.destroy(self);
+        releaseRuntimeSlot(share);
+        if (share) |key| alloc.free(key);
     }
 };
 
@@ -835,20 +844,26 @@ fn cleanupRuntimeHandle(data: ?*anyopaque) callconv(.c) void {
 
 var threaded_io: ?std.Io.Threaded = null;
 var threaded_io_state: std.atomic.Value(u8) = .init(0);
-var active_runtime_count: std.atomic.Value(usize) = .init(0);
+/// The process's native runtimes and the agents holding them, shared by
+/// every Node environment that loads the addon, such as worker threads.
+var runtime_slots: runtime_shares.Table = .{};
+var runtime_slots_mutex: std.Io.Mutex = .init;
 
-fn claimRuntimeSlot() bool {
-    var current = active_runtime_count.load(.acquire);
-    while (current < max_active_runtimes) {
-        if (active_runtime_count.cmpxchgWeak(current, current + 1, .acq_rel, .acquire)) |observed| {
-            current = observed;
-        } else return true;
-    }
-    return false;
+/// Claims a runtime slot for the agent `share` names, never waiting: a
+/// refused claim fails engine creation at once. Exactly one
+/// `releaseRuntimeSlot` with the same key undoes a successful one.
+fn claimRuntimeSlot(share: ?[]const u8) runtime_shares.Refusal!void {
+    const io = io_mod.getIo();
+    runtime_slots_mutex.lockUncancelable(io);
+    defer runtime_slots_mutex.unlock(io);
+    return runtime_slots.claim(share);
 }
 
-fn releaseRuntimeSlot() void {
-    _ = active_runtime_count.fetchSub(1, .acq_rel);
+fn releaseRuntimeSlot(share: ?[]const u8) void {
+    const io = io_mod.getIo();
+    runtime_slots_mutex.lockUncancelable(io);
+    defer runtime_slots_mutex.unlock(io);
+    runtime_slots.release(share);
 }
 
 fn ensureThreadedIo() void {
@@ -948,6 +963,8 @@ fn exceptionPending(env: c.napi_env) bool {
 const CreateError = error{
     JavaScriptException,
     TooManyRuntimes,
+    OverShare,
+    InvalidShare,
     InvalidApiKey,
     InvalidProvider,
     InvalidConfiguredProvider,
@@ -985,9 +1002,19 @@ fn getProvider(env: c.napi_env, options: c.napi_value) CreateError!?model_provid
 }
 
 fn createRuntime(env: c.napi_env, options: c.napi_value) CreateError!*Runtime {
-    if (!claimRuntimeSlot()) return error.TooManyRuntimes;
-    errdefer releaseRuntimeSlot();
     const alloc = std.heap.c_allocator;
+    // The agent whose share of the runtimes this one counts toward.
+    const share = getNamedString(env, options, "share", alloc, runtime_shares.max_key_bytes) catch |err| switch (err) {
+        error.JavaScriptException => return error.JavaScriptException,
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidShare,
+    };
+    errdefer if (share) |key| alloc.free(key);
+    claimRuntimeSlot(share) catch |err| return switch (err) {
+        error.RuntimesFull => error.TooManyRuntimes,
+        error.OverShare => error.OverShare,
+    };
+    errdefer releaseRuntimeSlot(share);
     const provider = try getProvider(env, options);
     const configured_providers = getNamedString(env, options, "configuredProviders", alloc, max_configured_providers_bytes) catch |err| switch (err) {
         error.JavaScriptException => return error.JavaScriptException,
@@ -1066,6 +1093,7 @@ fn createRuntime(env: c.napi_env, options: c.napi_value) CreateError!*Runtime {
         .home = home,
         .workspace_root = workspace_root,
         .gateway_chat_url = gateway_chat_url,
+        .share = share,
         .ready = ready,
         .thread = undefined,
     };
@@ -1099,7 +1127,9 @@ fn createRuntime(env: c.napi_env, options: c.napi_value) CreateError!*Runtime {
 fn throwCreateError(env: c.napi_env, err: CreateError) c.napi_value {
     return switch (err) {
         error.JavaScriptException => null,
-        error.TooManyRuntimes => throw(env, "LIBFX_NATIVE_LIMIT", "too many active native runtimes"),
+        error.TooManyRuntimes => throw(env, "LIBFX_NATIVE_LIMIT", std.fmt.comptimePrint("all {d} native runtimes libfx runs in a process are in use", .{runtime_shares.max_runtimes})),
+        error.OverShare => throw(env, "LIBFX_NATIVE_LIMIT", std.fmt.comptimePrint("this agent holds its share of the {d} native runtimes libfx runs in a process", .{runtime_shares.max_runtimes})),
+        error.InvalidShare => throw(env, "LIBFX_INVALID_ARGUMENT", "share must be a bounded string"),
         error.InvalidApiKey => throw(env, "LIBFX_INVALID_ARGUMENT", "apiKey is required and must be a bounded string"),
         error.InvalidProvider => throw(env, "LIBFX_INVALID_ARGUMENT", "provider must be \"gateway\", \"codex\", \"grok\" or a configured provider's name"),
         error.InvalidConfiguredProvider => throw(env, "LIBFX_INVALID_ARGUMENT", "configuredProviders must validly define the selected provider, without credentials"),

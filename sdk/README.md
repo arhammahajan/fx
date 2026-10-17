@@ -126,7 +126,7 @@ createFxAgent({ durability: local({ dir: ".fx/sessions" }) });
 createFxAgent({ durability: memory() }); // nothing outlives the process
 ```
 
-On `local()`, `vercel()` and `world()`, a session id is a Workflow run id, `wrun_` followed by letters and digits. Take it from `turn.accepted` or `await agent.newSessionId()` instead of making one up. On `memory()`, any 1 to 128 letters, digits, `.`, `_` or `-` work.
+On `local()`, `vercel()` and `world()`, a session id is a Workflow run id, `wrun_` followed by letters and digits. Take it from `turn.accepted` or `await agent.newSessionId()` instead of making one up: `agent.session()` throws a `TypeError` with the code `FX_SESSION_ID_INVALID` for any other id. On `memory()`, any 1 to 128 letters, digits, `.`, `_` or `-` work.
 
 `local()` keeps the sessions an older libfx saved in its folder in an older file layout: the first time it opens the folder, it moves their files into the layout it reads. If one can't be moved, such as when a different file already has its name, the prompt's `turn.accepted` rejects with `FX_LOCAL_STORE_LAYOUT` naming it, and nothing in the folder changes.
 
@@ -523,6 +523,12 @@ A checkpoint records the libfx version, a hash of the tool set and the model it 
 Each platform's native addon is a package of its own: `@libfx/linux-x64`, `@libfx/linux-arm64`, `@libfx/darwin-x64` and `@libfx/darwin-arm64`. libfx lists them as optional dependencies, so `npm install libfx` downloads only the one for the machine it runs on, and so do pnpm and Bun. Install on the platform that runs the app: `node_modules` copied from a Mac into a Linux container has no Linux addon. Without its addon package, such as with `npm install --omit=optional` or on a musl Linux, libfx runs on WebAssembly.
 
 The default `backend: "auto"` tries the native addon first. Pass `"native"` or `"wasm"` to require one, and call `getBackendInfo()` to see what would load without creating anything.
+
+A process runs at most 64 native runtimes at once, across its worker threads. A durable session's turn holds one while it runs, and an engine from `createFxEngine()` holds one until it closes. When agents contend for them, no agent holds more than its share, so one agent's turns can't keep another's off the native addon:
+
+- One agent is a name on a store, as queue deliveries tell agents apart. An agent's copies count as one, and so does an agent that replaced another under `NODE_ENV=development`. The engines that one JavaScript realm, such as the main thread or a worker, creates with `createFxEngine()` outside an agent count together as one more agent.
+- An agent may take another native runtime while it holds fewer than 64 divided by the number of agents holding them, itself included, rounded down. The last free runtime is kept for an agent that holds none, so an agent alone holds at most 63, and a new agent's turn always starts natively.
+- An engine beyond its agent's share, with `backend: "auto"` or `"native"`, runs on WebAssembly instead, and `onEvent` gets a `runtime.fallback` event. Without JSPI, where WebAssembly can't run, `createFxEngine()` rejects with `LIBFX_NATIVE_LIMIT`, naming the limit, and a durable session's turn ends with that error. libfx never waits for a native runtime to free.
 
 Next.js works in Node.js route handlers, with webpack or Turbopack, and doesn't need `serverExternalPackages`: the build copies the addon from its package into the output, so a Vercel deployment carries it. CommonJS apps can `require("libfx")`. With TypeScript's `moduleResolution: "bundler"`, add `"node"` to `customConditions` to get the Node.js types.
 

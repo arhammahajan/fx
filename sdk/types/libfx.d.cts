@@ -282,6 +282,11 @@ export interface FxCheckpointMeta {
 /** A runtime diagnostic an engine passes to `onEvent`, separate from model output. */
 export type FxEngineEvent = FxEventBase & (
   | { type: "runtime.start" }
+  /**
+   * On Node.js, the process's native runtimes were all in use, or this engine's agent held its share of them, so
+   * the engine runs on WebAssembly. `message` says which.
+   */
+  | { type: "runtime.fallback"; backend: "wasm"; code: "LIBFX_NATIVE_LIMIT"; message: string }
   | { type: "runtime.ready" }
   | { type: "runtime.exit"; code: number }
   | { type: "acp.send"; message: unknown }
@@ -461,12 +466,15 @@ export type FxBackendChoice = "auto" | "native" | "wasm";
 /** A Wasm asset in browsers and on `libfx/wasm`: a URL string, a `Response`, bytes, a compiled module, or a promise of one of the last three. */
 export type FxWasmSource = string | Response | FxBytes | FxWasmModule | Promise<Response | FxBytes | FxWasmModule>;
 
-/** A Wasm asset on Node.js: a path, a URL, a `Response`, bytes, a compiled module, or a promise of an HTTP(S) URL string, a `Response`, bytes, or a module. */
+/** A Wasm asset on Node.js: a path, a URL or URL string, read from disk when it is a `file:` URL, a `Response`, bytes, a compiled module, or a promise of an HTTP(S) URL string, a `Response`, bytes, or a module. */
 export type FxNodeWasmSource = string | URL | Response | FxBytes | FxWasmModule | Promise<string | Response | FxBytes | FxWasmModule>;
 
 /** Backend selection on Node.js. */
 export interface FxNodeBackendOptions {
-  /** `"auto"` tries the native addon, then Wasm; `"native"` requires N-API; `"wasm"` requires Wasm and JSPI. */
+  /**
+   * `"auto"` tries the native addon, then Wasm; `"native"` requires N-API; `"wasm"` requires Wasm and JSPI. With
+   * `"auto"` or `"native"`, an engine the native runtime limit or its agent's share of it keeps off N-API runs on Wasm.
+   */
   backend?: FxBackendChoice;
   /** Trusted host configuration: the native addon module, its path or URL, or `false` to disable native loading. */
   nativeAddon?: string | URL | false | object;

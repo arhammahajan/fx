@@ -52,7 +52,7 @@
     },
     "./wasm": {
       "types": "./types/wasm.d.ts",
-      "default": "./fx-sdk.js"
+      "default": "./wasm.js"
     },
     "./durable-local": {
       "types": "./types/durable-local.d.ts",
@@ -92,6 +92,7 @@
     "node.js",
     "node.cjs",
     "fx-sdk.js",
+    "wasm.js",
     "tool-observation.js",
     "durable.js",
     "fx-harness.js",

@@ -617,9 +617,16 @@ function createMemoryBackend({ maxDurationMs, reserveMs } = {}) {
     const timer = setTimeout(() => { timers.delete(timer); fn(); }, ms);
     timers.add(timer);
   };
+  // Messages sent while no agent listens, delivered once one does. A timer
+  // that looked for one would keep a process whose agents all closed alive
+  // for good.
+  const parked = [];
   // A message keeps its id across its deliveries, as a queue's does.
   const deliver = (message, attempt, messageId = newId("qmsg")) => {
-    if (handlers.size === 0) return later(() => deliver(message, attempt, messageId), 10);
+    if (handlers.size === 0) {
+      parked.push({ message, attempt, messageId });
+      return;
+    }
     const group = handlers.get(agentOf(message));
     // No agent of that name here yet: tried again, as a failed delivery is.
     if (!group) {
@@ -727,6 +734,7 @@ function createMemoryBackend({ maxDurationMs, reserveMs } = {}) {
     },
     listen(fn, name = defaultAgentName) {
       const group = joinGroup(handlers, name, fn);
+      for (const { message, attempt, messageId } of parked.splice(0)) later(() => deliver(message, attempt, messageId), 0);
       return () => {
         leaveGroup(handlers, name, group, fn);
         if (handlers.size > 0) return;
@@ -753,6 +761,10 @@ const queuePrefix = "__libfx_wkf_workflow_";
 // session from before names belonged to.
 const defaultAgentName = "default";
 const agentNameRule = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+// A Workflow run id, the only session id a World holds.
+const runIdRule = /^wrun_[0-9A-Za-z]{10,64}$/;
+// A session id a durability cannot hold, refused before anything is used.
+const invalidSessionId = (message) => Object.assign(new TypeError(message), { code: "FX_SESSION_ID_INVALID" });
 // The agent a queued message is for.
 const agentOf = (message) => (typeof message?.agent === "string" ? message.agent : defaultAgentName);
 const queueName = `${queuePrefix}session`;
@@ -1039,7 +1051,7 @@ function createWorldBackend(world, durability) {
     maxDurationMs: maxDurationMs ?? null,
     world,
     newSessionId: () => `wrun_${typeof world.createRunId === "function" ? world.createRunId({}) : ulid()}`,
-    validSessionId: (id) => typeof id === "string" && /^wrun_[0-9A-Za-z]{10,64}$/.test(id),
+    validSessionId: (id) => typeof id === "string" && runIdRule.test(id),
     deadline: () => null,
     holderInfo: holderInfo ?? (() => ({})),
     // Whether a lease's holder still runs, as `delivery` can tell: a worker
@@ -2663,7 +2675,7 @@ function turnView({ messageId, resumeRequest = null, start }) {
  * `harness(options)` receives the caller's options without `durability` and
  * returns:
  *
- * - `open({ sessionId, store, context, settings, durability, ready })`: the
+ * - `open({ sessionId, store, context, settings, durability, ready, inputs, agent })`: the
  *   harness session for one worker, for turns with that `context` and those
  *   `settings`. `store` is where it keeps the session: `load()` resolves
  *   `{ checkpoint?, journal, head }`, `append({ idempotencyKey, data, marks })`
@@ -2684,7 +2696,10 @@ function turnView({ messageId, resumeRequest = null, start }) {
  *   settles: by then every steer and cancel stored while the call ran has
  *   reached the running turn. It is called again before a turn ends, and
  *   the turn ends only once that promise settles, so a steer stored while
- *   the last reply streamed continues the turn.
+ *   the last reply streamed continues the turn. `agent` is `{ name, store }`,
+ *   the agent the session's turns run for, as deliveries tell agents apart:
+ *   `store` is a World's store as `world:` and its name, or the `memory()`
+ *   itself.
  * - `seed` (optional): the bytes of a checkpoint a new session starts from.
  * - `settings(sessionOptions)` (optional): what an `agent.session()` call
  *   sets over the agent's options for the turns it starts, as JSON the core
@@ -2725,8 +2740,10 @@ function turnView({ messageId, resumeRequest = null, start }) {
  *
  * `defaultDurability()` picks the durability when the caller names none, and
  * `defaultShared` says it hands every such agent the same one, as Node's
- * does, so that agents created without a durability share a store. `name` is
- * the factory's name in errors, and `label` the agent's.
+ * does, so that agents created without a durability share a store.
+ * `defaultWorld` says it is always a World, as Node's is, so `session(id)`
+ * on such an agent refuses an id that isn't a run id before the durability
+ * starts. `name` is the factory's name in errors, and `label` the agent's.
  *
  * `development()` says whether the process is a development server, whose
  * reloads create its agents again with new functions in their options. Where
@@ -2734,7 +2751,7 @@ function turnView({ messageId, resumeRequest = null, start }) {
  * ones; everywhere else it is refused (SEC-2). It is asked each time an agent
  * is created or learns its store. Without it, every process refuses.
  */
-export function createDurableAgentFactory({ harness, defaultDurability, defaultShared = false, development = () => false, name = "createAgent", label = "agent" }) {
+export function createDurableAgentFactory({ harness, defaultDurability, defaultShared = false, defaultWorld = false, development = () => false, name = "createAgent", label = "agent" }) {
   return function createDurableAgent(options = {}) {
     if (!options || typeof options !== "object" || Array.isArray(options)) {
       throw new TypeError(`${name}() options must be an object`);
@@ -2748,6 +2765,9 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
     }
     const plugged = harness(harnessOptions);
     const seed = plugged.seed === undefined ? undefined : toBase64(plugged.seed);
+    // Whether the agent's sessions live in a World, known before its
+    // durability starts.
+    const worldSessions = durability ? typeof durability.world === "function" : defaultWorld;
     const emit = (type, detail = {}) => {
       try { options.onEvent?.({ type, timestamp: performance.now(), ...detail }); } catch {}
     };
@@ -2766,6 +2786,10 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
         context: run?.context ?? null,
         ...(run?.settings == null ? {} : { settings: run.settings }),
         durability: chosenDurability,
+        // The agent the engine runs turns for: a name on a store, as
+        // deliveries tell agents apart, so copies of an agent, and one that
+        // replaced another in development, are one agent.
+        agent: { name: agentName, store: member.store },
         ...(ready ? { ready } : {}),
         ...(inputs ? { inputs } : {}),
       }),
@@ -2885,7 +2909,12 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
     };
 
     const openSession = (requestedId, sessionOptions = {}) => {
-      if (requestedId !== undefined && !validId(requestedId)) throw new TypeError(`session id must be ${idRule}`);
+      if (requestedId !== undefined && !validId(requestedId)) throw invalidSessionId(`session id must be ${idRule}`);
+      // A World holds only run ids, which the agent knows before its
+      // durability starts: any other id throws here, at once.
+      if (requestedId !== undefined && worldSessions && !runIdRule.test(requestedId)) {
+        throw invalidSessionId(`session id ${JSON.stringify(requestedId)} is not a Workflow run id ("wrun_" and 10 to 64 letters and digits), the only id ${durability ? `${durability.name}()` : "the default durability"} holds; take one from turn.accepted or agent.newSessionId()`);
+      }
       let context;
       try { context = jsonSnapshot(sessionOptions?.context); } catch { throw new TypeError("session context must be JSON"); }
       const settings = jsonSnapshot(plugged.settings?.(sessionOptions ?? {}));
@@ -2910,7 +2939,7 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
         if (!opened) {
           opened = backend().then((created) => {
             id ??= created.newSessionId();
-            if (!created.validSessionId(id)) throw new TypeError(`${created.name} durability cannot hold session id ${JSON.stringify(id)}`);
+            if (!created.validSessionId(id)) throw invalidSessionId(`${created.name} durability cannot hold session id ${JSON.stringify(id)}`);
             return { created, id };
           });
           void opened.catch(() => {});
@@ -3215,6 +3244,7 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
          * carry.
          */
         async steer(input, steerOptions = {}) {
+          if (closed) throw new Error(`${label} is closed`);
           if (typeof input === "string" ? input.length === 0 : !Array.isArray(input) || input.length === 0) {
             throw new TypeError("steer input must be a non-empty string or array of content blocks");
           }
@@ -3239,6 +3269,7 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
         },
         /** Cancels the running turn; dropping a turn's view does not. */
         async cancel() {
+          if (closed) throw new Error(`${label} is closed`);
           await send({ type: "cancel", messageId: newId("cnl") });
         },
         /** The session's state as opaque bytes, read without changing it. */

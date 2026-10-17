@@ -1,3 +1,4 @@
+import { createHash, randomUUID } from "node:crypto";
 import { access, readFile } from "node:fs/promises";
 import { closeSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -20,6 +21,7 @@ import {
   fxSdkApiVersion,
   listModels,
   normalizeAgentOptions,
+  runtimeAgent,
   supportsJspi,
   xtermAdapter,
 } from "./fx-sdk.js";
@@ -61,16 +63,54 @@ function bundledAssetUrl(asset) {
   return new URL(asset.href.slice(__webpack_public_path__.length), __webpack_base_uri__);
 }
 
-function jspiFallbackError(surface, nativeError) {
-  const nativeDetail = nativeError ? ` Native loading failed: ${nativeError.message}.` : " No compatible native addon was found.";
-  const error = new Error(
-    `libfx could not start the ${surface} backend.${nativeDetail} ` +
-    "The WebAssembly fallback requires JavaScript Promise Integration (JSPI). " +
-    "Run Node with --experimental-wasm-jspi or install a libfx package containing a compatible native addon.",
-  );
+// With `backend: "wasm"`, libfx never tries the native addon, so the error
+// says so rather than that none was found.
+function jspiFallbackError(surface, nativeError, wasmChosen = false) {
+  const message = wasmChosen
+    ? `libfx could not start the ${surface} backend. The "wasm" backend requires JavaScript Promise Integration (JSPI). ` +
+      'Run Node with --experimental-wasm-jspi, or use backend "auto" to run on the native addon where it is installed.'
+    : `libfx could not start the ${surface} backend.${nativeError ? ` Native loading failed: ${nativeError.message}.` : " No compatible native addon was found."} ` +
+      "The WebAssembly fallback requires JavaScript Promise Integration (JSPI). " +
+      "Run Node with --experimental-wasm-jspi or install a libfx package containing a compatible native addon.";
+  const error = new Error(message);
   error.code = "LIBFX_JSPI_REQUIRED";
   error.cause = nativeError;
   return error;
+}
+
+// No native runtime for this engine: all of the process's are in use, or
+// its agent holds its share of them (src/napi_runtime_shares.zig). Its turns
+// run on WebAssembly then, where that can run.
+const nativeLimit = (error) => error?.code === "LIBFX_NATIVE_LIMIT";
+
+function nativeLimitError(nativeError) {
+  const error = new Error(
+    `${nativeError.message}, and WebAssembly, which runs its turns then, requires JavaScript Promise Integration (JSPI): ` +
+    "run Node with --experimental-wasm-jspi",
+    { cause: nativeError },
+  );
+  error.code = "LIBFX_NATIVE_LIMIT";
+  return error;
+}
+
+// One key for each agent counted toward the native runtimes' shares: a
+// durable agent's name on its store, so its copies and an agent that
+// replaced it in development count as one, and a World's store names the
+// same agent in every worker thread; and the engines one JavaScript realm
+// creates outside an agent, together. The addon takes it as a SHA-256, so
+// it is bounded whatever the name of the store.
+const realmKey = (globalThis[Symbol.for("libfx.realmKey")] ??= randomUUID());
+const memoryStores = (globalThis[Symbol.for("libfx.memoryStoreKeys")] ??= { keys: new WeakMap(), next: 0 });
+function storeKeyOf(store) {
+  if (typeof store === "string") return store;
+  if (store === null || typeof store !== "object") return `default:${realmKey}`;
+  let key = memoryStores.keys.get(store);
+  if (key === undefined) memoryStores.keys.set(store, key = `memory:${realmKey}:${memoryStores.next++}`);
+  return key;
+}
+function runtimeShareKey(agent) {
+  const identity = agent ? `agent\0${agent.name}\0${storeKeyOf(agent.store)}` : `engines\0${realmKey}`;
+  return createHash("sha256").update(identity).digest("hex");
 }
 
 async function loadNativeCandidate(candidate) {
@@ -250,7 +290,12 @@ function wasmFilePath(input) {
     if (input.protocol === "") input = bundledAssetUrl(input);
     if (input.protocol === "file:") return fileURLToPath(input);
   }
-  if (typeof input === "string" && !URL.canParse(input)) return resolve(input);
+  if (typeof input === "string") {
+    if (!URL.canParse(input)) return resolve(input);
+    // A file: URL string is read from disk, as a file: URL is: fetch() has
+    // no file: support.
+    if (new URL(input).protocol === "file:") return fileURLToPath(input);
+  }
   return null;
 }
 
@@ -399,6 +444,7 @@ function createNativeCoreRuntime(addon, options) {
     ...(fast === undefined ? {} : { fast }),
     ...(ultrafast === undefined ? {} : { ultrafast }),
     ...(gatewayChatUrl === undefined ? {} : { gatewayChatUrl }),
+    share: runtimeShareKey(options[runtimeAgent]),
   });
   let readyFd;
   let readySocket;
@@ -651,6 +697,9 @@ async function createWithFallback(surface, nativeMethod, wasmFactory, defaultWas
 
   let nativeError;
   let nativeAttempted = false;
+  // The addon had no runtime for this engine to spare, so it runs on
+  // WebAssembly, with backend "native" as with "auto" (R3-D1).
+  let overLimit = false;
   if (backend !== "wasm") {
     const native = await resolveNativeBackend(nativeAddon);
     nativeError = native.error;
@@ -661,12 +710,13 @@ async function createWithFallback(surface, nativeMethod, wasmFactory, defaultWas
         return await native.backend[nativeMethod](runtimeOptions);
       } catch (error) {
         nativeError = error;
-        if (backend === "native" || error?.code === "LIBFX_MODEL_UNSUPPORTED_FAST" ||
+        overLimit = surface === "agent" && nativeLimit(error);
+        if (!overLimit && (backend === "native" || error?.code === "LIBFX_MODEL_UNSUPPORTED_FAST" ||
           error?.code === "LIBFX_MODEL_UNSUPPORTED_EFFORT" ||
-          typeof error?.code === "string" && error.code.startsWith("LIBFX_MODEL_METADATA_")) throw error;
+          typeof error?.code === "string" && error.code.startsWith("LIBFX_MODEL_METADATA_"))) throw error;
       }
     }
-    if (backend === "native") {
+    if (backend === "native" && !overLimit) {
       const error = nativeError ?? new Error(`native addon does not provide ${nativeMethod}()`);
       error.code ??= "LIBFX_NATIVE_UNAVAILABLE";
       throw error;
@@ -676,8 +726,14 @@ async function createWithFallback(surface, nativeMethod, wasmFactory, defaultWas
   const wasmSource = runtimeOptions.wasm ?? defaultWasm;
   if (wasmSource === undefined) throw nativeAttempted ? nativeError : new TypeError(terminalWasmRequired);
   if (!supportsJspi()) {
+    if (overLimit) throw nativeLimitError(nativeError);
     if (nativeAttempted) throw nativeError;
-    throw jspiFallbackError(surface, nativeError);
+    throw jspiFallbackError(surface, nativeError, backend === "wasm");
+  }
+  if (overLimit) {
+    try {
+      runtimeOptions.onEvent?.({ type: "runtime.fallback", timestamp: performance.now(), backend: "wasm", code: nativeError.code, message: nativeError.message });
+    } catch {}
   }
   return wasmFactory({ ...runtimeOptions, wasm: await wasmInput(wasmSource) });
 }
@@ -739,6 +795,8 @@ export const createFxAgent = createDurableAgentFactory({
   defaultDurability: environmentDurability,
   // One durability per environment, so agents created without one share it.
   defaultShared: true,
+  // local() or vercel(), so session ids are run ids.
+  defaultWorld: true,
   // A dev server such as `next dev` loads a module again and so creates its
   // agents again: there the newest replaces the agent its name had. Read
   // each time, as a process may set it after loading libfx, and through

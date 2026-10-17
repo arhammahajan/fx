@@ -5,7 +5,9 @@
 //
 //   node sdk/tests/test-durable-core.mjs [memory|local|world|queue]
 import { strict as assert } from "node:assert";
+import { spawnSync } from "node:child_process";
 import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createDurableAgentFactory, foldSessionLog, memory, wakeHandler } from "../durable.js";
@@ -395,6 +397,37 @@ if (durabilityKind === "local") {
     assert.deepEqual(openersOf(theirs.id), ["coding"]);
     await support.close();
     await coding.close();
+  });
+
+  // Vercel's World answers a process without a deployment's credentials with
+  // a bare "Unauthorized". Here a local server answers as it does.
+  test("vercel() without a deployment's credentials refuses a prompt saying what it needs", async () => {
+    const server = createServer((request, response) => {
+      request.resume();
+      response.writeHead(401, { "content-type": "application/json" }).end(JSON.stringify({ code: "unauthorized", message: "Unauthorized" }));
+    });
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const saved = { url: process.env.VERCEL_WORKFLOW_SERVER_URL, token: process.env.VERCEL_OIDC_TOKEN };
+    process.env.VERCEL_WORKFLOW_SERVER_URL = `http://127.0.0.1:${server.address().port}`;
+    delete process.env.VERCEL_OIDC_TOKEN;
+    try {
+      const { vercel } = await import("../durable/vercel.mjs");
+      const agent = createAgent({ durability: vercel(), name: "outside-vercel" });
+      const refused = await agent.session().prompt("alpha").accepted.then(() => null, (error) => error);
+      assert.ok(refused, "the prompt is refused");
+      assert.match(refused.message, /vercel\(\) keeps sessions in a Vercel project and needs a deployment's credentials/);
+      assert.match(refused.message, /set VERCEL_OIDC_TOKEN/);
+      assert.equal(refused.code, "unauthorized");
+      assert.equal(refused.status, 401);
+      assert.equal(refused.cause?.name, "WorkflowWorldError");
+      await agent.close();
+    } finally {
+      for (const [key, value] of [["VERCEL_WORKFLOW_SERVER_URL", saved.url], ["VERCEL_OIDC_TOKEN", saved.token]]) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      server.close();
+    }
   });
 }
 
@@ -1558,6 +1591,50 @@ test("a new session's id can come before its first prompt, and null is no id", a
   assert.deepEqual(JSON.parse(decoder.decode(await agent.session(id).checkpoint())), ["alpha-0", "alpha-1", "alpha-2"]);
   await agent.close();
 });
+
+test("a session id its durability can't hold throws from session() at once, with a code", async () => {
+  const agent = createAgent({ durability: await durabilityFor() });
+  const invalid = (pattern) => (error) => error instanceof TypeError && error.code === "FX_SESSION_ID_INVALID" && pattern.test(error.message);
+  assert.throws(() => agent.session("bad id"), invalid(/session id must be/));
+  if (durabilityKind === "memory") assert.equal(agent.session("my-chat").id, "my-chat");
+  else assert.throws(() => agent.session("my-chat"), invalid(/^session id "my-chat" is not a Workflow run id .* the only id (local|app|queue)\(\) holds/));
+  // One whose factory's default durability is a World, as Node's is, knows
+  // so before that durability is chosen.
+  const worldDefault = createDurableAgentFactory({ harness: scriptedHarness(), defaultDurability: async () => { throw new Error("no durability is chosen"); }, defaultWorld: true, name: "createWorldAgent" })({ name: "world-default" });
+  assert.throws(() => worldDefault.session("my-chat"), invalid(/the only id the default durability holds/));
+  assert.equal(worldDefault.session("wrun_01JRCOREOPENNOIO00000").id, "wrun_01JRCOREOPENNOIO00000");
+  await worldDefault.close();
+  await agent.close();
+});
+
+test("a session's steer() and cancel() after its agent closed reject as prompt() throws", async () => {
+  const agent = createAgent({ durability: await durabilityFor() });
+  const session = agent.session();
+  assert.equal((await session.prompt("alpha").result).stopReason, "end_turn");
+  await agent.close();
+  assert.throws(() => session.prompt("after"), /agent is closed/);
+  await assert.rejects(session.steer("after"), /agent is closed/);
+  await assert.rejects(session.cancel(), /agent is closed/);
+});
+
+if (durabilityKind === "memory") {
+  test("memory() holds a message no agent listens for, with no timer, and delivers it to the next one", async () => {
+    // A process whose agents all closed exits by itself after a send.
+    const script = `import { memory } from ${JSON.stringify(new URL("../durable.js", import.meta.url).href)};\n` +
+      "await memory().create().queue.send({ type: \"cancel\", messageId: \"cnl-1\", sessionId: \"s\", agent: \"default\" });";
+    const child = spawnSync(process.execPath, ["--input-type=module", "-e", script], { timeout: 5000, encoding: "utf8" });
+    assert.equal(child.signal, null, `the process exited by itself: ${child.stderr}`);
+    assert.equal(child.status, 0, child.stderr);
+    const backend = memory().create();
+    await backend.queue.send({ type: "cancel", messageId: "cnl-2", sessionId: "s", agent: "default" });
+    await sleep(50);
+    const seen = [];
+    const unlisten = backend.listen((message) => { seen.push(message.messageId); });
+    await sleep(50);
+    assert.deepEqual(seen, ["cnl-2"]);
+    unlisten();
+  });
+}
 
 // A memory durability whose stream loses each failed turn's end, as when
 // that write fails after the log recorded the failure.

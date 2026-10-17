@@ -112,7 +112,7 @@ Each handle is a JavaScript object wrapped around a `RuntimeHandle`. It is brand
 
 Creating a core performs these steps:
 
-1. Atomically reserve one of 64 process-wide runtime slots.
+1. Read the bounded `share` option, the key of the agent the runtime is for, and reserve one of 64 process-wide runtime slots for it under one lock. `src/napi_runtime_shares.zig` decides: while slots are contended, no agent holds more than its share, 64 divided by the number of agents holding slots, and the last free slot is kept for an agent that holds none. A runtime created without `share` counts toward the limit only. A refused reservation throws `LIBFX_NATIVE_LIMIT` at once and never waits; the JavaScript loader then runs that engine on WebAssembly. Destruction releases the slot, as does any failure later in creation.
 2. Read and copy bounded configuration strings from the JavaScript options object.
 3. Validate the Gateway endpoint.
 4. Allocate a `Runtime` and bounded fetch bridge using Zig's C allocator.
@@ -199,7 +199,7 @@ All untrusted values crossing the native boundary are bounded before allocation 
 
 One attachment holds a kernel checkpoint, a journal snapshot or the journal records a session opens from, each up to 32 MiB, since an engine's own store keeps a conversation's images inline. A journal opens from a snapshot and its records attached together, so the inbound total is twice that. Prompt images share the table, and the core bounds them as it takes them, below the table's limits. So do the images a durable session saves by name: an open stages the ones the session needs from its image store with `libfx/journal_images`, in batches the table holds. Those are the images one model request carries, at most 100 whose base64 takes at most 30 MiB, and the images of a turn the session left open; JavaScript reads up to 8 at once from the store while it stages the batch before. Older ones keep only their names, and the store keeps their bytes.
 
-The fetch request budget covers the full model request, including retained history and metadata. An engine's history keeps every image, and a durable session's keeps the newest a request carries. The core leaves a request's oldest images out to keep its body within 30 MiB, below the 32 MiB that Claude routes accept. The budget adds 2 MiB for the method, URL and headers, so a request the core trims that way always fits. Text is never left out, so a request whose text alone is over the budget fails with `HostStreamBackpressure` before it reaches `fetch`. The body crosses to Node unencoded beside its metadata, so the transfer adds no separate bound; accepting one tool result does not reserve space for later requests.
+The fetch request budget covers the full model request, including retained history and metadata. An engine's history keeps every image, and a durable session's keeps the newest a request carries. The core leaves a request's oldest images out to keep its body within 30 MiB, below the 32 MiB that Claude routes accept. The budget adds 2 MiB for the method, URL and headers, so a request the core trims that way always fits. Text is never left out, so a request whose text alone is over the budget fails with `HostStreamBackpressure` before it reaches `fetch`. The body crosses to Node unencoded beside its metadata, so the transfer adds no separate bound; accepting one tool result does not reserve space for later requests. Once JavaScript takes a request, or the request is dropped, the bridge frees each request buffer whose capacity is over 64 KiB, and the response buffer likewise when the response closes, so a runtime that once sent a large request doesn't keep that much memory.
 
 Prompt images and kernel checkpoints also cross the boundary unencoded. JavaScript writes each inbound payload with `writeCoreAttachment()` and then sends the ACP frame that references its id, an image block's `_meta.fx.attachment` or `libfx/restore`'s `checkpointAttachment`; the core thread takes the payload once while handling that frame. `libfx/checkpoint` answers with `checkpointAttachment`, and JavaScript takes those bytes with `takeCoreAttachment()`. The attachment table has its own mutex and stores C-allocator copies, so the core thread never touches JavaScript memory. JavaScript discards unconsumed inbound payloads before attaching new ones.
 
@@ -326,7 +326,7 @@ Native errors use stable codes where JavaScript needs to distinguish failure cla
 | Code | Meaning |
 | --- | --- |
 | `LIBFX_INVALID_ARGUMENT` | Missing, mistyped, oversized, invalid, or forged input. |
-| `LIBFX_NATIVE_LIMIT` | The process-wide runtime limit was reached. |
+| `LIBFX_NATIVE_LIMIT` | The process-wide runtime limit was reached, or the agent `share` names holds its share of it. |
 | `LIBFX_NATIVE_BACKPRESSURE` | The bounded input queue cannot accept more bytes. |
 | `LIBFX_NATIVE_CLOSED` | An operation targeted a closed runtime. |
 | `LIBFX_NATIVE_OOM` | Native allocation failed. |

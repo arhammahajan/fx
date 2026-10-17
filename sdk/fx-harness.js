@@ -1,7 +1,7 @@
 // fx as a harness of the durable core in durable.js: `createFxAgent` is that
 // core running fx engines. Everything the core needs to know about fx is
 // here; the core itself knows only the harness contract.
-import { catalogMemory, checkPromptInput, coreAnswered, engineInternals, journalMarksWanted, maxPromptFrameBytes, normalizeInstructions, normalizeModelChoice, promptFrameBytes, turnEndInputs } from "./fx-sdk.js";
+import { catalogMemory, checkPromptInput, coreAnswered, engineInternals, journalMarksWanted, maxPromptFrameBytes, normalizeInstructions, normalizeModelChoice, promptFrameBytes, runtimeAgent, turnEndInputs } from "./fx-sdk.js";
 import { createCredentialMemory, credentialMemory } from "./subscription.js";
 
 const encoder = new TextEncoder();
@@ -41,7 +41,7 @@ export function fxHarness({ createEngine, defaultApiKey = async () => undefined,
       checkPrompt(input) {
         checkPromptInput(input, { resizeImage: engineOptions.resizeImage });
       },
-      async open({ sessionId, store, context, settings, durability, ready, inputs }) {
+      async open({ sessionId, store, context, settings, durability, ready, inputs, agent }) {
         const apiKey = engineOptions.apiKey ?? await defaultApiKey(durability);
         // Only AI Gateway needs a key; another provider has its own
         // credentials. The engine would say only that apiKey is missing.
@@ -58,6 +58,8 @@ export function fxHarness({ createEngine, defaultApiKey = async () => undefined,
           sessionId,
           [credentialMemory]: credentials,
           [catalogMemory]: catalogs,
+          // Whose share of the native runtimes the engine counts toward.
+          ...(agent === undefined ? {} : { [runtimeAgent]: agent }),
           // The core folds the session from the marks on each record.
           persistence: { ...store, [journalMarksWanted]: true },
           inputsDurable: true,
