@@ -30,7 +30,10 @@ const max_drain_bytes = 1024 * 1024;
 const max_input_bytes = 8 * 1024 * 1024;
 const max_output_bytes = 8 * 1024 * 1024;
 const max_output_message_bytes = 64 * 1024 * 1024;
-const max_fetch_request_bytes = 8 * 1024 * 1024;
+// One model request: the largest prompt libfx accepts, an 8 MiB frame and
+// 8 MiB of base64 images (`maxPromptFrameBytes` and `maxPromptImagesDataBytes`
+// in sdk/fx-sdk.js), with 8 MiB for instructions, tools and earlier turns.
+const max_fetch_request_bytes = 24 * 1024 * 1024;
 const max_fetch_response_bytes = 8 * 1024 * 1024;
 // One attachment holds one prompt image or one kernel checkpoint, the larger.
 const max_attachment_bytes = agent_checkpoint.max_checkpoint_bytes;

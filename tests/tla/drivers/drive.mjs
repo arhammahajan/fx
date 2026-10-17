@@ -2,6 +2,9 @@
 // Drives real libfx, with its Zig kernel loaded through the native addon or
 // WebAssembly, along paths of the TLC state graph of DurableSession.tla, and
 // checks after every step that the code is in a state the model allows.
+// Each turn_end line a worker writes waits for the walk's EndLine step, so a
+// walk can crash a worker between the record that ends its turn and that
+// line, and check that another worker writes the end it left missing.
 //
 //   bun tests/tla/drivers/drive.mjs [send|lookup|write|cutoff|leased|queue] [--walks N] [--seed S] [--backend native|wasm]
 //     [--durability local|world|vercel] [--hooks]
@@ -90,15 +93,16 @@ const addon = resolve(here, "../../../zig-out/lib/libfx.node");
 const wasm = backend === "wasm" ? await readFile(resolve(here, "../../../zig-out/bin/fx-core.wasm")) : undefined;
 const Workers = ["A", "B"];
 
-// The epochs of the lines every reader shows, by the spec's ShownAt: each
-// line no earlier line outranks.
-const shownEpochs = (lines) => {
+// The lines every reader shows, by the spec's ShownAt: each line no earlier
+// line outranks, as its epoch, with an "e" after a turn_end's.
+const lineView = (epoch, end) => `${epoch}${end ? "e" : ""}`;
+const shownLines = (lines) => {
   let high = 0;
   const shown = [];
   for (const line of lines) {
     if (line.e < high) continue;
     high = line.e;
-    shown.push(line.e);
+    shown.push(lineView(line.e, line.end));
   }
   return shown;
 };
@@ -106,7 +110,7 @@ const shownEpochs = (lines) => {
 // leased World, whether a lease stands too: a woken worker's renewal may or
 // may not have landed, and only the lease tells those states apart.
 const view = (state) => JSON.stringify({
-  pc: state.pc, frozen: state.frozen, runs: state.runs, ids: state.ids, ui: shownEpochs(state.ui), ...(leased ? { live: state.live ?? state.lease.live } : {}),
+  pc: state.pc, frozen: state.frozen, runs: state.runs, ids: state.ids, ui: shownLines(state.ui), ...(leased ? { live: state.live ?? state.lease.live } : {}),
 });
 const sameAct = (a, b) => a.name === b.name && a.w === b.w;
 
@@ -191,6 +195,8 @@ async function harness() {
   // Each worker's held writes: its claims on the session, a call's first
   // intent, and a frozen leased worker's renewals.
   const held = { A: [], B: [] };
+  // How many turn_end lines each worker's writes hold.
+  const endsHeld = { A: 0, B: 0 };
   // On the queue's World, the message a frozen holder's delivery held, which
   // the queue delivers again.
   const lapsed = { A: null, B: null };
@@ -206,7 +212,10 @@ async function harness() {
     if (index >= 0) list.splice(index, 1);
   };
   report = (w, message) => {
-    if (message.type === "held") held[w] = message.held;
+    if (message.type === "held") {
+      held[w] = message.held;
+      endsHeld[w] = message.ends ?? 0;
+    }
     else if (message.type === "request") requests.push({ w, id: message.id, kind: message.kind });
     else if (message.type === "request-gone") remove(requests, requests.find((entry) => entry.w === w && entry.id === message.id));
     else if (message.type === "call") {
@@ -241,12 +250,14 @@ async function harness() {
     if (claimed[w] === null) return "none";
     if (fenced[w] > claimed[w].fenced) return "stopped";
     if (lines.some((line) => line.type === "turn_end" && line.epoch === claimed[w].epoch)) return "done";
+    // Its turn's end is in the log and its turn_end line waits.
+    if (endsHeld[w] > 0) return "ending";
     const request = requests.find((entry) => entry.w === w);
     if (request) return request.kind;
     if (calls.some((entry) => entry.w === w)) return held[w].some((entry) => entry.k === "record") ? "ahead" : "tool";
     return "busy";
   };
-  const waiting = (w) => requests.some((entry) => entry.w === w) || calls.some((entry) => entry.w === w);
+  const waiting = (w) => requests.some((entry) => entry.w === w) || calls.some((entry) => entry.w === w) || endsHeld[w] > 0;
   const newHolders = (before) => [...liveHolders].filter((holder) => !before.has(holder));
 
   async function observe() {
@@ -282,7 +293,7 @@ async function harness() {
       frozen: { ...frozen },
       runs,
       ids: executions.size,
-      ui: lines.filter((line) => modeledLines.has(line.type)).map((line) => line.epoch ?? 0),
+      ui: lines.filter((line) => modeledLines.has(line.type)).map((line) => lineView(line.epoch ?? 0, line.type === "turn_end")),
       ...(leased ? { live: sessionId ? await call("A", "leaseStands", { sessionId }) : false } : {}),
     };
   }
@@ -336,7 +347,12 @@ async function harness() {
         ? [{ type: "tool-call", toolCallId: `call-${(modelCalls += 1)}`, toolName: tool, input: { key: "alpha" } }, finish("tool-calls")]
         : [{ type: "text-delta", id: "answer", delta: "done" }, finish("stop")]);
       if (name === "Model1") await until(() => calls.some((entry) => entry.w === w) || stopped());
-      else await until(async () => stopped() || (await streamLines()).some((line) => line.type === "turn_end" && line.epoch === claimed[w].epoch));
+      // The record that ends the turn lands, and its turn_end line waits.
+      else await until(() => stopped() || endsHeld[w] > 0);
+    } else if (name === "EndLine") {
+      // w's turn_end line goes out, then its release.
+      await call(w, "releaseEnds");
+      await until(async () => stopped() || (await streamLines()).some((line) => line.type === "turn_end" && line.epoch === claimed[w].epoch));
     } else if (name === "Intent") {
       // The intent of w's call that ran ahead lands. Where w still heads the
       // chain its call goes on; where it was replaced the write is refused,
@@ -386,7 +402,7 @@ async function harness() {
         if (reclaimed()) took = true;
         if (held[w].length > 0) return false;
         if (took && waiting(w)) return true;
-        if (await ended()) return (took = true);
+        if (endsHeld[w] > 0 || (await ended())) return (took = true);
         return fenced[w] > fencedBefore;
       });
       if (took) {

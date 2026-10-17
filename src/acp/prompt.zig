@@ -979,6 +979,10 @@ pub fn handlePrompt(
             for (inputs, ids) |input, *id| id.* = input.id;
             try journal.notePlaced(state.alloc, ids);
         }
+        // The crashed turn took these inputs and died before its viewers
+        // heard of them, so they show now, where the turn places them, as a
+        // steer does when a boundary takes it (DUR-23).
+        for (inputs) |input| try publishSteeringReplay(&ctx, input.text, null, input.id);
         journal.dropPendingResume(state.alloc);
         // Calls the crash left running that the host asked to run again do
         // so before the turn continues, and their results replace the answer
@@ -2245,6 +2249,11 @@ fn finalizeTurn(raw_ctx: *anyopaque, turn_id: u64, outcome: types.TurnPresentati
         ctx.stop_reason = .max_output_tokens;
     } else if (outcome == .failed or outcome == .paused) {
         ctx.stop_reason = .refused;
+    } else if (outcome == .interrupted) {
+        // The session records the turn as interrupted, so it reports
+        // cancelled whatever stopped it, a handoff included: its end never
+        // says end_turn while the journal says otherwise (DUR-64).
+        ctx.stop_reason = .cancelled;
     }
 }
 
@@ -3230,12 +3239,16 @@ fn pushToolLifecycle(raw_ctx: *anyopaque, event: types.ToolLifecycleEvent) !void
             if (ctx.state.cfg.minimal_kernel) server.noteSteeringToolsPhase(ctx.state);
             const tool_name = provisional.tool_name orelse return;
             if (!tool_presentation.isProviderSearchAlias(tool_name)) return;
+            // A libfx viewer gets one tool_start per call, so a search waits
+            // to start until its input is known (API-68).
+            const arguments_json = provisional.arguments_json orelse
+                if (ctx.state.cfg.minimal_kernel) return else "{}";
             var arena_state = std.heap.ArenaAllocator.init(ctx.alloc);
             defer arena_state.deinit();
             _ = try ctx.sendToolCallPending(arena_state.allocator(), .{
                 .id = provisional.id.call_id,
                 .name = tool_name,
-                .arguments_json = "{}",
+                .arguments_json = arguments_json,
                 .provenance = .provider_executed,
             });
         },

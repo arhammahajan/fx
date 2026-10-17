@@ -79,7 +79,9 @@ async function loadNativeCandidate(candidate) {
       // Bundlers trace the asset URL; Node must load the native file at runtime.
       return Reflect.apply(nodeRequire, undefined, [fileURLToPath(candidate)]);
     }
-    const imported = await import(candidate.href);
+    // The app names this module at run time, so a bundler must leave the
+    // import to Node rather than turn it into a context of every file.
+    const imported = await import(/* webpackIgnore: true */ /* turbopackIgnore: true */ candidate.href);
     return imported.default ?? imported;
   }
   if (typeof candidate === "object") return candidate.default ?? candidate;
@@ -89,7 +91,7 @@ async function loadNativeCandidate(candidate) {
   if (candidate.endsWith(".node")) {
     return Reflect.apply(nodeRequire, undefined, [isAbsolute(candidate) ? candidate : resolve(candidate)]);
   }
-  const imported = await import(candidate.startsWith("file:") ? candidate : pathToFileURL(candidate).href);
+  const imported = await import(/* webpackIgnore: true */ /* turbopackIgnore: true */ candidate.startsWith("file:") ? candidate : pathToFileURL(candidate).href);
   return imported.default ?? imported;
 }
 
@@ -719,6 +721,7 @@ export const createFxAgent = createDurableAgentFactory({
     defaultApiKey: async (durability) => process.env.AI_GATEWAY_API_KEY ||
       (await Promise.resolve(durability?.gatewayKey?.()).catch(() => undefined)) ||
       process.env.VERCEL_OIDC_TOKEN || undefined,
+    keySources: ", set AI_GATEWAY_API_KEY or VERCEL_OIDC_TOKEN in the environment, or give its durability a gatewayKey()",
   }),
 });
 

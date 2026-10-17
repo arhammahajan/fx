@@ -51,10 +51,13 @@ const maxCheckpointBytes = 4 * 1024 * 1024;
 // Matches the core's journal load limit (journal.max_load_bytes).
 const maxJournalBytes = 4 * 1024 * 1024;
 // The core's ACP reader drops frames over 8 MiB without a request id to answer
-// (jsonrpc frame_resource_byte_limit), so the SDK must never emit one. The
-// envelope allowance covers the method key and request id.
-const maxPromptFrameBytes = 8 * 1024 * 1024;
-const promptFrameEnvelopeBytes = 128;
+// (jsonrpc frame_resource_byte_limit), so the SDK must never emit one. Prompt
+// images travel beside the frame, so only text, resources and metadata count.
+// The envelope allowance covers what session/prompt adds around its blocks at
+// its longest: the JSON-RPC envelope and request id, a 255-byte session id,
+// and `_meta.fx` with a turn id, an input id and a yield time.
+export const maxPromptFrameBytes = 8 * 1024 * 1024;
+const promptFrameEnvelopeBytes = 1024;
 const maxSteeringMessageBytes = 64 * 1024;
 const maxSteeringMessages = 64;
 const maxSteeringQueueBytes = 1024 * 1024;
@@ -71,6 +74,11 @@ function boundedString(value, name, maxBytes, required) {
     throw new RangeError(`${name} exceeds the ${maxBytes} byte libfx limit`);
   }
   return value;
+}
+
+// What a caller that names no AI Gateway credential does about it (QUAL-18).
+function missingGatewayKey(factory) {
+  return new TypeError(`no AI Gateway credentials were found: pass apiKey, an AI Gateway API key or a Vercel OIDC token, to ${factory}()`);
 }
 
 function validateGatewayChatUrl(value) {
@@ -183,8 +191,11 @@ export function normalizeAgentOptions(value) {
   options.customProvider = custom;
   options.providerName = custom ? custom.name : options.provider;
   const subscription = subscriptionProviders.has(options.provider);
-  // Gateway needs its key; every other provider runs on the host's credentials.
-  options.apiKey = boundedString(options.apiKey, "apiKey", maxApiKeyBytes, !subscription && !custom);
+  // Gateway needs its key; every other provider runs on the host's
+  // credentials. An engine reads no environment, so the key comes only from
+  // here.
+  if (options.apiKey === undefined && !subscription && !custom) throw missingGatewayKey("createFxEngine");
+  options.apiKey = boundedString(options.apiKey, "apiKey", maxApiKeyBytes, false);
   if (subscription && typeof options.credentials !== "function") {
     throw new TypeError(`provider "${options.provider}" needs a credentials() function`);
   }
@@ -234,6 +245,9 @@ export function normalizeAgentOptions(value) {
 // public surface.
 export const engineInternals = Symbol.for("libfx.engineInternals");
 export const journalMarksWanted = Symbol.for("libfx.journalMarks");
+// The Gateway catalog an agent fetched, a Map shared by every engine the
+// agent opens, so the agent fetches it once for all its sessions (API-15).
+export const catalogMemory = Symbol.for("libfx.catalogMemory");
 // Marks an error the core answered a request with, as opposed to one from a
 // core that stopped answering.
 export const coreAnswered = Symbol.for("libfx.coreAnswered");
@@ -566,7 +580,8 @@ export async function listModels(options = {}) {
   if (!options || typeof options !== "object" || Array.isArray(options)) {
     throw new TypeError("listModels() options must be an object");
   }
-  const apiKey = boundedString(options.apiKey, "apiKey", maxApiKeyBytes, true);
+  if (options.apiKey === undefined) throw missingGatewayKey("listModels");
+  const apiKey = boundedString(options.apiKey, "apiKey", maxApiKeyBytes, false);
   const fetchModels = options.fetch ?? globalThis.fetch?.bind(globalThis);
   if (typeof fetchModels !== "function") throw new TypeError("fetch is unavailable");
   const response = await fetchModels("https://ai-gateway.vercel.sh/coding-agent/v1/models", {
@@ -1039,11 +1054,16 @@ function createRuntime(options) {
     return handle;
   }
 
+  // A failure after libfx's own abort is a cancel, whatever the host's fetch
+  // threw; any other failure, an AbortError of its own included, is an error
+  // (API-60, API-63), as on the native backend.
+  const streamFailure = (state) => state.controller.signal.aborted ? -2 : -1;
+
   function streamStatus(handle, statusOut) {
     const state = streams.get(handle);
     if (!state) return -1;
     const settled = () => {
-      if (state.responseError) return state.responseError?.name === "AbortError" ? -2 : -1;
+      if (state.responseError) return streamFailure(state);
       if (!state.response) return 0;
       new DataView(memory().buffer).setUint16(statusOut, state.response.status, true);
       return 1;
@@ -1072,7 +1092,7 @@ function createRuntime(options) {
     };
     const consume = () => {
       if (state.leftover.length) return copy(state.leftover);
-      if (state.readError) return state.readError?.name === "AbortError" ? -2 : -1;
+      if (state.readError) return streamFailure(state);
       if (!state.readResult) return null;
       const { done, value } = state.readResult;
       state.readResult = null;
@@ -1972,31 +1992,49 @@ function normalizePromptInput(input, { deferImageLimits = false } = {}) {
       imageBytes = prompt.reduce((total, block) => total + (block.type === "image" ? block.byteLength ?? 0 : 0), 0);
     }
     checkPromptImagesByteLength(imageBytes);
-    if (promptFrameSize(prompt) > maxPromptFrameBytes) prompt = omitReferencedImageData(prompt);
   }
   return prompt;
 }
 
-// Image bytes travel beside the frame as attachment references, but the model
-// request carries them base64 encoded and the native host caps that request at
-// 8 MiB. Images therefore count at their encoded size, the same budget they
-// had inside the frame. With countImages false, only the frame counts.
-function promptFrameSize(prompt, countImages = true) {
-  const encodedImageBytes = countImages ? promptImageDataBytes(prompt) : 0;
-  const projected = prompt.map((block) => block.type !== "image" ? block : {
+// A prompt block as session/prompt carries it, from the caller's block or
+// from normalizePromptInput()'s: an image's bytes travel beside the frame as
+// an attachment, which the frame names.
+function framedPromptBlock(block) {
+  if (block?.type === "text") return { type: "text", text: block.text };
+  if (block?.type === "resource") {
+    const resource = block.resource || block;
+    return { type: "resource", resource: { uri: resource.uri, ...(resource.text === undefined ? {} : { text: resource.text }) } };
+  }
+  if (block?.type !== "image") return block;
+  return {
     type: "image",
     mimeType: block.mimeType,
     ...(block.sourceRef === undefined ? {} : { sourceRef: block.sourceRef }),
     ...(block.data === undefined && block.bytes === undefined ? {} : { _meta: { fx: { attachment: 0xffffffff } } }),
-  });
-  return encoder.encode(JSON.stringify({ sessionId: "", prompt: projected })).length +
-    encodedImageBytes + promptFrameEnvelopeBytes;
+  };
 }
 
-function checkPromptFrameSize(prompt, countImages) {
-  if (promptFrameSize(prompt, countImages) > maxPromptFrameBytes) {
+// The most the session/prompt frame for these blocks can take. The model
+// request also carries the images, base64 encoded; the native host's request
+// budget holds a full frame and a prompt's 8 MiB of encoded images.
+function promptFrameSize(prompt) {
+  return encoder.encode(JSON.stringify(prompt.map(framedPromptBlock))).length + promptFrameEnvelopeBytes;
+}
+
+function checkPromptFrameSize(prompt) {
+  if (promptFrameSize(prompt) > maxPromptFrameBytes) {
     throw new RangeError(`prompt exceeds the ${maxPromptFrameBytes} byte libfx frame limit`);
   }
+}
+
+/**
+ * What a prompt `input` takes of the frame an engine sends it in, as
+ * `prompt()` measures it, for a durable session to refuse an input no engine
+ * could take before it stores it. Pure; it validates nothing, so an input
+ * the engine refuses for another reason is measured too.
+ */
+export function promptFrameBytes(input) {
+  return promptFrameSize(typeof input === "string" ? [{ type: "text", text: input }] : Array.isArray(input) ? input : [input]);
 }
 
 // Returns prompt blocks whose images carry { mimeType, bytes }. Synchronous
@@ -2060,8 +2098,8 @@ async function materializePromptImages(blocks, isCancelled, resizeImage) {
     }
     checkPromptImagesByteLength(imageBytes);
   }
-  if (promptFrameSize(prepared) > maxPromptFrameBytes) prepared = omitReferencedImageData(prepared);
-  checkPromptFrameSize(prepared, true);
+  // A callback's mimeType can be longer than the one it replaced.
+  checkPromptFrameSize(prepared);
   return prepared;
 }
 
@@ -2174,6 +2212,30 @@ function modelCatalogBody(value) {
     throw new RangeError(`modelCatalog exceeds the ${maxModelCatalogBytes} byte libfx limit`);
   }
   return body;
+}
+
+// Answers a catalog request from `memory`, which maps a request to the body
+// the agent's first such request got. Only a successful response is kept: a
+// request that waited on one that failed fetches for itself.
+async function rememberedCatalog(memory, key, fetchCatalog) {
+  const remembered = memory.get(key);
+  if (remembered) {
+    const body = await remembered;
+    if (body === null) return fetchCatalog();
+    return new Response(body, { status: 200, headers: { "content-type": "application/json" } });
+  }
+  let settle;
+  memory.set(key, new Promise((resolve) => { settle = resolve; }));
+  let body = null;
+  try {
+    const response = await fetchCatalog();
+    if (!response.ok) return response;
+    body = await readBoundedResponseText(response, maxModelCatalogBytes);
+    return new Response(body, { status: response.status, headers: response.headers });
+  } finally {
+    if (body === null) memory.delete(key);
+    settle(body);
+  }
 }
 
 export function normalizeInstructions(value) {
@@ -2565,10 +2627,19 @@ export async function createFxEngine(options = {}) {
       endpoint = `${url.origin}${url.pathname}`;
       path = url.pathname;
     } catch {}
+    const catalogRequest = method === "GET" && path === "/coding-agent/v1/models";
     // A supplied catalog answers the core's catalog request without the network.
-    if (options.modelCatalogBody && method === "GET" && path === "/coding-agent/v1/models") {
+    if (options.modelCatalogBody && catalogRequest) {
       return new Response(options.modelCatalogBody, { status: 200, headers: { "content-type": "application/json" } });
     }
+    // So does one this engine's agent already fetched for the same request.
+    if (catalogRequest && options[catalogMemory]) {
+      const key = [String(input?.url ?? input), ...new Headers(init.headers ?? input?.headers)].join("\n");
+      return rememberedCatalog(options[catalogMemory], key, () => networkFetch(input, init, method, endpoint));
+    }
+    return networkFetch(input, init, method, endpoint);
+  };
+  const networkFetch = async (input, init, method, endpoint) => {
     for (let attemptIndex = 0; attemptIndex < 2; attemptIndex++) {
       const startedAt = performance.now();
       const attempt = activeTurn ? ++activeTurn.transportAttempts : attemptIndex + 1;
@@ -3206,8 +3277,8 @@ export async function createFxEngine(options = {}) {
     // Blob reads and resizeImage run before the prompt frame is sent.
     const asyncImages = hasPixels && (resizeImage !== undefined ||
       normalized.some((block) => block.type === "image" && block.source === "blob"));
-    // resizeImage decides the final image sizes, so they are counted after it runs.
-    checkPromptFrameSize(normalized, resizeImage === undefined);
+    // Image sizes, which resizeImage decides, are checked after it runs.
+    checkPromptFrameSize(normalized);
     // Snapshot caller-owned bytes, which could change before an async send.
     const prompt = asyncImages
       ? normalized.map((block) => block.type === "image" && block.source === "bytes" ? { ...block, data: block.data.slice() } : block)

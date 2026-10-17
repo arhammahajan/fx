@@ -47,11 +47,12 @@ try {
         return Response.json({ object: "list", data: [{ id: "native/image-model", type: "language", tags: ["tool-use", "vision", "file-input"] }] });
       }
       requests += 1;
-      if (requests === 1) return sse(
-        { type: "tool-call", toolCallId: "images1", toolName: "screenshots", input: {} },
+      // Each prompt calls the tool once, then answers with its images.
+      if (requests % 2 === 1) return sse(
+        { type: "tool-call", toolCallId: `images${requests}`, toolName: "screenshots", input: {} },
         { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
       );
-      assert.equal(requests, 2);
+      if (requests > 2) return sse({ type: "finish", finishReason: { unified: "stop", raw: "stop" } });
       assert.ok(init.body.length < 8 * 1024 * 1024);
       assert.ok(Buffer.from(init.body).toString("base64").length > 8 * 1024 * 1024);
       const payload = JSON.parse(Buffer.from(init.body).toString("utf8"));
@@ -76,9 +77,12 @@ try {
   assert.equal(toolCalls, 1);
   assert.equal(requests, 2);
 
-  // The retained images plus this prompt exceed the unchanged raw request budget.
-  await assert.rejects(agent.prompt("x".repeat(2 * 1024 * 1024)).result, /HostStreamBackpressure/);
-  assert.equal(requests, 2, "an oversized raw request must not reach host fetch");
+  // The raw request budget, 24 MiB, holds the 21 MiB of images three such
+  // turns retain, and not those with this 4 MiB prompt as well.
+  for (const _ of [2, 3]) assert.equal((await agent.prompt("take screenshots").result).stopReason, "end_turn");
+  assert.equal(requests, 6);
+  await assert.rejects(agent.prompt("x".repeat(4 * 1024 * 1024)).result, /HostStreamBackpressure/);
+  assert.equal(requests, 6, "an oversized raw request must not reach host fetch");
   console.log("native image framing passed: accepted images survive base64 framing; oversized raw requests stay bounded");
 } finally {
   clearTimeout(timer);

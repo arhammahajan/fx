@@ -31,6 +31,17 @@
 (*                                                                         *)
 (* With all four off, the spec is libfx before them (Witness-Today).       *)
 (*                                                                         *)
+(* Development is a process where NODE_ENV is "development", whose dev     *)
+(* server loads a module again and so creates its agent again. There, with *)
+(* OneDefinition, a new agent of a name and store key replaces the agent   *)
+(* it would be refused for. The replaced agent takes no more deliveries    *)
+(* but still sends, since a module loaded before still holds it, and its   *)
+(* inputs run on its replacement: RunsOnSenderOrReplacement holds, and     *)
+(* RunsOnSenderAgent does not (Witness-DevReplaces). That needs one store  *)
+(* key to be one store, as it is for a module that creates its World again *)
+(* over the same storage. A replacement on another store under the same    *)
+(* key leaves the replaced agent's inputs unrun (Witness-DevOtherStore).   *)
+(*                                                                         *)
 (* A worker that takes a message runs every input of the session its       *)
 (* store holds and no turn ran yet, as one turn each. A session belongs to *)
 (* the agent its first stored input names; a message that reached another  *)
@@ -45,7 +56,8 @@ CONSTANTS
     LogFirst,
     RouteByStore,
     OneDefinition,
-    Admission
+    Admission,
+    Development     \* NODE_ENV is "development": a new definition replaces the old
 
 None == "none"
 Forger == "forger"
@@ -89,13 +101,18 @@ VARIABLES
     ran,      \* turns run: which input, on whose agent, in which store, with which context
     sent,     \* the prompts the apps sent, by id and tenant
     forges,   \* deliveries the attacker posted so far
+    replacedBy, \* in development, the tenant whose agent replaced each one's
     act       \* the step just taken, for the driver
 
-vars == <<agents, refused, log, owner, done, queue, ran, sent, forges, act>>
+vars == <<agents, refused, log, owner, done, queue, ran, sent, forges, replacedBy, act>>
+
+\* Tenants whose agent another replaced: they still send.
+Replaced == {t \in Tenants: replacedBy[t] # None}
 
 TypeOK ==
     /\ agents \subseteq Tenants
     /\ refused \subseteq Tenants
+    /\ replacedBy \in [Tenants -> Tenants \cup {None}]
     /\ log \in [Stores -> SUBSET Entry]
     /\ owner \in [Stores -> [Tenants -> Names \cup {None}]]
     /\ done \in [Stores -> SUBSET Ids]
@@ -114,29 +131,38 @@ Init ==
     /\ ran = {}
     /\ sent = {}
     /\ forges = 0
+    /\ replacedBy = [t \in Tenants |-> None]
     /\ act = [name |-> "Init"]
 
 \* What the queue carries for m: with LogFirst, only which input it names.
 Ref(m) == IF LogFirst THEN [m EXCEPT !.ctx = None, !.size = None] ELSE m
 
-\* Tenant t's app creates its agent.
+\* Tenant t's app creates its agent. In development, an agent OneDefinition
+\* would refuse replaces the agents it collides with instead.
 Register(t) ==
-    /\ t \notin agents \cup refused
-    /\ IF OneDefinition /\ \E u \in agents: NameOf[u] = NameOf[t] /\ KeyOf[u] = KeyOf[t]
-       THEN /\ refused' = refused \cup {t}
-            /\ UNCHANGED agents
+    LET rivals == {u \in agents: NameOf[u] = NameOf[t] /\ KeyOf[u] = KeyOf[t]}
+    IN
+    /\ t \notin agents \cup refused \cup Replaced
+    /\ IF OneDefinition /\ rivals # {}
+       THEN IF Development
+            THEN /\ agents' = (agents \ rivals) \cup {t}
+                 /\ replacedBy' = [u \in Tenants |-> IF u \in rivals THEN t ELSE replacedBy[u]]
+                 /\ UNCHANGED refused
+            ELSE /\ refused' = refused \cup {t}
+                 /\ UNCHANGED <<agents, replacedBy>>
        ELSE /\ agents' = agents \cup {t}
-            /\ UNCHANGED refused
+            /\ UNCHANGED <<refused, replacedBy>>
     /\ act' = [name |-> "Register", t |-> t]
     /\ UNCHANGED <<log, owner, done, queue, ran, sent, forges>>
 
-\* Tenant t's app sends an input of `size` to its own session.
+\* Tenant t's app sends an input of `size` to its own session, through its
+\* agent, which may have been replaced since.
 Send(t, size) ==
     LET id == Cardinality(sent) + 1
         st == StoreOf[t]
         m == [id |-> id, s |-> t, n |-> NameOf[t], key |-> KeyOf[t], ctx |-> t, size |-> size]
     IN
-    /\ t \in agents
+    /\ t \in agents \cup Replaced
     /\ Cardinality(sent) < MaxPrompts
     /\ sent' = sent \cup {[id |-> id, t |-> t]}
     /\ queue' = queue \cup {Ref(m)}
@@ -144,7 +170,7 @@ Send(t, size) ==
        THEN /\ log' = [log EXCEPT ![st] = @ \cup {[id |-> id, s |-> t, n |-> NameOf[t], ctx |-> t, size |-> size]}]
             /\ owner' = [owner EXCEPT ![st][t] = IF @ = None THEN NameOf[t] ELSE @]
        ELSE UNCHANGED <<log, owner>>
-    /\ UNCHANGED <<agents, refused, done, ran, forges>>
+    /\ UNCHANGED <<agents, refused, done, ran, forges, replacedBy>>
 
 Prompt(t) ==
     /\ Send(t, "ok")
@@ -152,9 +178,9 @@ Prompt(t) ==
 
 \* The app sends an input over the limit, as a prompt or a steer.
 Oversize(t, k) ==
-    /\ t \in agents
+    /\ t \in agents \cup Replaced
     /\ IF Admission
-       THEN UNCHANGED <<agents, refused, log, owner, done, queue, ran, sent, forges>>
+       THEN UNCHANGED <<agents, refused, log, owner, done, queue, ran, sent, forges, replacedBy>>
        ELSE Send(t, "big")
     /\ act' = [name |-> "Oversize", t |-> t, k |-> k]
 
@@ -197,7 +223,7 @@ Deliver(m) ==
     /\ m \in queue
     /\ Handle(m, queue \ {m}, queue)
     /\ act' = [name |-> "Deliver", id |-> m.id, s |-> m.s, n |-> m.n, key |-> m.key]
-    /\ UNCHANGED <<agents, refused, sent, forges>>
+    /\ UNCHANGED <<agents, refused, sent, forges, replacedBy>>
 
 \* The attacker posts a delivery straight to the route.
 Forge(id, s, n, key) ==
@@ -206,7 +232,7 @@ Forge(id, s, n, key) ==
     /\ Handle([id |-> id, s |-> s, n |-> n, key |-> key, ctx |-> Forger, size |-> "ok"], queue, queue)
     /\ forges' = forges + 1
     /\ act' = [name |-> "Forge", id |-> id, s |-> s, n |-> n, key |-> key]
-    /\ UNCHANGED <<agents, refused, sent>>
+    /\ UNCHANGED <<agents, refused, sent, replacedBy>>
 
 Next ==
     \/ \E t \in Tenants: Register(t)
@@ -232,6 +258,17 @@ OnlySentRuns == \A r \in ran: Sender(r) # {}
 \* context its app gave.
 RunsOnSenderAgent == \A r \in ran: \A x \in Sender(r): r.def = x.t
 RunsInSenderStore == \A r \in ran: \A x \in Sender(r): r.store = StoreOf[x.t]
+
+\* Tenant t and the tenants whose agents replaced its own, directly or in turn.
+Successors(t) ==
+    LET Reach[n \in 0..Cardinality(Tenants)] ==
+            IF n = 0 THEN {t}
+            ELSE Reach[n - 1] \cup {replacedBy[u] : u \in {v \in Reach[n - 1]: replacedBy[v] # None}}
+    IN Reach[Cardinality(Tenants)]
+
+\* In development, an input runs on its sender's agent or on one that
+\* replaced it; without Development this is RunsOnSenderAgent.
+RunsOnSenderOrReplacement == \A r \in ran: \A x \in Sender(r): r.def \in Successors(x.t)
 RunsWithSenderContext == \A r \in ran: \A x \in Sender(r): r.ctx = x.t
 
 \* No store holds an input over the limit.

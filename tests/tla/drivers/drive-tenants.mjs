@@ -3,10 +3,14 @@
 // TenantIsolation.tla, and checks after every step that the code is in a
 // state the model allows.
 //
-//   bun tests/tla/drivers/drive-tenants.mjs [--walks N] [--depth N] [--seed S]
+//   bun tests/tla/drivers/drive-tenants.mjs [--walks N] [--depth N] [--seed S] [--development]
 //
 // `tests/tla/sdk/check.sh` model-checks the spec and writes
-// graphs/tenants-route.dot, the "four" topology with every rule on.
+// graphs/tenants-route.dot, the "four" topology with every rule on, and
+// graphs/tenants-dev.dot, the "shared" topology under Development, which
+// --development walks with NODE_ENV=development: there acme and evil name
+// their agents "support" on one World, and each one created replaces the
+// other's.
 //
 // This process is the shared function. Four tenants each create one agent
 // in it, as the model's Register steps say: acme and evil both name theirs
@@ -38,6 +42,10 @@ const option = (name, fallback) => {
 };
 const walks = Number(option("walks", 40));
 const depth = Number(option("depth", 14));
+const development = args.includes("--development");
+// libfx reads NODE_ENV each time it creates an agent.
+if (development) process.env.NODE_ENV = "development";
+else delete process.env.NODE_ENV;
 let seed = Number(option("seed", Date.now() % 100000));
 const firstSeed = seed;
 // A small deterministic generator, so a failing walk can be run again.
@@ -49,20 +57,23 @@ const pick = (items) => items[Math.floor(random() * items.length)];
 
 const here = fileURLToPath(new URL(".", import.meta.url));
 const { createWorld } = await import(new URL("../../../sdk/durable/node_modules/@workflow/world-local/dist/index.js", import.meta.url).href);
-const graph = await loadGraph(resolve(here, "../sdk/graphs/tenants-route.dot"));
+const graph = await loadGraph(resolve(here, `../sdk/graphs/tenants-${development ? "dev" : "route"}.dot`));
 const durableInternals = Symbol.for("libfx.durableInternals");
+// The process's durable agents, by name, as libfx registers them.
+const agentRegistry = globalThis[Symbol.for("libfx.durableAgents")];
 const encoder = new TextEncoder();
 
-// The "four" topology, as TenantIsolation.tla defines it.
-const tenants = ["acme", "evil", "bob", "carl"];
+// The "four" topology, or under --development the "shared" one, as
+// TenantIsolation.tla defines them.
+const tenants = development ? ["acme", "evil"] : ["acme", "evil", "bob", "carl"];
 const nameOf = { acme: "support", evil: "support", bob: "billing", carl: "support" };
 const keyOf = { acme: "k1", evil: "k1", bob: "k1", carl: "k2" };
-const storeOf = { acme: "A", evil: "B", bob: "A", carl: "C" };
-const stores = ["A", "B", "C"];
+const storeOf = development ? { acme: "A", evil: "A" } : { acme: "A", evil: "B", bob: "A", carl: "C" };
+const stores = development ? ["A"] : ["A", "B", "C"];
 const keyOfStore = { A: "k1", B: "k1", C: "k2" };
 // Comfortably over the limit libfx admits for one input (sdk/durable.js
-// maxInputBytes).
-const oversizeBytes = 9 * 1024 * 1024;
+// maxInputBytes), which this harness, framing nothing, is held to.
+const oversizeBytes = 17 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // The code under test.
@@ -167,9 +178,10 @@ async function openWalk() {
   const sessionOf = {};
   for (const t of tenants) sessionOf[t] = await observers.A.newSessionId();
   const tenantOfSession = new Map(tenants.map((t) => [sessionOf[t], t]));
-  const walk = { base, worlds, durabilities, storeOfDurability, observers, sessionOf, tenantOfSession, agents: {}, refused: new Set(), sent: [] };
+  // `created` holds each tenant's agent, replaced or not, as its app does.
+  const walk = { base, worlds, durabilities, storeOfDurability, observers, sessionOf, tenantOfSession, created: {}, refused: new Set(), sent: [] };
   walk.close = async () => {
-    for (const agent of [...Object.values(walk.agents), ...Object.values(observers)]) await agent.close().catch(() => {});
+    for (const agent of [...Object.values(walk.created), ...Object.values(observers)]) await agent.close().catch(() => {});
     for (const st of stores) await Promise.resolve(worlds[st].stored.close?.()).catch(() => {});
     await rm(base, { recursive: true, force: true });
   };
@@ -206,7 +218,13 @@ async function observe(walk) {
   }
   const queue = held.map(({ payload }) => ({ id: idOf(payload.input?.messageId), s: tenantOfSession.get(payload.input?.sessionId) ?? "?", n: payload.input?.agent ?? "none" }));
   const ran = turns.map((turn) => ({ id: idOf(turn.turnId), def: turn.tenant, store: turn.store, ctx: contextOf(turn.context) }));
-  return { agents: Object.keys(walk.agents), refused: [...walk.refused], log, owner, done, queue, ran };
+  // The tenants whose agents libfx has under their names now; one that was
+  // created and is not is the one another tenant's agent replaced.
+  const agents = [...agentRegistry.values()].flatMap((group) => group.members.map((member) => member.definition?.tenant)).filter((t) => tenants.includes(t));
+  const replacedBy = Object.fromEntries(tenants.map((t) => [t, walk.created[t] && !agents.includes(t)
+    ? agents.find((u) => nameOf[u] === nameOf[t] && keyOf[u] === keyOf[t]) ?? "?"
+    : "none"]));
+  return { agents, refused: [...walk.refused], log, owner, done, queue, ran, replacedBy };
 }
 
 // One canonical form for model and code alike: every collection in this
@@ -224,6 +242,7 @@ const viewOf = (state) => canonical({
   done: state.done,
   queue: state.queue.map(({ id, s, n }) => ({ id, s, n })),
   ran: state.ran,
+  replacedBy: state.replacedBy,
 });
 
 // ---------------------------------------------------------------------------
@@ -234,26 +253,33 @@ async function perform(walk, act) {
   switch (act.name) {
     case "Register": {
       const t = act.t;
+      let replaced = 0;
       try {
-        const agent = createTenantAgent({ name: nameOf[t], durability: walk.durabilities[storeOf[t]], tenant: t, storeOfDurability: walk.storeOfDurability });
+        const agent = createTenantAgent({
+          name: nameOf[t],
+          durability: walk.durabilities[storeOf[t]],
+          tenant: t,
+          storeOfDurability: walk.storeOfDurability,
+          onEvent: (event) => { if (event.type === "agent.replaced") replaced += event.replaced; },
+        });
         // Opens its backend, as its first request does.
         await agent.newSessionId();
-        walk.agents[t] = agent;
+        walk.created[t] = agent;
       } catch (error) {
         if (error?.code !== "FX_AGENT_NAME_IN_USE") throw error;
         walk.refused.add(t);
         return "register refused";
       }
-      return "register";
+      return replaced > 0 ? "register replaced" : "register";
     }
     case "Prompt": {
-      const session = walk.agents[act.t].session(sessionOf[act.t], { context: { tenant: act.t } });
+      const session = walk.created[act.t].session(sessionOf[act.t], { context: { tenant: act.t } });
       await session.prompt(`prompt ${act.id}`, { messageId: `m${act.id}` }).accepted;
       walk.sent.push(act.id);
       return "prompt";
     }
     case "Oversize": {
-      const session = walk.agents[act.t].session(sessionOf[act.t], { context: { tenant: act.t } });
+      const session = walk.created[act.t].session(sessionOf[act.t], { context: { tenant: act.t } });
       const big = "x".repeat(oversizeBytes);
       try {
         if (act.k === "prompt") await session.prompt(big).accepted;
@@ -378,6 +404,9 @@ async function walkOnce(number) {
 for (let number = 1; number <= walks; number += 1) await walkOnce(number);
 const edges = [...graph.next.values()].reduce((total, successors) => total + successors.size, 0);
 console.log(`${walks} walks (seed ${firstSeed}), ${steps} steps (${Object.entries(outcomes).sort().map(([name, count]) => `${count} ${name}`).join(", ")}): ${seenStates.size} of ${graph.states.size} states and ${seenEdges.size} of ${edges} edges, every step one the model allows`);
-for (const outcome of ["register", "register refused", "prompt", "delivered", "forge refused", "forge missed", "oversize refused"]) {
+const wanted = development
+  ? ["register", "register replaced", "prompt", "delivered", "forge refused", "oversize refused"]
+  : ["register", "register refused", "prompt", "delivered", "forge refused", "forge missed", "oversize refused"];
+for (const outcome of wanted) {
   assert.ok((outcomes[outcome] ?? 0) > 0, `the walks reach "${outcome}" at least once`);
 }
