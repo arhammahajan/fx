@@ -7911,7 +7911,7 @@ test "a pooled connection reset after the response starts is reported, not resen
         var r = ok_result;
         r.deinit(std.testing.allocator);
         return error.TestExpectedResetFailure;
-    } else |err| try std.testing.expect(err != error.Timeout);
+    } else |err| try std.testing.expectEqual(error.ReadFailed, err);
     try std.testing.expect(elapsed_ms < 2_500);
     harness.fixture.deinit();
     if (harness.fixture.failure) |err| return err;

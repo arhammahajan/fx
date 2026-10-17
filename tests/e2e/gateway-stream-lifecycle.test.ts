@@ -7318,6 +7318,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           {
             cwd: root.workspace,
             env: {
+              FX_SOUND: "0",
               HOME: root.home,
               AI_GATEWAY_API_KEY: "fake-gateway-lifecycle-key",
               VERCEL_OIDC_TOKEN: undefined,
