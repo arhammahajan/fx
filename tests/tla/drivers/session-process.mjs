@@ -13,12 +13,30 @@
 import { parentPort, workerData } from "node:worker_threads";
 import { sharedSet } from "./shared-set.mjs";
 
-const { w, liveBuffer, announcedBuffer, tool, toolFlags, runsAhead, durabilityKind, leaseMs, streamQuietMs, backend, addon, wasm, hooks } = workerData;
+const { w, liveBuffer, announcedBuffer, tool, toolFlags, runsAhead, durabilityKind, leaseMs, streamQuietMs, backend, addon, wasm, hooks, refused } = workerData;
 // Set before libfx loads, which keeps a set it finds.
 globalThis[Symbol.for("libfx.liveHolders")] = sharedSet(liveBuffer);
 const announced = sharedSet(announcedBuffer);
 
 const { createFxAgent } = await import("../../../sdk/node.js");
+// On the refuse graph, an fx agent whose prompt() stores a prompt fx refuses,
+// as an earlier libfx's did: its harness has no checkPrompt, so the worker
+// refuses the prompt only when its turn runs.
+const createAgent = refused ? await (async () => {
+  const { createDurableAgentFactory } = await import("../../../sdk/durable.js");
+  const { fxHarness } = await import("../../../sdk/fx-harness.js");
+  const { createFxEngine } = await import("../../../sdk/node.js");
+  const fx = fxHarness({ createEngine: createFxEngine });
+  return createDurableAgentFactory({
+    name: "createFxAgent",
+    label: "fx agent",
+    defaultDurability: async () => { throw new Error("each walk gives its agent a durability"); },
+    harness: (options) => {
+      const { checkPrompt: _checkPrompt, ...unchecked } = fx(options);
+      return unchecked;
+    },
+  });
+})() : createFxAgent;
 const { local } = await import("../../../sdk/durable/local.mjs");
 const { holdWrites } = await import("../../../sdk/tests/hold-writes.mjs");
 // The fixture checks its events at the exit of its process, which a thread
@@ -197,7 +215,7 @@ const methods = {
     state.writes = writes;
     state.broker = queueWorld?.broker ?? null;
     state.postHeld = postHeld;
-    state.agent = createFxAgent({
+    state.agent = createAgent({
       ...(observedHooks ? { hooks: observedHooks } : {}),
       backend,
       nativeAddon: addon,

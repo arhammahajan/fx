@@ -1,7 +1,7 @@
 // fx as a harness of the durable core in durable.js: `createFxAgent` is that
 // core running fx engines. Everything the core needs to know about fx is
 // here; the core itself knows only the harness contract.
-import { catalogMemory, coreAnswered, engineInternals, journalMarksWanted, maxPromptFrameBytes, normalizeInstructions, normalizeModelChoice, promptFrameBytes, turnEndInputs } from "./fx-sdk.js";
+import { catalogMemory, checkPromptInput, coreAnswered, engineInternals, journalMarksWanted, maxPromptFrameBytes, normalizeInstructions, normalizeModelChoice, promptFrameBytes, turnEndInputs } from "./fx-sdk.js";
 import { createCredentialMemory, credentialMemory } from "./subscription.js";
 
 const encoder = new TextEncoder();
@@ -36,6 +36,11 @@ export function fxHarness({ createEngine, defaultApiKey = async () => undefined,
       // take is refused before the session stores it.
       frameBytes: promptFrameBytes,
       maxFrameBytes: maxPromptFrameBytes,
+      // What a session's prompt() refuses before storing anything: whatever
+      // this agent's engines would refuse.
+      checkPrompt(input) {
+        checkPromptInput(input, { resizeImage: engineOptions.resizeImage });
+      },
       async open({ sessionId, store, context, settings, durability, ready, inputs }) {
         const apiKey = engineOptions.apiKey ?? await defaultApiKey(durability);
         // Only AI Gateway needs a key; another provider has its own

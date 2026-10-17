@@ -12,7 +12,10 @@
 // The refuse graph is the send graph with Refused: the prompt is one fx
 // refuses, a text block with no text, so its turn ends before any record,
 // through an `ended` entry, and its turn_end line waits for EndLine like
-// any other.
+// any other. An fx agent's prompt() refuses that prompt before storing
+// anything, so the walk's agents are fx agents without that check, as an
+// earlier libfx that stored such a prompt was; the worker refuses it when
+// its turn runs.
 //
 // The lookup and cutoff graphs run a lookup, which starts before its intent
 // is stored: the driver holds that intent's record, so the call runs while
@@ -71,7 +74,8 @@ const graphName = args.find((arg) => ["send", "lookup", "write", "cutoff", "leas
 const tool = graphName === "cutoff" ? "lookup" : ["leased", "queue", "refuse"].includes(graphName) ? "send" : graphName;
 // The walk's prompt: one that asks for the tool, or on the refuse graph one
 // the harness refuses before its engine stores anything.
-const promptInput = graphName === "refuse" ? [{ type: "text" }] : `use ${tool}`;
+const refused = graphName === "refuse";
+const promptInput = refused ? [{ type: "text" }] : `use ${tool}`;
 // The tool as the host declares it, and whether its calls run ahead.
 const toolFlags = { lookup: { idempotent: true }, write: { idempotent: true, writes: true }, send: { idempotent: false } }[tool];
 const runsAhead = tool === "lookup";
@@ -157,7 +161,7 @@ const pending = new Map();
 const servers = {};
 for (const w of Workers) {
   const server = new Worker(new URL("./session-process.mjs", import.meta.url), {
-    workerData: { w, liveBuffer, announcedBuffer, tool, toolFlags, runsAhead, durabilityKind, leaseMs, streamQuietMs, backend, addon, wasm, hooks },
+    workerData: { w, liveBuffer, announcedBuffer, tool, toolFlags, runsAhead, durabilityKind, leaseMs, streamQuietMs, backend, addon, wasm, hooks, refused },
     // The hooks fixture turns on with the flag in its own process's argv.
     ...(hooks ? { argv: ["--hooks"] } : {}),
   });

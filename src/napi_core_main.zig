@@ -39,9 +39,11 @@ const max_output_message_bytes = 64 * 1024 * 1024;
 // `HostStreamBackpressure` (`sdk/tests/test-native-core-image-framing.mjs`).
 const max_fetch_request_bytes = request_image_budget.default_max_request_bytes + 2 * 1024 * 1024;
 const max_fetch_response_bytes = 8 * 1024 * 1024;
-// One attachment holds one prompt image, or one kernel checkpoint, journal
-// load or snapshot, the larger. The core bounds prompt images further when it
-// takes them (`max_attached_image_bytes` in `src/acp/prompt.zig`).
+// One attachment holds one prompt image, one saved image an open stages, or
+// one kernel checkpoint, journal load or snapshot, the larger. The core bounds
+// prompt images further when it takes them (`max_attached_image_bytes` in
+// `src/acp/prompt.zig`). `maxPendingAttachments` and
+// `maxPendingAttachmentBytes` in `sdk/fx-sdk.js` match this table.
 const max_attachment_bytes = agent_checkpoint.max_checkpoint_bytes;
 const max_inbound_attachments = 8;
 // A journal opens from its snapshot and the events after it, attached
