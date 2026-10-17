@@ -17,6 +17,7 @@ if (backend === "wasm" && !supportsJspi()) {
 }
 
 const encoded = new TextEncoder();
+const sleep = (ms) => new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
 // A real 1x1 PNG, plus a helper that builds a PNG-sniffable payload with an
 // exact base64 length for limit probing (the kernel sniffs magic bytes only).
 const pngData = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jP0cAAAAASUVORK5CYII=";
@@ -409,6 +410,42 @@ for (const resizeImage of [undefined, (image) => image]) {
     createAgent(mockGateway(), { model: "sdk/vision-model", checkpoint: new Uint8Array(0) }),
     (error) => error.message === "Invalid or non-fresh libfx checkpoint",
   );
+}
+
+// QUAL-18: a conversation past the 32 MiB a checkpoint holds gets none.
+// checkpoint() says so, naming the limit, with a code, an engine on a store
+// reports the save it skips after a turn (checkpoint.error), and the engine
+// goes on. Each prompt's two images are 6 MiB of distinct bytes.
+{
+  const imageOf = (fill) => {
+    const raw = Buffer.alloc(3 * 1024 * 1024, fill);
+    Buffer.from(pngData, "base64").copy(raw);
+    return { type: "image", data: raw.toString("base64"), mimeType: "image/png" };
+  };
+  const events = [];
+  const agent = await createAgent(mockGateway(), {
+    model: "sdk/vision-model",
+    persistence: createMemoryPersistence(),
+    checkpointAfterBytes: 0,
+    onEvent: (event) => { if (event.type.startsWith("checkpoint.")) events.push(event); },
+  });
+  let refusal = null;
+  for (let turn = 1; turn <= 8 && refusal === null; turn += 1) {
+    assert.equal((await runPrompt(agent, [{ type: "text", text: `turn ${turn}` }, imageOf(2 * turn), imageOf(2 * turn + 1)])).stopReason, "end_turn");
+    refusal = await agent.checkpoint().then(() => null, (error) => error);
+  }
+  assert.ok(refusal, "checkpoint() refuses a conversation over 32 MiB");
+  assert.equal(refusal.code, "FX_CHECKPOINT_TOO_LARGE");
+  assert.match(refusal.message, /^libfx checkpoint is too large: the conversation is over the 32 MiB a checkpoint holds/);
+  for (let waited = 0; !events.some((event) => event.type === "checkpoint.error") && waited < 5000; waited += 20) await sleep(20);
+  const skipped = events.filter((event) => event.type === "checkpoint.error");
+  assert.equal(skipped.length, 1, JSON.stringify(events.map(({ type, skipped: reason }) => ({ type, reason }))));
+  assert.equal(skipped[0].code, "FX_CHECKPOINT_TOO_LARGE");
+  assert.equal(skipped[0].skipped, "too_large");
+  assert.match(skipped[0].message, /32 MiB/);
+  assert.ok(events.some((event) => event.type === "checkpoint.save"), "the turns before it saved checkpoints");
+  assert.equal((await runPrompt(agent, "still here")).stopReason, "end_turn");
+  await agent.close();
 }
 
 // An idle checkpoint is sent before a later prompt, while one queued behind it

@@ -76,7 +76,7 @@ A turn's result says how it ended:
 const { stopReason, usage, error } = await turn.result;
 ```
 
-`stopReason` is `end_turn`, `max_output_tokens`, `max_model_turns`, `refused` or `cancelled`. It's `error` when the turn failed, with the reason in `error`, and `unknown` when the process running it stopped before recording how it ended.
+`stopReason` is `end_turn`, `max_output_tokens`, `max_model_turns`, `refused` or `cancelled`. It's `error` when the turn failed, with the reason in `error`. The record that ends a turn says how it ended, so a turn whose process stopped right after that record still reports it. Only a turn an earlier libfx ended reports `unknown`, since its record doesn't say.
 
 ### Streaming to a browser
 
@@ -132,7 +132,7 @@ On `local()`, `vercel()` and `world()`, a session id is a Workflow run id, `wrun
 
 A session stores the conversation, and with each prompt and steer the caller's `context` and the session object's settings. Every process passes its own model, credentials, tools, MCP clients and skills when it creates the agent.
 
-libfx doesn't know who is calling. Anyone with a session's id can prompt, steer, cancel, stream or checkpoint it, so your app must check that the caller may use a session before it opens it. A queue message only names an input libfx already stored: a delivery that names one the session's log doesn't hold runs nothing, and the agent's `onEvent` gets a `session.refused` event. If a session's saved checkpoint came from a different libfx version, tool set or model, the session still loads, and `onEvent` gets a `checkpoint.mismatch` event naming what changed.
+libfx doesn't know who is calling. Anyone with a session's id can prompt, steer, cancel, stream or checkpoint it, so your app must check that the caller may use a session before it opens it. A queue message only names an input libfx already stored: a delivery that names one the session's log doesn't hold runs nothing, and the agent's `onEvent` gets a `session.refused` event. If a session's saved checkpoint came from a different libfx version, tool set or model, or a session that has saved no checkpoint yet last ran on a different model, the session still loads, and `onEvent` gets a `checkpoint.mismatch` event naming what changed.
 
 ### Several agents
 
@@ -501,13 +501,15 @@ interface JournalRecord {
 }
 ```
 
-Reject an `append()` whose `expected` isn't the last stored cursor with `FxFencedError`, so two processes can't write the same conversation. If your store keeps entries of its own after the last record, return the cursor the next `append()` should name as `head`. When a resumed turn left a tool call running, `resume({ onAmbiguous })` lets you return `"rerun"` to run it again under the same `executionId`.
+Reject an `append()` whose `expected` isn't the last stored cursor with `FxFencedError`, so two processes can't write the same conversation. The engine whose append you fence stops: its turn rejects with your `FxFencedError`, and so does each later call. If your store keeps entries of its own after the last record, return the cursor the next `append()` should name as `head`. When a resumed turn left a tool call running, `resume({ onAmbiguous })` lets you return `"rerun"` to run it again under the same `executionId`.
 
-The engine sends one `append()` at a time, and everything that happens while one is in flight goes in the next record. `barrier` is `true` when the engine waits for the record before it goes on, such as before a tool call with effects. A store may acknowledge a record with `barrier: false` before it is durable, as long as it keeps records in order and acknowledges a barrier only once it and every record before it are durable. `turn.result` doesn't wait for a turn's last records, which aren't barriers, so it can resolve before they're stored: `close()` waits for them, and a failure among them is reported by `close()` or the next call. If the process stops in between, the stored turn is still open, and the next engine's `resume()` runs its end again. Set `marks: true` to receive each record's `marks`, which say where turns start (`{ start: turnId }`), yield and end, and which inputs a turn took (`{ accepted: id }`), so a store can track turns without reading records.
+The engine sends one `append()` at a time, and everything that happens while one is in flight goes in the next record. `barrier` is `true` when the engine waits for the record before it goes on, such as before a tool call with effects. A store may acknowledge a record with `barrier: false` before it is durable, as long as it keeps records in order and acknowledges a barrier only once it and every record before it are durable. `turn.result` doesn't wait for a turn's last records, which aren't barriers, so it can resolve before they're stored: `close()` waits for them, and a failure among them is reported by `close()` or the next call. If the process stops in between, the stored turn is still open, and the next engine's `resume()` runs its end again. Set `marks: true` to receive each record's `marks`, which say where turns start (`{ start: turnId }`), yield and end, with how a turn ended (`{ end: true, stopReason }`), and which inputs a turn took (`{ accepted: id }`), so a store can track turns without reading records.
 
 `prompt()` and `resume()` take `yieldAt`, a time in milliseconds since the epoch: the turn stops before its next model request after that time, with the stop reason `yielded`, and the next `resume()` continues it without telling the model it was interrupted.
 
-A journal or `checkpoint` from a newer libfx fails with `FxJournalVersionError`. The conversation keeps its prompts' images, so a load may read a checkpoint of up to 32 MiB and up to 32 MiB of records after it; more fails with `FX_JOURNAL_TOO_LARGE`. `createMemoryPersistence()` is a reference store for tests.
+A journal or `checkpoint` from a newer libfx fails with `FxJournalVersionError`. The conversation keeps its prompts' images, so a load may read a checkpoint of up to 32 MiB and up to 32 MiB of records after it; more fails with `FX_JOURNAL_TOO_LARGE`. Once a conversation is past what a checkpoint holds, 32 MiB or 1,024 turns, `checkpoint()` rejects with `FX_CHECKPOINT_TOO_LARGE` and the engine goes on; an engine with a store saves no more checkpoints, and `onEvent` gets a `checkpoint.error` with that code after each turn. `createMemoryPersistence()` is a reference store for tests.
+
+A checkpoint records the libfx version, a hash of the tool set and the model it was taken with, so a restore can tell when one changed. It holds no credentials, instructions or tools, and restoring it doesn't choose the model: pass them again.
 
 ## Runtimes
 

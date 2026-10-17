@@ -1746,6 +1746,24 @@ const invalid_checkpoint_meta: jsonrpc.RpcError = .{
     .message = "Invalid libfx checkpoint meta",
 };
 
+/// `agent.checkpoint()`'s answers for a conversation past what a checkpoint
+/// holds: the limit it passed and what still works (QUAL-18). `sdk/fx-sdk.js`
+/// gives them the code `FX_CHECKPOINT_TOO_LARGE` by how their text starts.
+const checkpoint_too_large: jsonrpc.RpcError = .{
+    .code = ErrorCode.invalid_request,
+    .message = std.fmt.comptimePrint(
+        "libfx checkpoint is too large: the conversation is over the {d} MiB a checkpoint holds; this engine goes on with it, and a new conversation can be saved again",
+        .{agent_checkpoint.max_checkpoint_bytes / (1024 * 1024)},
+    ),
+};
+const checkpoint_too_many_turns: jsonrpc.RpcError = .{
+    .code = ErrorCode.invalid_request,
+    .message = std.fmt.comptimePrint(
+        "libfx checkpoint is too large: the conversation has more than the {d} turns a checkpoint holds; this engine goes on with it, and a new conversation can be saved again",
+        .{agent_checkpoint.max_history_turns},
+    ),
+};
+
 fn handleKernelCheckpoint(
     state: *ServerState,
     alloc: Allocator,
@@ -1767,8 +1785,13 @@ fn handleKernelCheckpoint(
     };
     const meta = checkpointMetaParam(parsed.value) orelse return state.writer.writeError(alloc, msg.id, invalid_checkpoint_meta);
     const store = state.cfg.host_attachments orelse return state.writer.writeError(alloc, msg.id, unavailable);
-    const bytes = active.session_rt.agent.checkpoint(alloc, meta) catch
-        return state.writer.writeError(alloc, msg.id, unavailable);
+    const bytes = active.session_rt.agent.checkpoint(alloc, meta) catch |err| return state.writer.writeError(alloc, msg.id, switch (err) {
+        error.CheckpointTooLarge => if (active.session_rt.agent.history.items.len > agent_checkpoint.max_history_turns)
+            checkpoint_too_many_turns
+        else
+            checkpoint_too_large,
+        else => unavailable,
+    });
     defer alloc.free(bytes);
     // The checkpoint leaves as raw bytes beside the response frame.
     const attachment = store.put(bytes) catch |err| switch (err) {

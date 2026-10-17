@@ -97,6 +97,9 @@ function framesFor(prompt) {
     return answer(`done: ${JSON.stringify(turnResults.at(-1).output)}`);
   }
   if (text === "stall") return null;
+  // An answer the model's output limit cuts short, so its turn ends
+  // max_output_tokens.
+  if (text === "cut short") return [{ type: "text-delta", id: "answer", delta: "cut" }, finish("length")];
   // A prompt as long as a frame holds is answered with its length.
   if (text.startsWith("long ")) return answer(`long: ${text.length}`);
   if (text === "slow reply") return slowReply;
@@ -2718,6 +2721,92 @@ test("a checkpoint names the libfx, tools and model that saved it, and a resume 
   await restored.close();
   assert.deepEqual(carried.map((event) => event.changed), [["model"]]);
 });
+
+// A session whose turns were too short to save a checkpoint has no saved
+// meta, but each model request's record names the model it went to.
+test("a session too short to have saved a checkpoint still hears that it continues on another model", async () => {
+  const durability = await durabilityFor();
+  const first = createFxAgent(agentOptions(durability));
+  const session = first.session();
+  assert.equal((await session.prompt("a short turn").result).stopReason, "end_turn");
+  await first.close();
+  const mismatches = [];
+  const onEvent = (event) => { if (event.type === "checkpoint.mismatch") mismatches.push(event); };
+  const same = createFxAgent(agentOptions(durability, { onEvent }));
+  assert.equal((await same.session(session.id).prompt("the same model").result).stopReason, "end_turn");
+  await same.close();
+  assert.deepEqual(mismatches, [], "no mismatch on the model the session ran on");
+  const other = createFxAgent(agentOptions(durability, { model: "durable/other", onEvent }));
+  assert.equal((await other.session(session.id).prompt("another model").result).stopReason, "end_turn");
+  await other.close();
+  assert.equal(mismatches.length, 1, JSON.stringify(mismatches));
+  assert.equal(mismatches[0].sessionId, session.id);
+  assert.deepEqual(mismatches[0].changed, ["model"]);
+  assert.deepEqual([mismatches[0].saved.model, mismatches[0].current.model], ["durable/model", "durable/other"]);
+});
+
+if (durabilityKind === "memory") {
+  // memory(), with a worker that dies right after the record that ends its
+  // turn while `dies.now` is set: its turn_end lines never land, and it never
+  // lets the session go.
+  const dyingAfterEnd = (base, dies) => {
+    let wrapped = null;
+    const isEnd = (line) => {
+      try { return JSON.parse(line).type === "turn_end"; } catch { return false; }
+    };
+    return {
+      ...base,
+      create() {
+        const backend = base.create();
+        wrapped ??= Object.assign(Object.create(backend), {
+          async session(id) {
+            const log = await backend.session(id);
+            return {
+              ...log,
+              ui: { ...log.ui, write: (lines) => log.ui.write(dies.now ? lines.filter((line) => !isEnd(line)) : lines) },
+              append: (entry) => (dies.now && entry?.k === "release" ? Promise.reject(new Error("the process died")) : log.append(entry)),
+            };
+          },
+        });
+        return wrapped;
+      },
+    };
+  };
+
+  // DUR-20, DUR-40: the record fx writes to end a turn says how it ended, in
+  // that same record, so the worker that writes the end a crashed holder
+  // left missing says so, and a retry resolves from it without asking the
+  // model again (`tests/tla/sdk/DurableSession.tla` EndSaysHow).
+  for (const [input, stopReason] of [["a finished answer", "end_turn"], ["cut short", "max_output_tokens"]]) {
+    test(`a turn whose worker died between the record that ended it ${stopReason} and its turn_end line ends ${stopReason} for its viewers and a retry`, async () => {
+      const dies = { now: true };
+      const durability = dyingAfterEnd(memory(), dies);
+      const agent = createFxAgent(agentOptions(durability));
+      const session = agent.session();
+      const messageId = `ended-${stopReason}`;
+      const first = session.prompt(input, { messageId });
+      const { sessionId } = await first.accepted;
+      const log = await durability.create().session(sessionId);
+      await until(async () => foldSessionLog(await log.read()).lastTurnId === messageId, "the record that ends the turn");
+      // The dying worker's run lets go of its lease as it ends.
+      await new Promise((wait) => setTimeout(wait, 100 * timeScale));
+      dies.now = false;
+      const asked = requests.length;
+      let timer;
+      const retried = await Promise.race([
+        session.prompt(input, { messageId }).result,
+        new Promise((_resolve, reject) => { timer = setTimeout(() => reject(new Error("the retry waited for an end nobody writes")), 10_000); }),
+      ]).finally(() => clearTimeout(timer));
+      assert.equal(retried.stopReason, stopReason);
+      assert.equal((await first.result).stopReason, stopReason);
+      assert.equal(requests.length, asked, "no model request once the turn's end was stored");
+      const lines = await readLines(session.stream(0), 32);
+      assert.deepEqual(lines.filter((line) => line.type === "turn_end").map((line) => line.stopReason), [stopReason]);
+      assert.deepEqual(foldSessionLog(await log.read()).endingOf(messageId), { stopReason }, "the log holds how the turn ended");
+      await agent.close();
+    });
+  }
+}
 
 // The agent is the long-lived instance: it fetches the model catalog once
 // for all its sessions and turns, though each delivery opens a new engine,

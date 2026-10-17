@@ -312,12 +312,25 @@ pub const Journal = struct {
     /// to be stored before it goes on, so the host can store the events
     /// nobody waits for more lazily.
     pub fn appendMarked(self: *Journal, alloc: Allocator, session_id: []const u8, event: Event, barrier: bool) !void {
+        return self.appendWith(alloc, session_id, event, barrier, null);
+    }
+
+    /// Sends a turn's end, `turn_committed` or `turn_progress_cleared`, with
+    /// `stop_reason`, how its prompt answers: the record that ends the turn
+    /// says how it ended, so recovery never has to guess.
+    pub fn appendEnd(self: *Journal, alloc: Allocator, session_id: []const u8, event: Event, stop_reason: []const u8) !void {
+        return self.appendWith(alloc, session_id, event, false, stop_reason);
+    }
+
+    fn appendWith(self: *Journal, alloc: Allocator, session_id: []const u8, event: Event, barrier: bool, stop_reason: ?[]const u8) !void {
         var params: std.Io.Writer.Allocating = .init(alloc);
         defer params.deinit();
         try params.writer.writeAll("{\"sessionId\":");
         try jsonrpc.writeJsonStr(session_id, &params.writer);
         try params.writer.writeAll(",\"events\":[");
-        const next = if (self.storedImages()) |stored|
+        const next = if (stop_reason) |reason|
+            try self.cursor.writeEnd(&params.writer, event, self.storedImages(), reason)
+        else if (self.storedImages()) |stored|
             try self.cursor.writeNamingImages(&params.writer, event, stored)
         else
             try self.cursor.write(&params.writer, event);
@@ -455,11 +468,11 @@ pub const Journal = struct {
             self.steers_waiting == 0 and self.follow_ups_waiting == 0;
     }
 
-    /// Records that the open turn ended without a history entry. A turn
-    /// with no progress on record needs no event.
-    pub fn clearProgress(self: *Journal, alloc: Allocator, session_id: []const u8) !void {
+    /// Records that the open turn ended without a history entry, and how,
+    /// in `stop_reason`. A turn with no progress on record needs no event.
+    pub fn clearProgress(self: *Journal, alloc: Allocator, session_id: []const u8, stop_reason: []const u8) !void {
         if (!self.progress_open) return;
-        try self.append(alloc, session_id, .turn_progress_cleared);
+        try self.appendEnd(alloc, session_id, .turn_progress_cleared, stop_reason);
     }
 };
 
@@ -1007,14 +1020,16 @@ test "a turn's id reaches its first progress only, and is the last turn's once t
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, capture.frames.items, "\"turnId\":\"turn-1\""));
     try std.testing.expectEqualStrings("turn-1", session.open_turn_id.slice().?);
 
-    try session.clearProgress(alloc, "session");
+    try session.clearProgress(alloc, "session", "error");
     try std.testing.expect(session.open_turn_id.slice() == null);
     try std.testing.expectEqualStrings("turn-1", session.last_turn_id.slice().?);
+    // The end says how the turn ended.
+    try std.testing.expect(std.mem.find(u8, capture.frames.items, "\"type\":\"turn_progress_cleared\",\"stopReason\":\"error\"}") != null);
 
     // A turn the host did not name ends with no last id.
     session.nameNextTurn(null);
     try session.appendProgress(alloc, alloc, "session", progress, "fake/model");
-    try session.clearProgress(alloc, "session");
+    try session.clearProgress(alloc, "session", "cancelled");
     try std.testing.expect(session.last_turn_id.slice() == null);
 }
 
@@ -1102,7 +1117,7 @@ test "a progress after its turn's first carries only what is new, and the next t
     try session.recordToolResult(alloc, "session", .{ .id = "call-1", .name = "lookup", .failed = false, .output = "done" });
     try std.testing.expect(std.mem.find(u8, capture.frames.items, "\"type\":\"tool_result\"") != null);
 
-    try session.clearProgress(alloc, "session");
+    try session.clearProgress(alloc, "session", "error");
     const next = capture.frames.items.len;
     try session.appendProgress(alloc, alloc, "session", progress, "fake/model");
     try std.testing.expect(std.mem.find(u8, capture.frames.items[next..], "\"base\"") == null);

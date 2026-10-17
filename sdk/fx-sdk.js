@@ -47,8 +47,20 @@ const maxPromptImagesDataBytes = 8 * 1024 * 1024;
 const maxPromptImageBytes = (maxPromptImageDataBytes / 4) * 3;
 const maxPromptImagesBytes = (maxPromptImagesDataBytes / 4) * 3;
 // Matches the core's kernel checkpoint limit (max_checkpoint_bytes), which
-// holds a session's history with its images.
+// holds a session's history with its images, and its turn limit
+// (max_history_turns).
 const maxCheckpointBytes = 32 * 1024 * 1024;
+const maxCheckpointTurns = 1024;
+// How the core's answer to `checkpoint()` begins when the conversation is
+// past a checkpoint's limits (server.zig checkpoint_too_large).
+const checkpointTooLargePrefix = "libfx checkpoint is too large: ";
+// Why the core skipped a checkpoint save after a turn, by the reason it
+// gives (server.zig SnapshotSkip), for the checkpoint.error the host hears.
+const checkpointSkips = {
+  too_large: `no checkpoint was saved: the conversation is over the ${maxCheckpointBytes / (1024 * 1024)} MiB a checkpoint holds, so each load reads every record since the last checkpoint`,
+  too_many_turns: `no checkpoint was saved: the conversation has more than the ${maxCheckpointTurns} turns a checkpoint holds, so each load reads every record since the last checkpoint`,
+  invalid: "no checkpoint was saved: the conversation could not be written as one, so each load reads every record since the last checkpoint",
+};
 // Matches the native attachment table (src/napi_core_main.zig): at most 8
 // attachments wait to be taken, each up to one kernel checkpoint, and twice
 // that together, since a journal opens from its snapshot and its records
@@ -524,10 +536,16 @@ async function loadPersistence(persistence) {
   return { checkpoint, events, head, tailBytes: bytes, lastSeq: events.at(-1)?.seq ?? covered };
 }
 
+// How a turn's end event says the turn ended: the stop reason its prompt
+// answered with, or "error" for a prompt that failed; null for an end an
+// earlier libfx wrote, which does not say.
+const journalEndReason = (event) => (typeof event?.stopReason === "string" && event.stopReason.length > 0 ? event.stopReason : null);
+const isJournalEnd = (event) => event?.type === "turn_committed" || event?.type === "turn_progress_cleared";
+
 // What a record's events say about turns, in order, for a store that tracks
-// them without reading records: a turn started, ended, or yielded, an input
-// was accepted or handed back unplaced, or the step the open turn is at, as
-// its tool steps finished and the state of its calls.
+// them without reading records: a turn started, ended, and how, or yielded,
+// an input was accepted or handed back unplaced, or the step the open turn is
+// at, as its tool steps finished and the state of its calls.
 function journalMarks(events) {
   const marks = [];
   for (const event of events) {
@@ -538,8 +556,10 @@ function journalMarks(events) {
       // A progress that carries only what is new counts all the turn's steps.
       const steps = Number.isSafeInteger(event.steps) ? event.steps : event.data?.execution?.tool_steps?.length;
       if (Number.isSafeInteger(steps)) marks.push({ step: `${steps}:${String(event.data?.tool_state ?? "none")}` });
-    } else if (event?.type === "turn_committed" || event?.type === "turn_progress_cleared") marks.push({ end: true });
-    else if (event?.type === "turn_yielded") marks.push({ yield: true });
+    } else if (isJournalEnd(event)) {
+      const stopReason = journalEndReason(event);
+      marks.push(stopReason === null ? { end: true } : { end: true, stopReason });
+    } else if (event?.type === "turn_yielded") marks.push({ yield: true });
     else if (event?.type === "input_accepted" && typeof event.data?.id === "string") marks.push({ accepted: event.data.id });
     else if (event?.type === "input_withdrawn" && typeof event.data?.id === "string") marks.push({ withdrawn: event.data.id });
   }
@@ -2547,6 +2567,21 @@ export async function createFxEngine(options = {}) {
   // ended, so a retried prompt continues or skips its turn.
   let openTurnId = null;
   let lastTurnId = null;
+  // How the journal says the last turn that ended ended, `{ id, stopReason }`
+  // with a null reason for an end an earlier libfx wrote, so a retried prompt
+  // of that turn reports it (DUR-20). `journalTurn` is the turn whose first
+  // progress the journal holds, until its end.
+  let lastTurnEnd = null;
+  let journalTurn = null;
+  const noteJournalEnds = (events) => {
+    for (const event of events) {
+      if (event?.type === "turn_progress" && validTurnId(event.turnId)) journalTurn = event.turnId;
+      else if (isJournalEnd(event) && journalTurn !== null) {
+        lastTurnEnd = { id: journalTurn, stopReason: journalEndReason(event) };
+        journalTurn = null;
+      }
+    }
+  };
   // The calls the open turn left running: `{ id, name, arguments }`, and
   // what the resume tells the model about each one it does not run again.
   let ambiguousCalls = [];
@@ -2646,6 +2681,7 @@ export async function createFxEngine(options = {}) {
       rejectInputWaiters(dropped, handedOffError());
       return;
     }
+    noteJournalEnds(events);
     journalQueue.push(...events);
     // A caller waits for its steer or withdrawal to be stored.
     if (barrier || events.some((event) => event?.type === "input_accepted" || event?.type === "input_withdrawn")) journalBarrier = true;
@@ -2679,9 +2715,13 @@ export async function createFxEngine(options = {}) {
       // Later events would leave a gap after the failed batch.
       journalQueue = [];
       if (journalFailure) return;
-      journalFailure = journalAppendError(error);
+      // A fence is the store's own answer, which an app checks for: the
+      // turn rejects with it, also when the store carries it as the cause.
+      // Any other failure says the append failed.
+      const fence = error?.code === "FX_FENCED" ? error : error?.cause?.code === "FX_FENCED" ? error.cause : null;
+      journalFailure = fence ?? journalAppendError(error);
       emit("journal.error", { error: error instanceof Error ? error.name : "Error" });
-      journalHook("journal.error", { error: error instanceof Error ? error.name : "Error", fenced: error?.code === "FX_FENCED" || error?.cause?.code === "FX_FENCED" });
+      journalHook("journal.error", { error: error instanceof Error ? error.name : "Error", fenced: fence !== null });
       rejectInputWaiters([...inputWaiters.keys()], journalFailure);
       // Nothing the turn does from here can be saved, and after a fence the
       // session has another owner: stop the turn and its effects now.
@@ -2738,6 +2778,18 @@ export async function createFxEngine(options = {}) {
       if (bytesSinceCheckpoint === 0 || (!force && bytesSinceCheckpoint < checkpointAfterBytes)) return;
       const response = await request("libfx/snapshot", { sessionId, checkpointMeta });
       const id = response?.snapshotAttachment;
+      // A session past a checkpoint's limits gets none; the host hears why,
+      // since every load then reads all the records since the last one.
+      const skipped = Object.hasOwn(checkpointSkips, response?.skipped ?? "") ? response.skipped : null;
+      if (skipped) {
+        emit("checkpoint.error", {
+          error: "Error",
+          message: checkpointSkips[skipped],
+          ...(skipped === "invalid" ? {} : { code: "FX_CHECKPOINT_TOO_LARGE" }),
+          skipped,
+        });
+        return;
+      }
       if (!Number.isSafeInteger(id) || id <= 0) return;
       const bytes = runtime.takeAttachment?.(id);
       // The core took it after every event this agent stored, and no later.
@@ -2780,6 +2832,14 @@ export async function createFxEngine(options = {}) {
     return networkFetch(input, init, method, endpoint);
   };
   const networkFetch = async (input, init, method, endpoint) => {
+    // The core sends a step's journal events before its next request. On
+    // native that request reaches this host after them, in a task of its
+    // own, so a store that refuses a write at once, as a fenced one does,
+    // has stopped the turn before the request starts. The WebAssembly core
+    // asks in the task that queued the events, so the request waits one
+    // task for the store's first answer. It does not wait for the write to
+    // be durable: requests still run ahead of commits (DUR-18, DUR-30).
+    if (journal && (journalQueue.length > 0 || journalInFlight)) await new Promise((resolve) => setTimeout(resolve, 0));
     for (let attemptIndex = 0; attemptIndex < 2; attemptIndex++) {
       const startedAt = performance.now();
       const attempt = activeTurn ? ++activeTurn.transportAttempts : attemptIndex + 1;
@@ -2979,7 +3039,11 @@ export async function createFxEngine(options = {}) {
   async function takeCheckpoint() {
     if (closing) throw new Error("fx agent is closed");
     if (activeTurn) throw new Error("cannot checkpoint while a prompt is active");
-    const response = await request("libfx/checkpoint", { sessionId, checkpointMeta });
+    const response = await request("libfx/checkpoint", { sessionId, checkpointMeta }).catch((error) => {
+      // The core says which limit the conversation passed.
+      if (String(error?.message ?? "").startsWith(checkpointTooLargePrefix)) error.code = "FX_CHECKPOINT_TOO_LARGE";
+      throw error;
+    });
     const id = response?.checkpointAttachment;
     const bytes = Number.isSafeInteger(id) && id > 0 ? runtime.takeAttachment?.(id) : null;
     if (!(bytes instanceof Uint8Array) || bytes.byteLength === 0) throw new Error("fx returned an invalid checkpoint");
@@ -3205,10 +3269,19 @@ export async function createFxEngine(options = {}) {
         opened = await openOnce();
         if (Array.isArray(opened?.imagesNeeded)) throw imageMissingError(String(opened.imagesNeeded[0]));
       }
-      compareCheckpointMeta(opened?.checkpointMeta);
+      // A session too short to have saved a checkpoint has no saved meta.
+      // Each model request's progress names the model it went to, so the
+      // newest one says what such a session last ran on.
+      const recordedModel = opened?.checkpointMeta || checkpointMeta.model === ""
+        ? undefined
+        : events.findLast((event) => event?.type === "turn_progress" && typeof event.model === "string" && event.model !== "")?.model;
+      compareCheckpointMeta(recordedModel === undefined ? opened?.checkpointMeta : { model: recordedModel });
       resumable = opened?.resumable === true;
       openTurnId = resumable && validTurnId(opened?.openTurnId) ? opened.openTurnId : null;
       lastTurnId = validTurnId(opened?.lastTurnId) ? opened.lastTurnId : null;
+      // A turn that ended before the checkpoint says nothing of how.
+      noteJournalEnds(events);
+      if (validTurnId(opened?.openTurnId)) journalTurn = opened.openTurnId;
       ambiguousCalls = resumable && Array.isArray(opened?.runningCalls)
         ? opened.runningCalls.filter((call) => typeof call?.id === "string" && typeof call.name === "string")
         : [];
@@ -3484,10 +3557,18 @@ export async function createFxEngine(options = {}) {
   }
 
   // A turn the journal shows already ended, returned for a retried prompt.
+  // A retried prompt of the turn that ended last reports how the journal
+  // says it ended (DUR-20): one that failed fails again, saying so, and an
+  // end an earlier libfx wrote, which does not say, reports end_turn.
   function endedTurn(id) {
+    const recorded = lastTurnEnd?.id === id ? lastTurnEnd.stopReason : null;
+    const result = recorded === "error"
+      ? Promise.reject(new Error(`turn ${id} already ran and failed; prompt with a new turnId to run it again`))
+      : Promise.resolve({ stopReason: recorded ?? "end_turn", usage: {} });
+    void result.catch(() => {});
     return {
       id,
-      result: Promise.resolve({ stopReason: "end_turn", usage: {} }),
+      result,
       cancel() {},
       steer() { return Promise.reject(new Error("no prompt is running")); },
       withdraw() { return Promise.resolve("already_placed"); },

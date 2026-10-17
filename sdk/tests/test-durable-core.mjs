@@ -42,6 +42,10 @@ const stopsAfterEnd = new Set(["omega"]);
 const brittle = "brittle";
 const shattered = "shattered";
 const endsLate = new Set(["late"]);
+// Inputs whose end records say only that the turn ended, not how, as an
+// earlier libfx wrote them. Every other end mark says how (DUR-20).
+const unsaidEnds = new Set();
+const endMarks = (input, stopReason) => [unsaidEnds.has(input) ? { end: true } : { end: true, stopReason }];
 // How many engines the scripted harness opened, and how long each takes to
 // close.
 const opened = { count: 0 };
@@ -83,7 +87,7 @@ function scriptedHarness({ steps = 3 } = {}) {
         } catch (error) {
           // A cancel ends the turn; a handoff, or an engine that stopped,
           // stores nothing more.
-          if (signal.aborted && !handedOff && error?.code !== "FX_HARNESS_STOPPED") await append({ turnId, end: true }, [{ end: true }]).catch(() => {});
+          if (signal.aborted && !handedOff && error?.code !== "FX_HARNESS_STOPPED") await append({ turnId, end: true }, endMarks(input, "cancelled")).catch(() => {});
           throw error;
         }
       }, () => { handedOff = true; });
@@ -115,12 +119,12 @@ function scriptedHarness({ steps = 3 } = {}) {
           const last = step === steps - 1;
           if (last && endsLate.delete(input)) {
             // The end record is still on its way when the engine stops.
-            const write = sleep(150).then(() => append({ turnId, step, word, end: true }, [{ end: true }]));
+            const write = sleep(150).then(() => append({ turnId, step, word, end: true }, endMarks(input, "end_turn")));
             landing.add(write);
             push({ type: "text_delta", delta: `${word} ` });
             throw harnessStopped("the engine exited as the turn ended");
           }
-          await append({ turnId, step, word, ...(last ? { end: true } : {}) }, last ? [{ end: true }] : []);
+          await append({ turnId, step, word, ...(last ? { end: true } : {}) }, last ? endMarks(input, "end_turn") : []);
           push({ type: "text_delta", delta: `${word} ` });
         }
         if (stopsAfterEnd.delete(input)) throw harnessStopped("the engine exited after the turn ended");
@@ -596,13 +600,17 @@ test("an engine that stops each time it starts a turn ends that turn, and the se
   await agent.close();
 });
 
-test("a turn whose engine stops after its end landed still ends for its viewers", async () => {
+test("a turn whose engine stops after its end landed still ends for its viewers, as its end says (DUR-20)", async () => {
   const agent = createAgent({ durability: await durabilityFor() });
   const session = agent.session();
   const { text, result } = await textOf(session.prompt("omega", { messageId: "turn-omega" }));
-  assert.equal(result.stopReason, "unknown");
+  assert.equal(result.stopReason, "end_turn");
   assert.equal(text, "omega-0 omega-1 omega-2");
   assert.equal((await session.prompt("after", { messageId: "turn-after" }).result).stopReason, "end_turn");
+  // An end an earlier libfx wrote says only that the turn ended.
+  stopsAfterEnd.add("omega-elder");
+  unsaidEnds.add("omega-elder");
+  assert.equal((await session.prompt("omega-elder", { messageId: "turn-omega-elder" }).result).stopReason, "unknown");
   await agent.close();
 });
 
@@ -751,11 +759,11 @@ test("a lone started turn whose engine stops even when cancelled ends, and the s
   await agent.close();
 });
 
-test("a turn whose end is still landing when its engine stops ends as unknown", async () => {
+test("a turn whose end is still landing when its engine stops ends as that end says", async () => {
   const agent = createAgent({ durability: await durabilityFor() });
   const session = agent.session();
   const { text, result } = await textOf(session.prompt("late", { messageId: "turn-late" }));
-  assert.equal(result.stopReason, "unknown");
+  assert.equal(result.stopReason, "end_turn");
   assert.equal(text, "late-0 late-1 late-2");
   assert.equal((await session.prompt("after late", { messageId: "turn-after-late" }).result).stopReason, "end_turn");
   await agent.close();
@@ -1642,12 +1650,32 @@ if (durabilityKind === "memory") {
       session.prompt("alpha", { messageId: "turn-a" }).result,
       new Promise((_resolve, reject) => { timer = setTimeout(() => reject(new Error("the retry waited for an end nobody writes")), 5000); }),
     ]).finally(() => clearTimeout(timer));
-    // How it ended is not in the log (`tests/tla/sdk/DurableSession.tla` EndLine).
-    assert.equal(retried.stopReason, "unknown");
-    assert.equal((await first.result).stopReason, "unknown");
+    // The record that ended it says how (DUR-20, `tests/tla/sdk/DurableSession.tla`
+    // EndLine, EndSaysHow).
+    assert.equal(retried.stopReason, "end_turn");
+    assert.equal((await first.result).stopReason, "end_turn");
     const lines = await readLines(session.stream(0), 100);
-    assert.equal(lines.filter((line) => line.type === "turn_end" && line.messageId === "turn-a").length, 1);
+    const ends = lines.filter((line) => line.type === "turn_end" && line.messageId === "turn-a");
+    assert.deepEqual(ends.map((line) => line.stopReason), ["end_turn"]);
     assert.equal((await session.prompt("after", { messageId: "turn-after" }).result).stopReason, "end_turn");
+    await agent.close();
+  });
+
+  test("a turn an earlier libfx ended, whose worker died before its turn_end line, ends for its viewers as unknown", async () => {
+    const dies = { now: true };
+    const durability = dyingAfterEnd(memory(), dies);
+    const agent = createAgent({ durability });
+    const session = agent.session();
+    unsaidEnds.add("elder");
+    const first = session.prompt("elder", { messageId: "turn-elder" });
+    const { sessionId } = await first.accepted;
+    const log = await durability.create().session(sessionId);
+    while (foldSessionLog(await log.read()).lastTurnId !== "turn-elder") await sleep(10);
+    await sleep(landMs);
+    dies.now = false;
+    // Its record does not say how it ended.
+    assert.equal((await session.prompt("elder", { messageId: "turn-elder" }).result).stopReason, "unknown");
+    assert.equal((await first.result).stopReason, "unknown");
     await agent.close();
   });
 }
@@ -1706,7 +1734,7 @@ if (durabilityKind === "memory") {
       Promise.all([first.result, second.result]),
       new Promise((_resolve, reject) => { timer = setTimeout(() => reject(new Error("the first turn never ended for its viewers")), 5000); }),
     ]).finally(() => clearTimeout(timer));
-    assert.equal(a.stopReason, "unknown");
+    assert.equal(a.stopReason, "end_turn", "the first turn ended as its record says");
     assert.equal(b.stopReason, "end_turn");
     const lines = await readLines(session.stream(0), 200);
     const ends = (id) => lines.filter((line) => line.type === "turn_end" && line.messageId === id).length;
@@ -1722,15 +1750,17 @@ if (durabilityKind === "memory") {
   // writes that line when its holder died between the two, as for a turn a
   // record ended (`tests/tla/sdk/DurableSession.tla` with Refused, EndLine).
   // Each retry here would otherwise wait 30 s for an end nobody writes.
-  const endsForItsViewers = async (session, input, messageId, first) => {
+  // Its `ended` entry says how it ended, so both its viewers and a retry
+  // hear that (DUR-20).
+  const endsForItsViewers = async (session, input, messageId, first, expected) => {
     let timer;
     const retried = await Promise.race([
       session.prompt(input, { messageId }).result,
       new Promise((_resolve, reject) => { timer = setTimeout(() => reject(new Error("the retry waited for an end nobody writes")), 5000); }),
     ]).finally(() => clearTimeout(timer));
-    // How it ended is not in the log.
-    assert.equal(retried.stopReason, "unknown");
-    assert.equal((await first.result).stopReason, "unknown");
+    const outcome = (result) => ({ stopReason: result.stopReason, ...(result.error ? { error: result.error.message } : {}) });
+    assert.deepEqual(outcome(retried), expected);
+    assert.deepEqual(outcome(await first.result), expected);
     const lines = await readLines(session.stream(0), 100);
     assert.equal(lines.filter((line) => line.type === "turn_end" && line.messageId === messageId).length, 1);
     assert.equal((await session.prompt("after", { messageId: `${messageId}-after` }).result).stopReason, "end_turn");
@@ -1745,7 +1775,7 @@ if (durabilityKind === "memory") {
     while (!dies.dead) await sleep(10);
     await sleep(landMs);
     dies.dead = false;
-    await endsForItsViewers(session, "refuse", "turn-r", first);
+    await endsForItsViewers(session, "refuse", "turn-r", first, { stopReason: "error", error: "refused" });
     await agent.close();
   });
 
@@ -1769,8 +1799,36 @@ if (durabilityKind === "memory") {
     while (!dies.dead) await sleep(10);
     await sleep(landMs);
     dies.dead = false;
-    await endsForItsViewers(session, "beta", "turn-b", first);
+    await endsForItsViewers(session, "beta", "turn-b", first, { stopReason: "cancelled" });
     await agent.close();
+  });
+
+  // A resume answers its viewer with the turn its delivery continues, whose
+  // lines that viewer follows; idle is the answer for a resume with nothing
+  // to continue, never for one whose turn then ended.
+  test("a resume() that continued a turn another worker left open writes no idle line for its request", async () => {
+    const durability = memory();
+    const first = createAgent({ durability });
+    const second = createAgent({ durability });
+    const held = holdStep("kappa-1");
+    const turn = first.session().prompt("kappa", { messageId: "turn-k" });
+    const { sessionId } = await turn.accepted;
+    await held.holding;
+    // The first worker's process is gone, as far as its lease shows.
+    const holders = globalThis[Symbol.for("libfx.liveHolders")];
+    for (const holder of [...holders]) holders.delete(holder);
+    holds.delete("kappa-1");
+    const resumed = await second.session(sessionId).resume().result;
+    assert.equal(resumed.stopReason, "end_turn");
+    assert.equal((await turn.result).stopReason, "end_turn");
+    const lines = await readLines(second.session(sessionId).stream(0), 32);
+    assert.deepEqual(lines.filter((line) => line.type === "idle"), [], "the resume that continued the turn wrote no idle line");
+    assert.equal(lines.filter((line) => line.type === "turn_end").length, 1);
+    // A resume with nothing to continue still answers idle.
+    assert.equal((await second.session(sessionId).resume().result).stopReason, "idle");
+    held.release();
+    await first.close();
+    await second.close();
   });
 }
 
@@ -2125,6 +2183,29 @@ if (durabilityKind === "memory") {
     assert.equal(ownerOf({ k: "checkpoint", through: null, data: "seed" }, input("m1", "support")), "support");
     assert.equal(ownerOf({ k: "checkpoint", through: "7", data: "saved" }), "default");
     assert.equal(ownerOf({ k: "checkpoint", through: "7", data: "saved", agent: "support" }, input("m9", "coding")), "support");
+  });
+
+  // DUR-20: the entry that ends a turn says how, and a fold from a checkpoint
+  // still knows how the last turn ended.
+  test("the log says how each turn ended, and a checkpoint keeps the last turn's", () => {
+    const input = (messageId) => ({ k: "input", key: `${messageId}:prompt`, type: "prompt", messageId });
+    const record = (head, marks) => ({ k: "record", a: head, data: "", marks });
+    const fold = (entries) => foldSessionLog(entries.map((entry, index) => ({ cursor: String(index + 1), entry })));
+    const state = fold([
+      input("t1"), record(null, [{ start: "t1" }]), record("2", [{ end: true, stopReason: "max_output_tokens" }]),
+      input("t2"), { k: "ended", messageId: "t2", stopReason: "error", error: { name: "Error", message: "refused" } },
+      input("t3"), record("3", [{ start: "t3" }]), record("7", [{ end: true }]),
+    ]);
+    assert.deepEqual(state.endingOf("t1"), { stopReason: "max_output_tokens" });
+    assert.deepEqual(state.endingOf("t2"), { stopReason: "error", error: { name: "Error", message: "refused" } });
+    // An end an earlier libfx wrote says nothing of how.
+    assert.equal(state.endingOf("t3"), null);
+    assert.equal(state.endingOf("t9"), null);
+    // A second end of a turn already ended changes nothing.
+    assert.deepEqual(fold([input("t1"), record(null, [{ start: "t1" }]), record("2", [{ end: true, stopReason: "cancelled" }, { end: true, stopReason: "end_turn" }])]).endingOf("t1"), { stopReason: "cancelled" });
+    const restored = fold([{ k: "checkpoint", through: "9", data: "saved", lastTurnId: "t1", lastTurnEnd: { stopReason: "end_turn" } }]);
+    assert.equal(restored.lastTurnId, "t1");
+    assert.deepEqual(restored.endingOf("t1"), { stopReason: "end_turn" });
   });
 }
 

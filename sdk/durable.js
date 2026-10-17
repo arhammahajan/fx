@@ -301,6 +301,11 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
   // it join it, before it started too.
   let openTurn = typeof base?.openTurn?.id === "string" ? { id: base.openTurn.id, at: Number(base.openTurn.at) || 0, from: Number(base.openTurn.from ?? base.openTurn.at) || 0, context: base.openTurn.context ?? null, settings: base.openTurn.settings ?? null } : null;
   let lastTurnId = base?.lastTurnId ?? null;
+  // How each turn that ended ended, as the entry that ended it says:
+  // `{ stopReason, error? }`. An end an earlier libfx wrote does not say.
+  // A checkpoint keeps the last turn's.
+  const endings = new Map();
+  if (typeof base?.lastTurnId === "string" && endingOf(base.lastTurnEnd)) endings.set(base.lastTurnId, endingOf(base.lastTurnEnd));
   // The agent the session belongs to: the one its first stored input, or the
   // checkpoint it was restored from, names. A session stored before agents
   // had names belongs to the default agent.
@@ -373,7 +378,11 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
               consume(mark.start);
               yielded = false;
             } else if (mark.end === true) {
-              if (openTurn) lastTurnId = openTurn.id;
+              if (openTurn) {
+                lastTurnId = openTurn.id;
+                const ending = endingOf(mark);
+                if (ending) endings.set(openTurn.id, ending);
+              }
               openTurn = null;
               yielded = false;
               // A turn's unplaced inputs end with it, handed back first.
@@ -405,7 +414,11 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
         // turn to end, as one a record ends is: a holder that died before
         // that line leaves it to the next worker (endUnshown). An entry a
         // replaced worker wrote again for a turn already taken moves nothing.
-        if (!consumed.has(entry.messageId)) lastTurnId = entry.messageId;
+        if (!consumed.has(entry.messageId)) {
+          lastTurnId = entry.messageId;
+          const ending = endingOf(entry);
+          if (ending) endings.set(entry.messageId, ending);
+        }
         consume(entry.messageId);
         break;
       case "stopped":
@@ -505,6 +518,9 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
     cutoffs: openTurn === null ? 0 : cut.cutoffs,
     openFailed,
     lastTurnId,
+    // How turn `id` ended, as the log says: `{ stopReason, error? }`, or
+    // null when the entry that ended it does not say or it has not ended.
+    endingOf: (id) => endings.get(id) ?? null,
     agent,
     yielded,
     pending,
@@ -525,6 +541,27 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
     hasWork: (openTurn !== null && !openFailed) || pending.length > 0,
   };
 }
+
+// How an entry that ends a turn says the turn ended: a record's end mark,
+// an `ended` entry, or a checkpoint's last turn. Null when it does not say,
+// as one an earlier libfx wrote.
+function endingOf(entry) {
+  if (typeof entry?.stopReason !== "string" || entry.stopReason.length === 0) return null;
+  const error = entry.error && typeof entry.error === "object" ? { name: String(entry.error.name ?? "Error"), message: String(entry.error.message ?? "") } : null;
+  return { stopReason: entry.stopReason, ...(error ? { error } : {}) };
+}
+
+// A turn's end line as `ending` says the turn ended: the line of a turn
+// that ends without a record of its own, written with its `ended` entry, or
+// the one recovery writes for a turn whose end the log holds. "unknown" only
+// for an end an earlier libfx wrote, which does not say (DUR-20).
+function endLineOf(messageId, ending) {
+  return { type: "turn_end", messageId, stopReason: ending?.stopReason ?? "unknown", usage: {}, ...(ending?.error ? { error: ending.error } : {}) };
+}
+
+// The `ended` entry of a turn that ends without a record of its own, saying
+// how it ended, so a worker that writes its line after a crash says so too.
+const endedEntry = (messageId, ending) => ({ k: "ended", messageId, ...ending });
 
 function leaseStands(lease, now, alive) {
   if (!lease) return false;
@@ -1614,6 +1651,9 @@ class SessionWorker {
     // Deliveries in progress for the session in this process.
     this.deliveries = 0;
     this.holder = null;
+    // Turns this process started or continued for the session, as it showed
+    // their turn_start or turn_resume line.
+    this.turnsShown = 0;
   }
 
   // The log folded as `delivery` judges whether a lease's holder lives.
@@ -1651,6 +1691,9 @@ class SessionWorker {
       this.agent.emit("session.forwarded", { sessionId: this.sessionId, agent: owner });
       return undefined;
     }
+    // A resume whose delivery runs a turn is answered by that turn's lines,
+    // which its viewer follows; only one with nothing to continue gets idle.
+    const turnsBefore = this.turnsShown;
     for (let claims = 0; claims < 8; claims += 1) {
       // A holder that died between the record or `ended` entry that ended
       // the session's last turn and that turn's turn_end line left no reader
@@ -1671,7 +1714,7 @@ class SessionWorker {
       } else {
         if (this.running) return { timeoutSeconds: runningBackstopSeconds };
         if (!state.hasWork && missingEnd === null) {
-          if (message.type === "resume") await this.answerIdle(log, message);
+          if (message.type === "resume" && this.turnsShown === turnsBefore) await this.answerIdle(log, message);
           return undefined;
         }
         if (state.lease) {
@@ -1893,6 +1936,8 @@ class SessionWorker {
           recent: now.recent,
           recentSteers: now.recentSteers,
           lastTurnId: now.lastTurnId,
+          // So a fold from here can still write the last turn's end.
+          ...(now.lastTurnId !== null && now.endingOf(now.lastTurnId) ? { lastTurnEnd: now.endingOf(now.lastTurnId) } : {}),
           ...(now.agent === null ? {} : { agent: now.agent }),
           ...(now.openTurn ? { openTurn: now.openTurn, yielded: now.yielded } : {}),
           lease: { holder: this.holder, epoch: lease.epoch, expiresAt: leaseExpiresAt, pid: lease.pid, host: lease.host, ...(lease.delivery ? { delivery: lease.delivery } : {}) },
@@ -1957,8 +2002,9 @@ class SessionWorker {
           ui.push({ type: "turn_end", messageId: id, stopReason: "error", usage: {}, error });
         }
         for (const waiting of state.pending) {
-          await log.append({ k: "ended", messageId: waiting.messageId });
-          ui.push({ type: "turn_end", messageId: waiting.messageId, stopReason: "error", usage: {}, error: { name: "Error", message: "the session's open turn cannot continue" } });
+          const ending = { stopReason: "error", error: { name: "Error", message: "the session's open turn cannot continue" } };
+          await log.append(endedEntry(waiting.messageId, ending));
+          ui.push(endLineOf(waiting.messageId, ending));
         }
         await ui.settle();
         return "done";
@@ -1966,11 +2012,10 @@ class SessionWorker {
       if (missingEnd !== null && state.openTurn === null && state.lastTurnId === missingEnd) {
         // The session's last turn ended without a turn_end line, its holder
         // gone: its viewers hear it ended now, under this worker's lease,
-        // whose epoch outranks a late line from that holder
-        // (`tests/tla/sdk/DurableSession.tla` EndLine, with Repair). The log
-        // does not say how it ended, so it ended "unknown", as for a
-        // process that stopped before recording how. No engine starts.
-        ui.push({ type: "turn_end", messageId: missingEnd, stopReason: "unknown", usage: {} });
+        // whose epoch outranks a late line from that holder, and how, as
+        // the entry that ended it says (`tests/tla/sdk/DurableSession.tla`
+        // EndLine, with Repair; EndSaysHow). No engine starts.
+        ui.push(endLineOf(missingEnd, state.endingOf(missingEnd)));
         await ui.settle();
         if (!state.hasWork) return "done";
       }
@@ -2016,6 +2061,7 @@ class SessionWorker {
           // partly run, and the turn goes on.
           messageId = open.id;
           ui.push({ type: "turn_resume", messageId, sessionId: this.sessionId });
+          this.turnsShown += 1;
           // It lands before the turn goes on, so any line the replaced
           // worker writes after it ranks below it and stays hidden.
           await ui.settle();
@@ -2038,16 +2084,18 @@ class SessionWorker {
           if ((state.stops.get(messageId) ?? 0) >= maxHarnessStops) {
             // An engine that stops each time it starts this turn would hold
             // the session forever; the turn ends with an error instead.
-            await log.append({ k: "ended", messageId });
-            ui.push({ type: "turn_end", messageId, stopReason: "error", usage: {}, error: { name: "Error", message: `the engine stopped each of the ${maxHarnessStops} times it started this turn` } });
+            const ending = { stopReason: "error", error: { name: "Error", message: `the engine stopped each of the ${maxHarnessStops} times it started this turn` } };
+            await log.append(endedEntry(messageId, ending));
+            ui.push(endLineOf(messageId, ending));
             await ui.settle();
             state = this.fold(await log.read());
             continue;
           }
           if (next.cancelled) {
             // Its own cancel came before it started, so it never runs.
-            await log.append({ k: "ended", messageId });
-            ui.push({ type: "turn_end", messageId, stopReason: "cancelled", usage: {} });
+            const ending = { stopReason: "cancelled" };
+            await log.append(endedEntry(messageId, ending));
+            ui.push(endLineOf(messageId, ending));
             await ui.settle();
             state = this.fold(await log.read());
             continue;
@@ -2065,11 +2113,12 @@ class SessionWorker {
           const withImages = await resolvePromptImages(log.images, next.input);
           if (withImages.missing) {
             // A history without the image is not the one its caller sent.
-            await log.append({ k: "ended", messageId });
             const message = withImages.corrupt
               ? `the session's image store holds other bytes under image ${withImages.missing}`
               : `the session's image store does not hold image ${withImages.missing}`;
-            ui.push({ type: "turn_end", messageId, stopReason: "error", usage: {}, error: { name: "Error", message } });
+            const ending = { stopReason: "error", error: { name: "Error", message } };
+            await log.append(endedEntry(messageId, ending));
+            ui.push(endLineOf(messageId, ending));
             await ui.settle();
             state = this.fold(await log.read());
             continue;
@@ -2081,6 +2130,7 @@ class SessionWorker {
             return unusable(error);
           }
           ui.push({ type: "turn_start", messageId, sessionId: this.sessionId, ...(typeof next.input === "string" ? { input: next.input } : {}) });
+          this.turnsShown += 1;
           fresh = true;
         }
         turnNow = turn;
@@ -2114,9 +2164,9 @@ class SessionWorker {
           if (failed) return broken();
           state = this.fold(await log.read());
           if (state.openTurn?.id !== messageId && state.consumed.has(messageId)) {
-            // Its end landed before its engine stopped, so it ended, though
-            // how is unknown.
-            ui.push({ type: "turn_end", messageId, stopReason: "unknown", usage: {} });
+            // Its end landed before its engine stopped, so it ended, as that
+            // end says.
+            ui.push(endLineOf(messageId, state.endingOf(messageId)));
             await ui.settle();
           } else {
             await log.append({ k: "stopped", messageId });
@@ -2127,10 +2177,12 @@ class SessionWorker {
         if (fresh && !failed && !started.has(messageId)) {
           // A turn that ended before writing a record, such as a prompt the
           // harness refused or one a cancel stopped first, is done too. The
-          // log says so before its viewers hear it ended, so a retry that
-          // reads the log finds it ended.
+          // log says so, and how, before its viewers hear it ended, so a
+          // retry that reads the log finds it ended.
           state = this.fold(await log.read());
-          if (!state.consumed.has(messageId)) await log.append({ k: "ended", messageId });
+          if (!state.consumed.has(messageId)) {
+            await log.append(endedEntry(messageId, { stopReason: result.stopReason, ...(result.error ? { error: result.error } : {}) }));
+          }
         }
         // The turn's records have landed, so its viewers hear it ended now;
         // the log is read after, for what comes next.
@@ -2357,8 +2409,9 @@ async function uiRankerAt(log, count) {
 // What a retried `messageId` finds in its session: its turn still waiting or
 // running (`follow`), no trace of it (`fresh`), a turn it already ran,
 // settled from that turn's end on the stream before `from` or from the
-// log's record of its failure, or `unsure` when the log says it ran but
-// neither shows how. Once this call has `sent` the message, a recorded
+// log's record of its failure, or `unsure` when the log says it ran but no
+// line shows its end yet, with `ending`, how the entry that ended it says it
+// ended, when it says. Once this call has `sent` the message, a recorded
 // failure may be this send's own run, so it is not called a repeat.
 async function retryOutcome(log, state, messageId, from, { sent }) {
   const waiting = state.inputKeys.has(`prompt:${messageId}`) && !state.consumed.has(messageId);
@@ -2368,7 +2421,7 @@ async function retryOutcome(log, state, messageId, from, { sent }) {
   if (ended) return { settled: { ...ended, repeated: true } };
   const error = state.failed.get(messageId);
   if (error) return { settled: { messageId, stopReason: "error", error, ...(sent ? {} : { repeated: true }) } };
-  return { unsure: true };
+  return { unsure: true, ending: state.endingOf(messageId) };
 }
 
 // Calls `visit` with each line a reader shows among the first `count` lines
@@ -2459,7 +2512,7 @@ function turnView({ messageId, resumeRequest = null, start }) {
   };
   const read = async () => {
     try {
-      const { log, from, settled, attaching, endWithinMs, unsure } = await started;
+      const { log, from, settled, attaching, endWithinMs, unsure, ending } = await started;
       // A turn whose end this view finds after its own start may be the
       // message's first run, so only an end found before it is a repeat.
       repeated = settled?.repeated === true || (endWithinMs !== undefined && !unsure);
@@ -2475,12 +2528,14 @@ function turnView({ messageId, resumeRequest = null, start }) {
       const shows = attaching ? await uiRankerAt(log, from) : uiRanker();
       const reader = log.ui.read(from).getReader();
       // A turn whose end the log holds but no line shows yet: a worker that
-      // stopped between the two never writes it, so the outcome is unknown.
+      // stopped between the two never writes it, so the turn ended as the
+      // entry that ended it says (DUR-20), or, where it does not say, unknown.
       let gaveUp = null;
       if (endWithinMs !== undefined) {
         gaveUp = setTimeout(() => {
           void reader.cancel().catch(() => {});
-          finish({ messageId, stopReason: "unknown", usage: {} });
+          const { type: _type, ...outcome } = endLineOf(messageId, ending);
+          finish(outcome);
         }, endWithinMs);
       }
       let buffered = "";
@@ -2919,7 +2974,7 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
                 // this id ran before never wrote its end.
                 const outcome = await retryOutcome(log, state, messageId, from, { sent: true });
                 if (outcome.settled) return { settled: outcome.settled };
-                if (outcome.unsure) return { log, from, attaching: true, endWithinMs: retryEndWaitMs, unsure: true };
+                if (outcome.unsure) return { log, from, attaching: true, endWithinMs: retryEndWaitMs, unsure: true, ending: outcome.ending };
                 return { log, from, attaching: outcome.follow === true };
               }
               if (retried) {
@@ -2931,7 +2986,7 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
                 else if (!outcome.fresh) {
                   accept.resolve({ messageId, sessionId });
                   if (outcome.settled) return { settled: outcome.settled };
-                  return { log, from, attaching: true, endWithinMs: retryEndWaitMs };
+                  return { log, from, attaching: true, endWithinMs: retryEndWaitMs, ending: outcome.ending };
                 }
               }
               // The viewer starts where the stream is now, before the

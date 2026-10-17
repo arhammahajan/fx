@@ -235,6 +235,25 @@ const AgentMessageKind = enum {
     operational,
 };
 
+/// A journaled turn's end, which the runtime reports before the turn's stop
+/// reason is decided: it calls `propagate_history_turn`, or clears the turn's
+/// progress, then `finalize_turn`. The end reaches the journal from
+/// `finalizeTurn`, saying how the turn ended in the record that ends it, so a
+/// crash can never leave an end whose outcome a later record would have told
+/// (DUR-20, `tests/tla/sdk/DurableSession.tla` EndSaysHow). Nothing the host
+/// sees comes between: the prompt's answer, `finish_prompt`, and the turn's
+/// end hook all follow `finalize_turn`.
+const HeldJournalEnd = struct {
+    /// The runtime cleared the turn's progress: it ends without a history
+    /// entry, or before the interrupted one it then commits.
+    cleared: bool = false,
+    /// The history entry the turn ends with, owned by the context's allocator.
+    turn: ?HistoryTurn = null,
+};
+
+/// How a journaled turn whose prompt fails ended, as libfx reports one.
+const journal_failed_stop_reason = "error";
+
 const AcpContext = struct {
     alloc: Allocator,
     state: *server.ServerState,
@@ -254,11 +273,53 @@ const AcpContext = struct {
     captured_permission_mode: ?PermissionMode = null,
     current_prompt_input: ?*ParsedPromptInput = null,
     observer: ?*observation.Observer = null,
+    /// The running turn's end in a journaled session, held from where the
+    /// runtime ends the turn until `finalizeTurn` decides how it ended.
+    held_end: HeldJournalEnd = .{},
 
     fn deinitPublishedToolCalls(self: *AcpContext) void {
         var keys = self.published_tool_calls.keyIterator();
         while (keys.next()) |key| self.alloc.free(key.*);
         self.published_tool_calls.deinit(self.alloc);
+    }
+
+    /// Writes the turn's end the runtime reported, held until now, saying
+    /// it ended with `stop_reason`: the cleared progress, then the history
+    /// entry, as the runtime reported them, each handing back first the
+    /// steers the turn never placed. Nothing is held afterwards, whether or
+    /// not the writes succeed.
+    fn writeHeldJournalEnd(self: *AcpContext, stop_reason: []const u8) !void {
+        const held = self.held_end;
+        self.held_end = .{};
+        defer if (held.turn) |turn| types.freeHistoryTurn(self.alloc, turn);
+        if (!held.cleared and held.turn == null) return;
+        const session = if (self.state.active_session) |*value| value else return error.SessionPersistenceUnavailable;
+        if (held.cleared) {
+            session.session_write_mutex.lockUncancelable(io_mod.getIo());
+            defer session.session_write_mutex.unlock(io_mod.getIo());
+            const journal = if (session.journal) |*value| value else return error.SessionPersistenceUnavailable;
+            try handBackUnplacedSteersLocked(self.alloc, self.state.alloc, session, journal);
+            try journal.clearProgress(self.alloc, session.session_id, stop_reason);
+        }
+        if (held.turn) |turn| try persistAcpHistoryTurn(self.alloc, session, turn, self.current_prompt_input, self.state.alloc, stop_reason);
+    }
+
+    /// Frees an end that never reached the journal, which only a prompt that
+    /// failed before it could write it leaves.
+    fn dropHeldJournalEnd(self: *AcpContext) void {
+        if (!self.held_end.cleared and self.held_end.turn == null) return;
+        debug_trace.logf("session", "event=libfx_journal_turn_end_dropped cleared={} committed={} reason=prompt_ended_first", .{ self.held_end.cleared, self.held_end.turn != null });
+        if (self.held_end.turn) |turn| types.freeHistoryTurn(self.alloc, turn);
+        self.held_end = .{};
+    }
+
+    /// How the running turn ended, as its prompt answers: the stop reason
+    /// `finalizeTurn` decided, or cancelled once the user cancelled the
+    /// turn, whatever stopped it (see the end of `handlePrompt`).
+    fn journalStopReason(self: *AcpContext) []const u8 {
+        const session = if (self.state.active_session) |*value| value else return self.stop_reason.jsonString();
+        if (session.steering.userCancelled()) return acp_types.StopReason.cancelled.jsonString();
+        return self.stop_reason.jsonString();
     }
 
     fn sendUpdate(self: *AcpContext, update_json: []const u8) !void {
@@ -980,6 +1041,7 @@ pub fn handlePrompt(
         .current_prompt_input = &prompt_input,
     };
     defer ctx.deinitPublishedToolCalls();
+    defer ctx.dropHeldJournalEnd();
 
     var hook_bridge: libfx_hooks.Bridge = undefined;
     if (session.observer_hooks) |hook_config| {
@@ -1051,16 +1113,17 @@ pub fn handlePrompt(
         };
         recovery_checkpoint = try checkpoint.dupe(alloc);
     } else if (session.journal) |*journal| {
-        // A new prompt instead of a resume ends the open turn as interrupted.
+        // A new prompt instead of a resume ends the open turn as interrupted,
+        // which a turn's end reports as cancelled.
         if (journal.pending_resume) |pending| {
-            try persistAcpHistoryTurn(alloc, session, pending.interruptedTurn(), null, null);
+            try persistAcpHistoryTurn(alloc, session, pending.interruptedTurn(), null, null, acp_types.StopReason.cancelled.jsonString());
             journal.dropPendingResume(state.alloc);
         }
     } else if (session.writable) |*writable| {
         if (writable.conversation_writer.turn_open) {
             const checkpoint = writable.state.recovery_checkpoint orelse
                 return error.InvalidRecoveryCheckpoint;
-            try persistAcpHistoryTurn(alloc, session, checkpoint.interruptedTurn(), null, null);
+            try persistAcpHistoryTurn(alloc, session, checkpoint.interruptedTurn(), null, null, null);
         }
     }
 
@@ -1202,18 +1265,28 @@ pub fn handlePrompt(
             // the turn as interrupted, as a cancel anywhere else does.
             ctx.stop_reason = .cancelled;
             // If the commit fails, the turn still ends below.
+            const cancelled = acp_types.StopReason.cancelled.jsonString();
+            ctx.writeHeldJournalEnd(cancelled) catch |end_err| {
+                debug_trace.logf("session", "event=libfx_journal_turn_end_failed err={s} turn_err={s}", .{ @errorName(end_err), @errorName(err) });
+            };
             commitCancelledJournalTurn(alloc, state.alloc, session, &prompt_input) catch |commit_err| {
                 debug_trace.logf("session", "event=libfx_journal_interrupted_commit_failed err={s}", .{@errorName(commit_err)});
             };
         } else {
             // The turn's own failure is the one to report.
-            endJournalTurn(alloc, state.alloc, session) catch |end_err| {
+            ctx.writeHeldJournalEnd(journal_failed_stop_reason) catch |end_err| {
+                debug_trace.logf("session", "event=libfx_journal_turn_end_failed err={s} turn_err={s}", .{ @errorName(end_err), @errorName(err) });
+            };
+            endJournalTurn(alloc, state.alloc, session, journal_failed_stop_reason) catch |end_err| {
                 debug_trace.logf("session", "event=libfx_journal_turn_end_failed err={s} turn_err={s}", .{ @errorName(end_err), @errorName(err) });
             };
             return promptExecutionFailure(err);
         }
     };
-    try endJournalTurn(alloc, state.alloc, session);
+    // `finalizeTurn` wrote the turn's end; one the runtime reported without
+    // it, or a turn that ended with no end yet, ends now.
+    try ctx.writeHeldJournalEnd(ctx.journalStopReason());
+    try endJournalTurn(alloc, state.alloc, session, ctx.journalStopReason());
     prompt_input.retainImageSnapshots();
     completeAcpTitleTask(state, session, alloc);
     try sessions.sendActiveSessionInfoUpdate(state, alloc);
@@ -2357,6 +2430,10 @@ fn finalizeTurn(raw_ctx: *anyopaque, turn_id: u64, outcome: types.TurnPresentati
         // says end_turn while the journal says otherwise (DUR-64).
         ctx.stop_reason = .cancelled;
     }
+    // A journaled turn's end, held since the runtime reported it, reaches
+    // the journal saying how the turn ended, before anything else the host
+    // hears of the turn's end.
+    try ctx.writeHeldJournalEnd(ctx.journalStopReason());
 }
 
 fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
@@ -2884,15 +2961,22 @@ fn toolUpdateContentText(result: ToolExecutionResult) []const u8 {
 
 fn propagateHistoryTurn(raw_ctx: *anyopaque, turn: HistoryTurn) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    if (ctx.state.active_session) |*session| {
-        try persistAcpHistoryTurn(
-            ctx.alloc,
-            session,
-            turn,
-            ctx.current_prompt_input,
-            ctx.state.alloc,
-        );
+    const session = if (ctx.state.active_session) |*value| value else return;
+    if (session.journal != null) {
+        // The turn's end waits for `finalizeTurn`, which knows how it ended
+        // (`HeldJournalEnd`). An end held already goes first, as it stands.
+        if (ctx.held_end.turn != null) try ctx.writeHeldJournalEnd(ctx.journalStopReason());
+        ctx.held_end.turn = try types.dupeHistoryTurn(ctx.alloc, turn);
+        return;
     }
+    try persistAcpHistoryTurn(
+        ctx.alloc,
+        session,
+        turn,
+        ctx.current_prompt_input,
+        ctx.state.alloc,
+        null,
+    );
 }
 
 /// `AgentRuntimeDeps.append_turn_piece` on v2: the pieces finished so far,
@@ -2999,18 +3083,19 @@ fn handBackUnplacedSteersLocked(alloc: Allocator, backing: Allocator, session: *
     if (ids.len > 0) debug_trace.logf("acp", "handed back unplaced libfx steers count={d}", .{ids.len});
 }
 
-/// Ends a journaled turn in the journal as it ended in the session. One that
-/// failed left no history entry, so its progress is cleared: resuming is for
-/// turns a stopped process left open. Inputs it took and never placed are
-/// settled. `session_alloc` owns the journal's state.
-fn endJournalTurn(alloc: Allocator, session_alloc: Allocator, session: *server.ActiveSessionState) !void {
+/// Ends a journaled turn in the journal as it ended in the session, with
+/// `stop_reason`, how its prompt answers. One that failed left no history
+/// entry, so its progress is cleared: resuming is for turns a stopped
+/// process left open. Inputs it took and never placed are settled.
+/// `session_alloc` owns the journal's state.
+fn endJournalTurn(alloc: Allocator, session_alloc: Allocator, session: *server.ActiveSessionState, stop_reason: []const u8) !void {
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer session.session_write_mutex.unlock(io_mod.getIo());
     const journal = if (session.journal) |*value| value else return;
     try handBackUnplacedSteersLocked(alloc, session_alloc, session, journal);
     if (journal.progress_open) {
         debug_trace.logf("session", "event=libfx_journal_turn_closed reason=ended_without_commit", .{});
-        try journal.clearProgress(alloc, session.session_id);
+        try journal.clearProgress(alloc, session.session_id, stop_reason);
     }
     try journal.endUnplaced(alloc, session_alloc, session.session_id);
     if (journal.takeCancelledProgress()) |checkpoint| {
@@ -3035,7 +3120,7 @@ fn commitCancelledJournalTurn(alloc: Allocator, session_alloc: Allocator, sessio
         break :cancelled checkpoint;
     };
     defer cancelled.deinit(session_alloc);
-    try persistAcpHistoryTurn(alloc, session, cancelled.interruptedTurn(), prompt_input, session_alloc);
+    try persistAcpHistoryTurn(alloc, session, cancelled.interruptedTurn(), prompt_input, session_alloc, acp_types.StopReason.cancelled.jsonString());
 }
 
 fn sessionChildCapability(session: *server.ActiveSessionState) ?*session_child_store.SessionChildCapability {
@@ -3045,13 +3130,15 @@ fn sessionChildCapability(session: *server.ActiveSessionState) ?*session_child_s
 }
 
 /// `hand_back_alloc`, set when the running turn ends, owns its queued
-/// steering, which is handed back first.
+/// steering, which is handed back first. In a journaled session the commit
+/// says how the turn ended with `stop_reason`.
 fn persistAcpHistoryTurn(
     alloc: Allocator,
     session: *server.ActiveSessionState,
     turn: HistoryTurn,
     current_prompt_input: ?*ParsedPromptInput,
     hand_back_alloc: ?Allocator,
+    stop_reason: ?[]const u8,
 ) !void {
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer session.session_write_mutex.unlock(io_mod.getIo());
@@ -3062,7 +3149,10 @@ fn persistAcpHistoryTurn(
         // The running turn's own end hands back its unplaced steers; ending
         // an earlier turn for a new prompt does not.
         if (hand_back_alloc) |backing| try handBackUnplacedSteersLocked(alloc, backing, session, journal);
-        try journal.append(alloc, session.session_id, .{ .turn_committed = prepared });
+        if (stop_reason) |reason|
+            try journal.appendEnd(alloc, session.session_id, .{ .turn_committed = prepared }, reason)
+        else
+            try journal.append(alloc, session.session_id, .{ .turn_committed = prepared });
     }
     if (comptime host_target.is_wasm) {
         session.session_rt.commitPreparedHistoryEntry(alloc, prepared);
@@ -3295,13 +3385,11 @@ fn keepCancelledProgress(session_alloc: Allocator, session: *server.ActiveSessio
 fn clearJournalProgress(raw_ctx: *anyopaque) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const session = if (ctx.state.active_session) |*value| value else return error.SessionPersistenceUnavailable;
-    session.session_write_mutex.lockUncancelable(io_mod.getIo());
-    defer session.session_write_mutex.unlock(io_mod.getIo());
-    const journal = if (session.journal) |*value| value else return error.SessionPersistenceUnavailable;
-    // The turn ends here, cancelled or stopped: the steers it never placed
-    // are withdrawn while they still belong to it, before the clear ends it.
-    try handBackUnplacedSteersLocked(ctx.alloc, ctx.state.alloc, session, journal);
-    try journal.clearProgress(ctx.alloc, session.session_id);
+    if (session.journal == null) return error.SessionPersistenceUnavailable;
+    // The turn ends here, cancelled or stopped. The clear that ends it waits
+    // for `finalizeTurn`, which knows how (`HeldJournalEnd`); then the steers
+    // it never placed are withdrawn while they still belong to it.
+    ctx.held_end.cleared = true;
 }
 
 /// Stores grants on the active ACP session without persisting them.

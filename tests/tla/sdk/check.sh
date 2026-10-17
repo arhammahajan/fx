@@ -68,10 +68,15 @@ done
 # NoRefusedRepair breaks it the same way for a turn the harness refused,
 # which ends through an `ended` entry and no record: libfx repaired only a
 # turn a record ended, which on the refuse graph is no repair at all.
+# NoEndHow breaks EndSaysHow: when the record that ends a turn does not say
+# how, as before libfx recorded it, the worker that writes a crashed
+# holder's missing turn_end can only say unknown. NoRefusedHow breaks it
+# the same way for a refused turn's `ended` entry.
 for pair in UiInOrder:UiInOrder NoStaleShown:NoStaleShown NotTwoActive:NotTwoActive \
     NoSelfStop:TwoActiveNeedsFreeze NoClaimFence:EffectsAtMostOnce NoCutoffBound:HandoffsBounded \
     LeasedTwoActive:NotTwoActive LookupRunsAhead:EveryCallAfterIntent LookupNewId:IdsAtMostOne \
-    WriteRunsAhead:OneExecutionId NoEndRepair:EndRecoverable NoRefusedRepair:EndRecoverable; do
+    WriteRunsAhead:OneExecutionId NoEndRepair:EndRecoverable NoRefusedRepair:EndRecoverable \
+    NoEndHow:EndSaysHow NoRefusedHow:EndSaysHow; do
     witness="${pair%%:*}" invariant="${pair#*:}"
     if "$java" -cp "$jar" tlc2.TLC -deadlock -workers auto -cleanup -metadir "$work/w-$witness" \
         -config "Witness-$witness.cfg" DurableSession.tla 2>&1 | grep -q -E "Invariant $invariant is violated"; then

@@ -151,6 +151,13 @@ function framesFor(prompt) {
       { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" }, usage },
     ];
   }
+  // An answer the output limit cuts short: its turn ends max_output_tokens.
+  if (text === "cut short") {
+    return [
+      { type: "text-delta", id: "answer", delta: "cut" },
+      { type: "finish", finishReason: { unified: "length", raw: "length" }, usage },
+    ];
+  }
   const answer = text === "use the tool" ? "tool said beta" : `answer to ${text}`;
   return [
     { type: "text-delta", id: "answer", delta: answer },
@@ -715,9 +722,11 @@ test("a second agent on the same store fences the first", async () => {
   await run(second, "from the second");
   await second.close();
   const turn = first.prompt("too late");
-  const fenced = (error) => error.code === "FX_JOURNAL_APPEND_FAILED" && error.cause instanceof FxFencedError;
+  // The turn rejects with the store's own FxFencedError, which an app checks for.
+  const fenced = (error) => error instanceof FxFencedError && error.code === "FX_FENCED";
   await assert.rejects((async () => { for await (const _ of turn) {} })(), fenced);
   await assert.rejects(turn.result, fenced);
+  assert.throws(() => first.prompt("and again"), fenced);
   await first.close();
   assertContiguous(storedEvents(store));
 });
@@ -807,17 +816,18 @@ test("a session taken over mid-turn fences the first agent, which stops at once"
   const laptopRequests = () => sessionHeaders.filter(([id]) => id === laptopSession).length;
 
   // The laptop learns of the takeover from its next append. Progress appends
-  // do not hold up model requests, so the request the tool's result
-  // starts while that append is in flight may still arrive, even after the
-  // turn has failed; nothing starts once the laptop knows.
+  // do not hold up model requests, but the request the tool's result starts
+  // waits for the store's first answer to the events before it, so a store
+  // that refuses at once, as this one does, stops the turn before it, on
+  // either backend (DUR-30).
   const requestsBeforeRelease = laptopRequests();
   releaseTool();
-  const fenced = (error) => error.code === "FX_JOURNAL_APPEND_FAILED" && error.cause instanceof FxFencedError && error.cause.code === "FX_FENCED";
+  const fenced = (error) => error instanceof FxFencedError && error.code === "FX_FENCED";
   await assert.rejects(drained, fenced);
   await assert.rejects(turn.result, fenced);
   await laptop.close();
   await new Promise((resolveWait) => setTimeout(resolveWait, 50));
-  assert.ok(laptopRequests() <= requestsBeforeRelease + 1, `the laptop started no request once fenced (${laptopRequests()} after ${requestsBeforeRelease})`);
+  assert.equal(laptopRequests(), requestsBeforeRelease, `the laptop started no request once fenced (${laptopRequests()} after ${requestsBeforeRelease})`);
   assert.equal(journal.events.length, eventsAfterTakeover, "the laptop wrote nothing after the fence");
   assert.equal(laptopRuns, 1);
   assertContiguous(journal.events);
@@ -855,8 +865,8 @@ test("a takeover does not run a running call again and records one outcome for i
   assert.equal((await resumed.result).stopReason, "end_turn");
   await takeover.close();
   releaseTool();
-  await assert.rejects(drained, (error) => error.cause instanceof FxFencedError);
-  await assert.rejects(turn.result, (error) => error.cause instanceof FxFencedError);
+  await assert.rejects(drained, (error) => error instanceof FxFencedError);
+  await assert.rejects(turn.result, (error) => error instanceof FxFencedError);
   await laptop.close();
 
   // AtMostOneRun: the call ran once, on the laptop, and the takeover did not run it again.
@@ -2030,6 +2040,30 @@ test("a retried prompt with the id of a turn that ended does not run it again", 
   assert.equal(requests.length, 1);
   assert.equal(journal.events.filter((event) => event.type === "turn_committed").length, 2);
   assertContiguous(journal.events);
+});
+
+// DUR-20: the record that ends a turn says how it ended, at version 1, so a
+// retried prompt of that turn reports it, in this engine and after a reopen
+// on the other backend. An end an earlier libfx wrote does not say, and a
+// retry reports end_turn, as it did.
+test("a retried prompt of a turn that ended reports how the journal says it ended", async () => {
+  const journal = eventJournal();
+  const agent = await createFxEngine(options(sourceBackend, journal));
+  const turn = agent.prompt("cut short", { turnId: "turn-cut" });
+  for await (const _ of turn) {}
+  assert.equal((await turn.result).stopReason, "max_output_tokens");
+  const ends = journal.events.filter((event) => event.type === "turn_committed" || event.type === "turn_progress_cleared");
+  assert.deepEqual(ends.map(({ type, v, stopReason }) => ({ type, v, stopReason })), [{ type: "turn_committed", v: 1, stopReason: "max_output_tokens" }]);
+  requests.length = 0;
+  assert.equal((await agent.prompt("cut short", { turnId: "turn-cut" }).result).stopReason, "max_output_tokens");
+  await agent.close();
+  const restored = await createFxEngine(options(targetBackend, journal));
+  assert.equal((await restored.prompt("cut short", { turnId: "turn-cut" }).result).stopReason, "max_output_tokens");
+  await restored.close();
+  assert.equal(requests.length, 0, "no model request ran for the ended turn");
+  const elder = await createFxEngine(options(targetBackend, eventJournal(journal.events.map(({ stopReason: _said, ...event }) => event))));
+  assert.equal((await elder.prompt("cut short", { turnId: "turn-cut" }).result).stopReason, "end_turn");
+  await elder.close();
 });
 
 test("a tool receives the model's call id as its execution id, and its session's id", async () => {

@@ -4,7 +4,8 @@
 // checks after every step that the code is in a state the model allows.
 // Each turn_end line a worker writes waits for the walk's EndLine step, so a
 // walk can crash a worker between the record that ends its turn and that
-// line, and check that another worker writes the end it left missing.
+// line, and check that another worker writes the end it left missing, with
+// the stop reason that record holds.
 //
 //   bun tests/tla/drivers/drive.mjs [send|lookup|write|cutoff|leased|queue|refuse] [--walks N] [--seed S] [--backend native|wasm]
 //     [--durability local|world|vercel] [--hooks]
@@ -106,15 +107,16 @@ const wasm = backend === "wasm" ? await readFile(resolve(here, "../../../zig-out
 const Workers = ["A", "B"];
 
 // The lines every reader shows, by the spec's ShownAt: each line no earlier
-// line outranks, as its epoch, with an "e" after a turn_end's.
-const lineView = (epoch, end) => `${epoch}${end ? "e" : ""}`;
+// line outranks, as its epoch, with an "e" and the stop reason it says after
+// a turn_end's (the spec's EndSaysHow).
+const lineView = (epoch, end, how) => `${epoch}${end ? `e:${how}` : ""}`;
 const shownLines = (lines) => {
   let high = 0;
   const shown = [];
   for (const line of lines) {
     if (line.e < high) continue;
     high = line.e;
-    shown.push(lineView(line.e, line.end));
+    shown.push(lineView(line.e, line.end, line.how));
   }
   return shown;
 };
@@ -305,7 +307,7 @@ async function harness() {
       frozen: { ...frozen },
       runs,
       ids: executions.size,
-      ui: lines.filter((line) => modeledLines.has(line.type)).map((line) => lineView(line.epoch ?? 0, line.type === "turn_end")),
+      ui: lines.filter((line) => modeledLines.has(line.type)).map((line) => lineView(line.epoch ?? 0, line.type === "turn_end", line.stopReason)),
       ...(leased ? { live: sessionId ? await call("A", "leaseStands", { sessionId }) : false } : {}),
     };
   }

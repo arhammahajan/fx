@@ -261,8 +261,8 @@ export interface FxUsage {
   reasoningTokens?: number;
 }
 
-/** Why an engine turn ended. */
-export type FxStopReason = "end_turn" | "max_output_tokens" | "max_model_turns" | "refused" | "cancelled";
+/** Why an engine turn ended. `yielded` is a turn that stopped at its `yieldAt` before its next model request; `resume()` continues it. */
+export type FxStopReason = "end_turn" | "max_output_tokens" | "max_model_turns" | "refused" | "cancelled" | "yielded";
 
 // ---------------------------------------------------------------------------
 // Diagnostics
@@ -307,8 +307,9 @@ export type FxEngineEvent = FxEventBase & (
   | { type: "journal.append"; events: number }
   | { type: "journal.error"; error: string }
   | { type: "checkpoint.save"; through: string; bytes: number }
-  | { type: "checkpoint.error"; error: string; message: string }
-  /** A checkpoint saved under a different libfx version, tool set, or model still loaded. */
+  /** A checkpoint save failed, or, with `skipped`, the core saved none because the conversation is past a checkpoint's limits (`code: "FX_CHECKPOINT_TOO_LARGE"`), so each load reads every record since the last checkpoint. */
+  | { type: "checkpoint.error"; error: string; message: string; code?: "FX_CHECKPOINT_TOO_LARGE"; skipped?: "too_large" | "too_many_turns" | "invalid" }
+  /** A checkpoint saved under a different libfx version, tool set, or model still loaded; or a session that has saved no checkpoint yet last ran on another model, as its records say (`saved` then holds only `model`). */
   | { type: "checkpoint.mismatch"; sessionId: string; changed: Array<keyof FxCheckpointMeta>; saved: unknown; current: FxCheckpointMeta }
   | { type: "output.backpressure"; bufferedBytes: number; bufferedEvents: number }
   | { type: "output.discarded"; reason: "cancelled"; bytes: number }
@@ -496,10 +497,11 @@ export interface PersistenceLoadResult {
   head?: string | null;
 }
 
-/** What one record tells a store that set `marks: true` about turns: a turn started, ended or yielded, or an input was accepted. Other marks may appear; a store keeps or ignores them. */
+/** What one record tells a store that set `marks: true` about turns: a turn started, ended and how, or yielded, or an input was accepted. Other marks may appear; a store keeps or ignores them. */
 export type FxJournalMark =
   | { start: string }
-  | { end: true }
+  /** `stopReason` is how the turn ended: its stop reason, or `error` when its prompt failed. A record an earlier libfx wrote has none. */
+  | { end: true; stopReason?: FxStopReason | "error" }
   | { yield: true }
   | { accepted: string }
   | { step: string };
@@ -607,7 +609,7 @@ export interface FxEngine {
   resume(options?: FxResumeOptions): FxEngineTurn | null;
   /** Queues text to run as its own turn once the current turn ends, or at once when none is running. */
   followUp(input: FxSteeringInput): FxFollowUp;
-  /** The conversation as opaque, bounded, versioned bytes, when no prompt is running. */
+  /** The conversation as opaque, bounded, versioned bytes, when no prompt is running. Rejects with `code: "FX_CHECKPOINT_TOO_LARGE"` once the conversation is past what a checkpoint holds, 32 MiB or 1024 turns; the engine goes on. */
   checkpoint(): Promise<Uint8Array>;
   close(): Promise<void>;
 }
@@ -799,7 +801,7 @@ export interface FxAccepted {
 /** How a durable turn ended. */
 export interface FxTurnResult {
   messageId: string;
-  /** `error` when the turn failed, with the reason in `error`; `unknown` when the process that ran it stopped before writing how it ended. */
+  /** `error` when the turn failed, with the reason in `error`. A turn whose process stopped after its end was saved reports how the session's log says it ended; `unknown` only when an earlier libfx saved that end, which does not say. */
   stopReason: FxStopReason | "error" | "unknown";
   /** Absent when the result is a failure read from the session's log rather than from the turn's end. */
   usage?: FxUsage;
