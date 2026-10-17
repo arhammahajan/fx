@@ -16,9 +16,9 @@
 //! This change does not persist `Plan.save`: fx's recovery checkpoint still
 //! owns resume. `Plan.finish` has no record to delete for the same reason.
 //!
-//! The module retries every transient failure for as long as it lasts. Two
+//! The module retries every transient failure for as long as it lasts. Some
 //! failures may never heal, so fx bounds them here, outside the module: see
-//! `Repeating`.
+//! `Repeating` for the four classes.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -66,9 +66,13 @@ pub fn failureKind(cause: types.ModelRecoveryCause) ?Failure.Kind {
 /// `repeat_stop_sends` sends in a row.
 pub const Repeating = enum { tls_setup, missing_finish, uncoded_error, unexplained_error_finish };
 
-/// Sends in a row that the same `Repeating` failure may end, with no response
-/// progress between them, before fx stops the request.
-pub const repeat_stop_sends: u8 = 3;
+/// Sends in a row, all sent the same way, that the same `Repeating` failure
+/// may end with no response progress between them before fx stops the
+/// request.
+const repeat_stop_sends: u8 = 3;
+
+/// Past any wait the module schedules; its longest is 30 seconds.
+const probe_horizon_ms: u64 = 60 * std.time.ms_per_min;
 
 pub const RequestRecovery = struct {
     deps: *const runtime_deps.AgentRuntimeDeps,
@@ -84,8 +88,12 @@ pub const RequestRecovery = struct {
     repeat_sends: u8 = 0,
     /// Response bytes the latest of them streamed.
     repeat_progress_bytes: usize = 0,
+    /// How those sends went out.
+    repeat_send: Send = .{},
     /// The latest send's ending went to `repeatedFailure`.
     repeat_noted: bool = false,
+    /// `repeatedFailure` stopped the request.
+    repeat_stopped: bool = false,
 
     mutex: std.Io.Mutex = .init,
     // Everything below is guarded by `mutex`.
@@ -133,6 +141,7 @@ pub const RequestRecovery = struct {
     /// A new request. `fast` is the request's Fast selection, which makes
     /// "retrying without Fast" a real option.
     pub fn start(self: *RequestRecovery, fast: bool) !void {
+        if (self.deps.begin_route_recovery_request) |begin| begin(self.deps.ctx);
         _ = try self.event(.{ .start = .{ .fast = fast } });
     }
 
@@ -228,41 +237,68 @@ pub const RequestRecovery = struct {
         };
     }
 
-    /// Reports how a failed send ended: `failure` when it is a `Repeating`
-    /// failure and null for any other, with the response bytes the send
+    /// Reports how a failed send ended, before the module hears of it:
+    /// `failure` as the module will hear it, `class` when it is a `Repeating`
+    /// failure and null for any other, and the response bytes the send
     /// streamed. Returns true when the same failure has now ended
-    /// `repeat_stop_sends` sends in a row with no new response progress, and
-    /// fx stops the request. A send whose ending never reaches this, such as
-    /// an HTTP error or a success, breaks the run at the next `beginSend`.
-    pub fn repeatedFailure(self: *RequestRecovery, failure: ?Repeating, progress_bytes: usize) bool {
-        const class = failure orelse {
+    /// `repeat_stop_sends` sends in a row, all sent the same way, with no new
+    /// response progress, and the module would send the same way again, so fx
+    /// stops the request. When the module would change the send, as it drops
+    /// Fast after a run of gateway errors, the request gets those sends first:
+    /// the count starts over with the first send that goes out differently. A
+    /// send whose ending never reaches this, such as an HTTP error or a
+    /// success, breaks the run at the next `beginSend`.
+    pub fn repeatedFailure(self: *RequestRecovery, failure: Failure, class: ?Repeating, progress_bytes: usize) bool {
+        const repeating = class orelse {
             self.repeating = null;
             return false;
         };
         self.repeat_noted = true;
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
         const same = if (self.repeating) |previous|
-            previous == class and self.repeat_progress_bytes == progress_bytes
+            previous == repeating and
+                self.repeat_progress_bytes == progress_bytes and
+                self.repeat_send == self.send
         else
             false;
         if (same) {
             self.repeat_sends +|= 1;
         } else {
-            self.repeating = class;
+            self.repeating = repeating;
             self.repeat_sends = 1;
             self.repeat_progress_bytes = progress_bytes;
+            self.repeat_send = self.send;
         }
         if (self.repeat_sends < repeat_stop_sends) return false;
-        debug_trace.eventf("recovery", "repeated_failure_stop", self.trace_ctx, "failure={s} sends={d} progress_bytes={d}", .{
-            @tagName(class),
+        if (self.nextSendLocked(failure)) |next| {
+            if (next != self.send) return false;
+        }
+        self.repeat_stopped = true;
+        debug_trace.eventf("recovery", "repeated_failure_stop", self.trace_ctx, "failure={s} sends={d} progress_bytes={d} no_fast={}", .{
+            @tagName(repeating),
             self.repeat_sends,
             progress_bytes,
+            self.send.no_fast,
         });
         return true;
     }
 
-    /// `repeatedFailure` stopped the request at its latest failure.
+    /// `repeatedFailure` stopped the request.
     pub fn stoppedRepeating(self: *const RequestRecovery) bool {
-        return self.repeating != null and self.repeat_sends >= repeat_stop_sends;
+        return self.repeat_stopped;
+    }
+
+    /// How the module would send after `failure`, asked of a copy of its
+    /// state: `step` is pure, so stepping a copy changes nothing. The tick
+    /// lands past any wait the module schedules. Null when it would not send
+    /// again on its own.
+    fn nextSendLocked(self: *RequestRecovery, failure: Failure) ?Send {
+        var probe = self.state;
+        const now_ms = self.nowMs();
+        _ = recovery.step(&probe, .{ .failed = failure }, now_ms);
+        return recovery.step(&probe, .tick, now_ms +| probe_horizon_ms).send;
     }
 
     fn clearShownLocked(self: *RequestRecovery) void {
@@ -682,16 +718,75 @@ test "the same repeating failure on three sends in a row stops the request" {
     var request = RequestRecovery.init(&deps, &cancel_flag, .{});
     defer request.deinit();
 
+    try request.start(false);
     for (0..repeat_stop_sends - 1) |_| {
         request.beginSend();
         request.endSend();
-        try std.testing.expect(!request.repeatedFailure(.tls_setup, 0));
+        try std.testing.expect(!request.repeatedFailure(.{ .kind = .dropped }, .tls_setup, 0));
         try std.testing.expect(!request.stoppedRepeating());
+        try request.failed(.{ .kind = .dropped });
+        _ = (try request.waitForSend()).?;
     }
     request.beginSend();
     request.endSend();
-    try std.testing.expect(request.repeatedFailure(.tls_setup, 0));
+    try std.testing.expect(request.repeatedFailure(.{ .kind = .dropped }, .tls_setup, 0));
     try std.testing.expect(request.stoppedRepeating());
+}
+
+test "a request gets its sends without Fast before a repeating failure stops it" {
+    var fake = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
+    defer fake.deinit();
+    const deps = fake.deps();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+    defer request.deinit();
+
+    // Three gateway errors with Fast: the module would drop Fast next, so
+    // the third does not stop the request.
+    try request.start(true);
+    const server: Failure = .{ .kind = .server };
+    for (0..repeat_stop_sends) |_| {
+        request.beginSend();
+        request.endSend();
+        try std.testing.expect(!request.send.no_fast);
+        try std.testing.expect(!request.repeatedFailure(server, .unexplained_error_finish, 0));
+        try request.failed(server);
+        _ = (try request.waitForSend()).?;
+    }
+    // The first send without Fast starts the count over, and the third such
+    // failure stops it.
+    for (0..repeat_stop_sends - 1) |_| {
+        request.beginSend();
+        request.endSend();
+        try std.testing.expect(request.send.no_fast);
+        try std.testing.expect(!request.repeatedFailure(server, .unexplained_error_finish, 0));
+        try request.failed(server);
+        _ = (try request.waitForSend()).?;
+    }
+    request.beginSend();
+    request.endSend();
+    try std.testing.expect(request.repeatedFailure(server, .unexplained_error_finish, 0));
+    try std.testing.expect(request.stoppedRepeating());
+}
+
+test "start tells the host a new request begins" {
+    var fake = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
+    defer fake.deinit();
+    var deps = fake.deps();
+    const Host = struct {
+        var begun: usize = 0;
+        fn begin(_: *anyopaque) void {
+            begun += 1;
+        }
+    };
+    Host.begun = 0;
+    deps.begin_route_recovery_request = Host.begin;
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+    defer request.deinit();
+
+    try request.start(false);
+    try std.testing.expectEqual(@as(usize, 1), Host.begun);
 }
 
 test "another ending or new response progress starts the repeat count over" {
@@ -720,12 +815,14 @@ test "another ending or new response progress starts the repeat count over" {
         .{ .repeating = .{ .tls_setup, 12 } },
         .{ .repeating = .{ .tls_setup, 12 } },
     };
+    try request.start(false);
+    const dropped: Failure = .{ .kind = .dropped };
     for (endings) |ending| {
         request.beginSend();
         request.endSend();
         switch (ending) {
-            .repeating => |failure| try std.testing.expect(!request.repeatedFailure(failure[0], failure[1])),
-            .other_failure => try std.testing.expect(!request.repeatedFailure(null, 0)),
+            .repeating => |failure| try std.testing.expect(!request.repeatedFailure(dropped, failure[0], failure[1])),
+            .other_failure => try std.testing.expect(!request.repeatedFailure(dropped, null, 0)),
             .unreported => {},
         }
     }

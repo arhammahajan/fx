@@ -4340,7 +4340,7 @@ fn isRetryableModelFailure(kind: agent_stream_provider.FailureKind) bool {
 }
 
 /// The module takes Retry-After in milliseconds. Absurd hints saturate; the
-/// module caps server waits and honors rate limits exactly.
+/// module caps every hint, a rate limit's included, at its 30 second ceiling.
 fn retryAfterMs(seconds: ?u64) ?u32 {
     const value = seconds orelse return null;
     return std.math.cast(u32, value *| std.time.ms_per_s) orelse std.math.maxInt(u32);
@@ -7384,6 +7384,7 @@ fn processQueuedPromptLoop(
                     failure_kind != null and
                     !reconciliation_tool_violation;
                 const repeat_stop = retryable and request_recovery.repeatedFailure(
+                    .{ .kind = failure_kind.? },
                     if (err == error.TlsInitializationFailed) .tls_setup else null,
                     stream_ctx.streamed_output_bytes,
                 );
@@ -8020,6 +8021,7 @@ fn processQueuedPromptLoop(
                     .gateway_stream_timeout, .non_retryable, .rate_limited => null,
                 } else null;
                 const repeat_stop = retryable and request_recovery.repeatedFailure(
+                    .{ .kind = failure_kind.? },
                     repeating,
                     stream_ctx.streamed_output_bytes,
                 );
@@ -8104,7 +8106,11 @@ fn processQueuedPromptLoop(
                     completionContentBytes(attempt_completion),
                     attempt_completion.tool_calls.len,
                 });
-                if (attempt_completion.provider_failure_cause == .non_retryable) {
+                // A content filter finish decides on its own, as it always
+                // did, even when an earlier error event carried a code.
+                if (finish_reason != .content_filter and
+                    attempt_completion.provider_failure_cause == .non_retryable)
+                {
                     try deps.push_system_notice(deps.ctx, diagnostic.view());
                     restorePromptAfterTerminalFailure(deps, job, config);
                     const failed_assistant_source = stream_ctx.interruption_source_or("");
