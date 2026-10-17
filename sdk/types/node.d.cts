@@ -155,7 +155,11 @@ export declare function createFxAgent(options?: FxNodeAgentOptions): FxAgent;
  */
 export declare function createFxEngine(options: FxNodeEngineOptions): Promise<FxEngine>;
 
-/** The interactive terminal harness. */
+/**
+ * The interactive terminal harness. Its WebAssembly, `fx-term.wasm`, ships in
+ * `@libfx/term`, whose `createFxTerminal()` passes it as `wasm`; without
+ * `wasm`, this rejects with a `TypeError`.
+ */
 export declare function createFxTerminal(options: FxNodeTerminalOptions): Promise<FxTerminal>;
 
 /** Inspects backend availability without creating an agent or terminal. */

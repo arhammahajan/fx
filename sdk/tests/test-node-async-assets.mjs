@@ -6,14 +6,17 @@ import { createServer } from "node:http";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
-const directory = resolve(process.argv[2]);
+// The directory sdk/scripts/package-libfx.mjs wrote: libfx, and @libfx/term
+// with the terminal's WebAssembly.
+const dist = resolve(process.argv[2]);
+const directory = join(dist, "libfx");
 const entries = [
   ["esm", await import(pathToFileURL(join(directory, "node.js")).href)],
   ["cjs", createRequire(import.meta.url)(join(directory, "node.cjs"))],
 ];
 const assets = {
   agent: await readFile(join(directory, "fx-core.wasm")),
-  terminal: await readFile(join(directory, "fx-term.wasm")),
+  terminal: await readFile(join(dist, "libfx-term", "fx-term.wasm")),
 };
 const requests = new Map();
 const corrupt = new Set();

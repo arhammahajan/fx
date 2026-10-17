@@ -7,12 +7,16 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import { nativePackageBeside, nativePlatform, termPackageBeside } from "./package-siblings.mjs";
 
 const repoRoot = fileURLToPath(new URL("../..", import.meta.url));
 const temp = await mkdtemp(join(tmpdir(), "libfx-node-package-"));
-const packageDir = join(temp, "package");
+const distDir = join(temp, "dist");
+const packageDir = join(distDir, "libfx");
 const consumerDir = join(temp, "consumer");
 const installedPackage = join(consumerDir, "node_modules", "libfx");
+const platforms = ["linux-x64", "linux-arm64", "darwin-x64", "darwin-arm64"];
+const version = "1.2.3-package.4";
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
@@ -26,7 +30,8 @@ function run(command, args, options = {}) {
 }
 
 // The packager takes the docs from a server in this process, so it runs
-// without blocking this process.
+// without blocking this process. It writes libfx and the packages beside it
+// into `outputDir`.
 function packageLibfx(outputDir, env) {
   return new Promise((done, fail) => {
     const child = spawn(process.execPath, [resolve(repoRoot, "sdk/scripts/package-libfx.mjs"), outputDir], {
@@ -129,16 +134,47 @@ try {
   const optional = await packageLibfx(join(temp, "package-docs-optional"), { LIBFX_DOCS_SITE: docsSite, LIBFX_REQUIRE_DOCS: "" });
   assert.equal(optional.status, 0, optional.output);
   assert.match(optional.output, new RegExp(`warning: packaging libfx without its docs: ${unavailable.source}`));
-  assert.ok(!existsSync(join(temp, "package-docs-optional", "docs")), "a build without the docs leaves no partial docs");
+  assert.ok(existsSync(join(temp, "package-docs-optional", "libfx", "package.json")), "a build without the docs still packages libfx");
+  assert.ok(!existsSync(join(temp, "package-docs-optional", "libfx", "docs")), "a build without the docs leaves no partial docs");
   unavailableDocsPath = null;
 
-  // As the publisher packages it, with the docs required.
+  // As the publisher packages it, with the docs required and the release's
+  // version.
   docsRequests.length = 0;
-  const packaged = await packageLibfx(packageDir, { LIBFX_DOCS_SITE: docsSite, LIBFX_REQUIRE_DOCS: "1" });
+  const packaged = await packageLibfx(distDir, { LIBFX_DOCS_SITE: docsSite, LIBFX_REQUIRE_DOCS: "1", LIBFX_VERSION: version });
   assert.equal(packaged.status, 0, packaged.output);
   assert.deepEqual(docsRequests, ["/llms.txt", ...docsPages.map(([sitePath]) => sitePath)], "the packager fetches the index, then each libfx page it lists");
 
+  // PKG-2, PKG-3: libfx carries no native addon and no terminal. Each
+  // platform's addon is a package npm installs only on that platform, and the
+  // terminal is @libfx/term; all are at libfx's version, pinned exactly.
+  const nativeDir = nativePackageBeside(packageDir);
+  const termDir = termPackageBeside(packageDir);
+  assert.equal(nativeDir, join(distDir, `libfx-${nativePlatform}`));
+  assert.equal(termDir, join(distDir, "libfx-term"));
+  assert.deepEqual((await readdir(distDir)).sort(), ["libfx", `libfx-${nativePlatform}`, "libfx-term"].sort(), "a local build packages this machine's addon only");
   const manifest = JSON.parse(await readFile(join(packageDir, "package.json"), "utf8"));
+  assert.equal(manifest.version, version);
+  assert.deepEqual(manifest.optionalDependencies, Object.fromEntries(platforms.map((platform) => [`@libfx/${platform}`, version]).sort()));
+  assert.deepEqual(manifest.peerDependenciesMeta, Object.fromEntries(platforms.map((platform) => [`@libfx/${platform}`, { optional: true }]).sort()));
+  for (const field of ["dependencies", "peerDependencies", "devDependencies", "files"]) assert.equal(manifest[field], undefined, `libfx has no ${field}`);
+  assert.ok(!(await readdir(packageDir)).some((name) => name.endsWith(".node") || name === "fx-term.wasm"), "libfx carries no addon and no fx-term.wasm");
+  const nativeManifest = JSON.parse(await readFile(join(nativeDir, "package.json"), "utf8"));
+  const [os, cpu] = nativePlatform.split("-");
+  assert.deepEqual(
+    { name: nativeManifest.name, version: nativeManifest.version, os: nativeManifest.os, cpu: nativeManifest.cpu, libc: nativeManifest.libc, exports: nativeManifest.exports },
+    { name: `@libfx/${nativePlatform}`, version, os: [os], cpu: [cpu], libc: os === "linux" ? ["glibc"] : undefined, exports: { ".": "./index.js", "./package.json": "./package.json" } },
+  );
+  assert.deepEqual((await readdir(nativeDir)).sort(), ["LICENSE", "README.md", "index.js", `libfx.${nativePlatform}.node`, "package.json"]);
+  assert.equal(await readFile(join(nativeDir, "index.js"), "utf8"), `export default new URL("./libfx.${nativePlatform}.node", import.meta.url);\n`);
+  const termManifest = JSON.parse(await readFile(join(termDir, "package.json"), "utf8"));
+  assert.equal(termManifest.name, "@libfx/term");
+  assert.equal(termManifest.version, version);
+  assert.deepEqual(termManifest.peerDependencies, { libfx: version });
+  assert.deepEqual((await readdir(termDir)).sort(), ["LICENSE", "README.md", "browser.d.ts", "browser.js", "fx-term.wasm", "node.d.ts", "node.js", "package.json"]);
+  for (const dir of [nativeDir, termDir]) {
+    assert.equal(await readFile(join(dir, "LICENSE"), "utf8"), await readFile(resolve(repoRoot, "LICENSE"), "utf8"), `${dir} carries the license (PKG-6)`);
+  }
   const typed = (types, entry) => ({ types: `./types/${types}`, default: entry });
   const nodeEntry = { import: typed("node.d.ts", "./node.js"), require: typed("node.d.cts", "./node.cjs") };
   assert.deepEqual(manifest.exports["."], {
@@ -157,32 +193,47 @@ try {
     assert.ok(existsSync(join(packageDir, target)), `package is missing ${target}`);
   }
 
-  const archiveValidator = packageJob.match(/- name: Validate package archive\n\s+run: \|\n\s+node -e '([\s\S]*?)'/)?.[1];
+  const archiveValidator = packageJob.match(/- name: Validate package archives\n(?:\s+env:\n(?:\s+\w+: .*\n)+)?\s+run: \|\n\s+node -e '([\s\S]*?)'/)?.[1];
   assert.ok(archiveValidator, "publisher archive validation must exist");
   const reportPath = join(temp, "libfx-pack.json");
-  // Every file, at its path in the package, as `npm pack` reports them.
-  const archiveFiles = new Set((await readdir(packageDir, { recursive: true, withFileTypes: true }))
+  // Every file of a package directory, at its path in the package, as
+  // `npm pack` reports them.
+  const packedFiles = async (dir) => (await readdir(dir, { recursive: true, withFileTypes: true }))
     .filter((entry) => entry.isFile())
-    .map((entry) => relative(packageDir, join(entry.parentPath, entry.name)).split(sep).join("/")));
-  for (const platform of ["linux-x64", "linux-arm64", "darwin-x64", "darwin-arm64"]) {
-    archiveFiles.add(`libfx.${platform}.node`);
+    .map((entry) => relative(dir, join(entry.parentPath, entry.name)).split(sep).join("/"));
+  const archiveFiles = new Set(await packedFiles(packageDir));
+  // `npm pack <dir>...` reports each package. This machine built one addon;
+  // the other platforms' packages have the same files.
+  const archiveReports = () => [
+    { name: "libfx", version, size: 0, files: [...archiveFiles].map((path) => ({ path })) },
+    ...platforms.map((platform) => ({
+      name: `@libfx/${platform}`, version, size: 0,
+      files: ["LICENSE", "README.md", "index.js", `libfx.${platform}.node`, "package.json"].map((path) => ({ path })),
+    })),
+    { name: "@libfx/term", version, size: 0, files: [] },
+  ];
+  const termFiles = await packedFiles(termDir);
+  // From a file, so that a failure's message holds the validator's error, not its source.
+  const validatorPath = join(temp, "validate-archives.cjs");
+  await writeFile(validatorPath, archiveValidator.replace("/tmp/libfx-pack.json", reportPath));
+  const validate = async (reports) => {
+    await writeFile(reportPath, JSON.stringify(reports));
+    return run(process.execPath, [validatorPath], { env: { LIBFX_VERSION: version } });
+  };
+  const withTerm = (reports) => reports.map((report) => report.name === "@libfx/term" ? { ...report, files: termFiles.map((path) => ({ path })) } : report);
+  await validate(withTerm(archiveReports()));
+  const mutated = (change) => withTerm(archiveReports()).map((report) => change(report) || report);
+  for (const [reports, message] of [
+    [mutated((report) => report.name === "libfx" && { ...report, files: report.files.filter(({ path }) => path !== "fetch-cleanup.js") }), /libfx: unexpected file count|libfx is missing fetch-cleanup\.js/],
+    [mutated((report) => report.name === "libfx" && { ...report, files: report.files.filter(({ path }) => !path.startsWith("docs/")) }), /libfx is missing the libfx docs/],
+    [mutated((report) => report.name === "libfx" && { ...report, files: [...report.files, { path: "libfx.linux-x64.node" }] }), /libfx must not carry/],
+    [mutated((report) => report.name === "libfx" && { ...report, files: [...report.files, { path: "fx-term.wasm" }] }), /libfx must not carry/],
+    [mutated((report) => report.name === "@libfx/linux-x64" && { ...report, files: report.files.filter(({ path }) => !path.endsWith(".node")) }), /@libfx\/linux-x64: unexpected file count|@libfx\/linux-x64 is missing/],
+    [withTerm(archiveReports()).filter((report) => report.name !== "@libfx/term"), /expected 6 packages/],
+    [mutated((report) => report.name === "@libfx/darwin-x64" && { ...report, version: "0.0.1" }), /@libfx\/darwin-x64 is 0\.0\.1/],
+  ]) {
+    await assert.rejects(validate(reports), message);
   }
-  const archiveReport = [{ name: manifest.name, version: manifest.version, size: 0, files: [...archiveFiles].map(path => ({ path })) }];
-  await writeFile(reportPath, JSON.stringify(archiveReport));
-  run(process.execPath, ["-e", archiveValidator.replace("/tmp/libfx-pack.json", reportPath)]);
-  const allFiles = archiveReport[0].files;
-  archiveReport[0].files = allFiles.filter(({ path }) => path !== "fetch-cleanup.js");
-  await writeFile(reportPath, JSON.stringify(archiveReport));
-  assert.throws(
-    () => run(process.execPath, ["-e", archiveValidator.replace("/tmp/libfx-pack.json", reportPath)]),
-    /unexpected package file count|package is missing/,
-  );
-  archiveReport[0].files = allFiles.filter(({ path }) => !path.startsWith("docs/"));
-  await writeFile(reportPath, JSON.stringify(archiveReport));
-  assert.throws(
-    () => run(process.execPath, ["-e", archiveValidator.replace("/tmp/libfx-pack.json", reportPath)]),
-    /package is missing the libfx docs/,
-  );
 
   // PKG-5: the docs ship in the package: an index in the site's order, and
   // each libfx page as the site served it, with its links to the other
@@ -224,27 +275,33 @@ The libfx pages of the fx docs, as fx.sh published them when this package was bu
 
   const cjs = await readFile(join(packageDir, "node.cjs"), "utf8");
   assert.doesNotMatch(cjs, new RegExp(repoRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-  for (const platform of ["linux-x64", "linux-arm64", "darwin-x64", "darwin-arm64"]) {
-    assert.match(cjs, new RegExp(`libfx\\.${platform}\\.node`));
-  }
 
   const source = await readFile(resolve(repoRoot, "sdk/node.js"), "utf8");
   // PKG-10: every import() in either Node entry names a module only known at
   // run time, which webpack and Turbopack must leave to Node instead of
-  // warning that they can't resolve it.
-  const unhinted = /\bimport\((?!\/\* webpackIgnore: true \*\/ \/\* turbopackIgnore: true \*\/)/;
+  // warning that they can't resolve it, except the imports of the platform
+  // packages, which name each one literally and without hints so bundlers
+  // follow them and copy the addon (PKG-2).
+  const unhinted = /\bimport\((?!\/\* webpackIgnore: true \*\/ \/\* turbopackIgnore: true \*\/)(?!"@libfx\/(linux|darwin)-(x64|arm64)"\))/;
   assert.doesNotMatch(source, unhinted, "node.js has an import() bundlers would try to resolve");
   assert.doesNotMatch(cjs, unhinted, "node.cjs has an import() bundlers would try to resolve");
-  assert.doesNotMatch(source, /["']\.\/libfx\.node["']/);
-  for (const platform of ["linux-x64", "linux-arm64", "darwin-x64", "darwin-arm64"]) {
-    assert.match(source, new RegExp(`["']\\.\\/libfx\\.${platform}\\.node["']`));
+  for (const platform of platforms) {
+    for (const [name, text] of [["node.js", source], ["node.cjs", cjs]]) {
+      assert.equal(text.split(`import("@libfx/${platform}")`).length, 2, `${name} imports @libfx/${platform} once, literally and without bundler hints`);
+    }
   }
+  assert.doesNotMatch(source, /["']\.\/libfx\.(linux|darwin)-(x64|arm64)\.node["']/, "node.js names no addon file of its own");
 
   await cp(packageDir, installedPackage, { recursive: true });
+  await cp(nativeDir, join(consumerDir, "node_modules", "@libfx", nativePlatform), { recursive: true });
+  await cp(termDir, join(consumerDir, "node_modules", "@libfx", "term"), { recursive: true });
   await writeFile(join(consumerDir, "package.json"), '{"type":"module"}\n');
   await writeFile(join(consumerDir, "esm.mjs"), `
     import * as libfx from "libfx";
     import * as nodeEntry from "libfx/node";
+    import * as term from "@libfx/term";
+    import { access } from "node:fs/promises";
+    import { fileURLToPath } from "node:url";
     const { createFxEngine, createFxTerminal, getBackendInfo } = libfx;
     if (JSON.stringify(Object.keys(libfx).sort()) !== JSON.stringify(Object.keys(nodeEntry).sort())) {
       throw new Error("root and Node subpath ESM exports differ");
@@ -257,6 +314,17 @@ The libfx pages of the fx docs, as fx.sh published them when this package was bu
     const checkpoint = await agent.checkpoint();
     await agent.close();
     if (!(checkpoint instanceof Uint8Array) || checkpoint.length === 0) throw new Error("empty checkpoint");
+    // PKG-3: the terminal comes from @libfx/term, which carries fx-term.wasm.
+    if (JSON.stringify(Object.keys(term).sort()) !== JSON.stringify(["createFxTerminal", "encodeXtermKeyEvent", "xtermAdapter"])) {
+      throw new Error("@libfx/term exports " + Object.keys(term).join(", "));
+    }
+    if (term.xtermAdapter !== libfx.xtermAdapter) throw new Error("@libfx/term re-exports libfx's xtermAdapter");
+    await access(fileURLToPath(import.meta.resolve("@libfx/term/fx-term.wasm")));
+    const terminal = { cols: 80, rows: 24, write() {}, onData: () => () => {}, onResize: () => () => {} };
+    const withoutWasm = await createFxTerminal({ terminal, nativeAddon: false }).then(() => null, (error) => error);
+    if (!(withoutWasm instanceof TypeError) || !withoutWasm.message.includes("@libfx/term")) throw new Error("libfx's createFxTerminal() without wasm: " + withoutWasm);
+    const terminalInfo = await getBackendInfo({ surface: "terminal", nativeAddon: false });
+    if (terminalInfo.backend !== "unavailable" || !terminalInfo.attempts.at(-1).reason.message.includes("@libfx/term")) throw new Error(JSON.stringify(terminalInfo));
     console.log(JSON.stringify(Object.keys(libfx).sort()));
   `);
   await writeFile(join(consumerDir, "cjs.cjs"), `
@@ -325,7 +393,7 @@ The libfx pages of the fx docs, as fx.sh published them when this package was bu
   const esm = run(process.execPath, ["esm.mjs"], { cwd: consumerDir });
   const cjsResult = run(process.execPath, ["--no-experimental-require-module", "cjs.cjs"], { cwd: consumerDir });
   assert.deepEqual(JSON.parse(cjsResult.stdout), JSON.parse(esm.stdout));
-  console.log("Node package passed: publisher prerequisites, archive validation, docs packaged from a local docs site and required by the publisher, no bundled undici, the Vercel World over node:http, conditional exports, relocated CJS, literal native assets, and bare imports");
+  console.log("Node package passed: publisher prerequisites, archive validation of every package, docs packaged from a local docs site and required by the publisher, the addon in its platform package and the terminal in @libfx/term at libfx's version, no bundled undici, the Vercel World over node:http, conditional exports, relocated CJS, literal platform imports, and bare imports");
 } finally {
   docsServer.closeAllConnections();
   docsServer.close();

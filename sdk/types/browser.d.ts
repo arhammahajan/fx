@@ -139,7 +139,12 @@ export declare function createFxAgent(options?: FxBrowserAgentOptions): FxAgent;
 /** One fx session on WebAssembly, with no durability of its own. `apiKey` is required. */
 export declare function createFxEngine(options: FxBrowserEngineOptions): Promise<FxEngine>;
 
-/** The interactive terminal harness. Connect it to xterm.js with `xtermAdapter()`. */
+/**
+ * The interactive terminal harness. Connect it to xterm.js with
+ * `xtermAdapter()`. Its WebAssembly, `fx-term.wasm`, ships in `@libfx/term`,
+ * whose `createFxTerminal()` passes it as `wasm`; without `wasm`, this
+ * rejects with a `TypeError`.
+ */
 export declare function createFxTerminal(options: FxBrowserTerminalOptions): Promise<FxTerminal>;
 
 /** The version of the libfx agent API. */

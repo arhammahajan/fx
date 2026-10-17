@@ -52,7 +52,7 @@ const entries = [
   { specifier: "libfx/skills/node", resolution: "node16", mode: "import", types: "types/skills-node.d.ts", runtime: "skills-node.js" },
 ];
 
-const nodeFixtures = ["agent.mts", "engine.mts", "adapters.mts"];
+const nodeFixtures = ["agent.mts", "engine.mts", "adapters.mts", "term.mts"];
 const failures = [];
 const fail = (message) => {
   failures.push(message);
@@ -79,6 +79,17 @@ mkdirSync(modulesDir, { recursive: true });
 writeFileSync(join(temp, "package.json"), `${JSON.stringify({ private: true, type: "module" }, null, 2)}\n`);
 
 symlinkSync(sdkDir, join(modulesDir, "libfx"), "dir");
+
+// @libfx/term, copied so that its imports of libfx resolve in this project.
+// Its entries name their files inside that copy.
+const termDir = join(modulesDir, "@libfx/term");
+mkdirSync(termDir, { recursive: true });
+for (const name of ["package.json", "node.js", "browser.js", "node.d.ts", "browser.d.ts"]) copyFileSync(join(sdkDir, "term", name), join(termDir, name));
+entries.push(
+  { specifier: "@libfx/term", resolution: "node16", mode: "import", root: termDir, types: "node.d.ts", runtime: "node.js" },
+  { specifier: "@libfx/term", resolution: "bundler", conditions: ["node"], root: termDir, types: "node.d.ts", runtime: "node.js" },
+  { specifier: "@libfx/term", resolution: "bundler", conditions: [], root: termDir, types: "browser.d.ts", runtime: "browser.js" },
+);
 
 for (const name of readdirSync(fixturesDir)) copyFileSync(join(fixturesDir, name), join(srcDir, name));
 
@@ -115,7 +126,7 @@ const runs = [
     name: "bundler",
     summary: "moduleResolution bundler, no custom conditions (the \"default\" condition), strict, lib es2022 + dom",
     options: { module: "esnext", moduleResolution: "bundler" },
-    files: ["bundler-default.ts", "browser.mts"],
+    files: ["bundler-default.ts", "browser.mts", "term.mts"],
   },
 ];
 if (existsSync(join(typesNode, "package.json"))) {
@@ -176,7 +187,7 @@ for (const entry of entries) {
   const containing = join(srcDir, entry.mode === "require" ? "probe.cts" : "probe.mts");
   const mode = entry.resolution === "node16" ? (entry.mode === "require" ? ts.ModuleKind.CommonJS : ts.ModuleKind.ESNext) : undefined;
   const resolved = ts.resolveModuleName(entry.specifier, containing, resolutionOptions(entry), ts.sys, undefined, undefined, mode).resolvedModule;
-  const expected = realpathSync(join(sdkDir, entry.types));
+  const expected = realpathSync(join(entry.root ?? sdkDir, entry.types));
   const actual = resolved ? realpathSync(resolved.resolvedFileName) : null;
   if (actual === expected) console.log(`  ok   ${label} -> ${entry.types}`);
   else fail(`${label} resolved to ${actual ? relative(sdkDir, actual) : "nothing"}, expected ${entry.types}`);
@@ -184,7 +195,7 @@ for (const entry of entries) {
 
 // Each declaration file must declare exactly its runtime module's values.
 console.log("\ndrift (declared values vs runtime exports)");
-const declarationFiles = [...new Set(entries.map((entry) => realpathSync(join(sdkDir, entry.types))))];
+const declarationFiles = [...new Set(entries.map((entry) => realpathSync(join(entry.root ?? sdkDir, entry.types))))];
 const program = ts.createProgram(declarationFiles, {
   module: ts.ModuleKind.Node16,
   moduleResolution: ts.ModuleResolutionKind.Node16,
@@ -196,18 +207,19 @@ const program = ts.createProgram(declarationFiles, {
 const checker = program.getTypeChecker();
 const checked = new Set();
 for (const entry of entries) {
-  const key = `${entry.types}\0${entry.runtime}`;
+  const root = entry.root ?? sdkDir;
+  const key = `${root}\0${entry.types}\0${entry.runtime}`;
   if (checked.has(key)) continue;
   checked.add(key);
-  const label = `${entry.types} vs ${entry.runtime}`;
+  const label = `${entry.root ? `${entry.specifier} ` : ""}${entry.types} vs ${entry.runtime}`;
   let runtime;
   try {
-    runtime = Object.keys(await import(pathToFileURL(join(sdkDir, entry.runtime)).href)).filter((name) => !entry.hidden?.has(name)).sort();
+    runtime = Object.keys(await import(pathToFileURL(join(root, entry.runtime)).href)).filter((name) => !entry.hidden?.has(name)).sort();
   } catch (error) {
     fail(`${label}: could not import ${entry.runtime}: ${error?.message ?? error}${entry.runtime.startsWith("durable/") ? " (run `npm ci --prefix sdk/durable`)" : ""}`);
     continue;
   }
-  const declared = declaredValues(realpathSync(join(sdkDir, entry.types)));
+  const declared = declaredValues(realpathSync(join(root, entry.types)));
   const missing = runtime.filter((name) => !declared.includes(name));
   const extra = declared.filter((name) => !runtime.includes(name));
   if (missing.length === 0 && extra.length === 0) {

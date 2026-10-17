@@ -11,8 +11,10 @@ import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { serializeError } from "./package-report.mjs";
+import { nativePackageBeside, nativePlatform } from "./package-siblings.mjs";
 
 const tarball = resolve(process.argv[2]);
+const nativeTarball = nativePackageBeside(tarball);
 const next15 = process.argv.includes("--next15");
 const webpack = next15 || process.argv.includes("--webpack");
 const bundlerArgs = webpack && !next15 ? ["--webpack"] : [];
@@ -185,10 +187,16 @@ async function assertBundledNativeAssets(buildDir) {
     assert.ok(file, `the durable route must trace the emitted durable/${name}.mjs`);
     await access(resolve(durableDir, file));
   }
+  // PKG-2, PKG-10: webpack copies the addon of the platform package npm
+  // installed, and only that one, into the build.
   const routeDir = resolve(buildDir, "server/app/api/fx");
   const trace = JSON.parse(await readFile(resolve(routeDir, "route.js.nft.json"), "utf8"));
   for (const platform of ["linux-x64", "linux-arm64", "darwin-x64", "darwin-arm64"]) {
     const file = trace.files.find((path) => path.includes(`/static/media/libfx.${platform}.`) && path.endsWith(".node"));
+    if (platform !== nativePlatform) {
+      assert.equal(file, undefined, `the build carries the ${platform} addon, which this machine doesn't install`);
+      continue;
+    }
     assert.ok(file, `webpack must trace the emitted ${platform} addon, not externalize libfx`);
     await access(resolve(routeDir, file));
   }
@@ -201,6 +209,12 @@ try {
   manifest.dependencies.libfx = "file:./libfx.tgz";
   if (next15) manifest.dependencies.next = "15.5.25";
   await writeFile(resolve(app, "package.json"), JSON.stringify(manifest, null, 2));
+  // libfx's optional dependency on this machine's addon package resolves to
+  // the tarball beside libfx's instead of the registry, and pnpm links it
+  // beside libfx as it would a registry install (PKG-2).
+  assert.ok(nativeTarball, `no @libfx/${nativePlatform} tarball beside ${tarball}`);
+  await cp(nativeTarball, resolve(app, "libfx-native.tgz"));
+  await writeFile(resolve(app, "pnpm-workspace.yaml"), `overrides:\n  "@libfx/${nativePlatform}": "file:./libfx-native.tgz"\n`);
   await run(process.env.PNPM_BIN || "pnpm", ["install", "--no-frozen-lockfile", "--ignore-scripts"], app, "install");
   const require = createRequire(resolve(app, "package.json"));
   if (!next15) {

@@ -1,0 +1,37 @@
+{
+  "name": "@libfx/term",
+  "version": "0.0.0",
+  "description": "The fx terminal for libfx: createFxTerminal() and fx-term.wasm",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vercel-labs/fx.git",
+    "directory": "sdk/term"
+  },
+  "homepage": "https://github.com/vercel-labs/fx/tree/main/sdk#readme",
+  "bugs": "https://github.com/vercel-labs/fx/issues",
+  "exports": {
+    ".": {
+      "node": {
+        "types": "./node.d.ts",
+        "default": "./node.js"
+      },
+      "default": {
+        "types": "./browser.d.ts",
+        "default": "./browser.js"
+      }
+    },
+    "./fx-term.wasm": "./fx-term.wasm"
+  },
+  "peerDependencies": {
+    "libfx": "0.0.0"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "license": "Apache-2.0"
+}

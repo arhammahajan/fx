@@ -1,30 +1,42 @@
 #!/usr/bin/env node
+// Assembles libfx and the packages that ship beside it, each in a directory of
+// its own under <dist> (default sdk/dist), ready for `npm pack` or
+// `npm publish`:
+//
+//   <dist>/libfx             libfx: the JavaScript, fx-core.wasm, types and docs
+//   <dist>/libfx-<platform>  @libfx/<platform>: one native addon (PKG-2)
+//   <dist>/libfx-term        @libfx/term: fx-term.wasm and its entry (PKG-3)
+//
+// With no addons named, it packages zig-out/lib/libfx.node as this machine's
+// platform. A release names all four, as `libfx.<platform>.node`. Every
+// package gets the version in LIBFX_VERSION, or sdk/package.json's, and libfx
+// names its platform packages, and @libfx/term names libfx, at exactly that
+// version.
+//
+//   node sdk/scripts/package-libfx.mjs [<dist>] [<addon>...]
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { cp, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
-import { basename, dirname, posix, resolve } from "node:path";
+import { basename, dirname, posix, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
 const repoRoot = resolve(scriptDir, "../..");
-const outputDir = resolve(process.argv[2] || resolve(repoRoot, "sdk/dist/libfx"));
+const distDir = resolve(process.argv[2] || resolve(repoRoot, "sdk/dist"));
 const requestedNativeAddons = process.argv.slice(3).map((path) => resolve(path));
-const defaultNativeAddon = resolve(repoRoot, "zig-out/lib/libfx.node");
-const nativeAddons = requestedNativeAddons.length ? requestedNativeAddons : [defaultNativeAddon];
-const requiredNativeNames = new Set([
-  "libfx.linux-x64.node",
-  "libfx.linux-arm64.node",
-  "libfx.darwin-x64.node",
-  "libfx.darwin-arm64.node",
-]);
-const localNativeName = {
-  "linux-x64": "libfx.linux-x64.node",
-  "linux-arm64": "libfx.linux-arm64.node",
-  "darwin-x64": "libfx.darwin-x64.node",
-  "darwin-arm64": "libfx.darwin-arm64.node",
-}[`${process.platform}-${process.arch}`];
-const files = [
-  ["sdk/package.json", "package.json"],
+// What npm installs each platform's addon on. The Linux addons link glibc
+// 2.34 (`-Dtarget=<arch>-linux-gnu.2.34`), so musl systems skip them.
+const platforms = {
+  "linux-x64": { os: "linux", cpu: "x64", libc: "glibc", label: "Linux on x64, with glibc 2.34 or newer" },
+  "linux-arm64": { os: "linux", cpu: "arm64", libc: "glibc", label: "Linux on arm64, with glibc 2.34 or newer" },
+  "darwin-x64": { os: "darwin", cpu: "x64", label: "macOS on x64" },
+  "darwin-arm64": { os: "darwin", cpu: "arm64", label: "macOS on arm64" },
+};
+const localPlatform = `${process.platform}-${process.arch}`;
+const nativeAddons = requestedNativeAddons.length
+  ? requestedNativeAddons.map((path) => ({ path, platform: /^libfx\.(.+)\.node$/.exec(basename(path))?.[1] }))
+  : [{ path: resolve(repoRoot, "zig-out/lib/libfx.node"), platform: localPlatform }];
+const libfxFiles = [
   ["sdk/README.md", "README.md"],
   ["LICENSE", "LICENSE"],
   ["sdk/browser.js", "browser.js"],
@@ -47,53 +59,70 @@ const files = [
   ["sdk/skills.js", "skills.js"],
   ["sdk/skills-node.js", "skills-node.js"],
   ["zig-out/bin/fx-core.wasm", "fx-core.wasm"],
+];
+const termFiles = [
+  ["sdk/term/README.md", "README.md"],
+  ["LICENSE", "LICENSE"],
+  ["sdk/term/node.js", "node.js"],
+  ["sdk/term/browser.js", "browser.js"],
+  ["sdk/term/node.d.ts", "node.d.ts"],
+  ["sdk/term/browser.d.ts", "browser.d.ts"],
   ["zig-out/bin/fx-term.wasm", "fx-term.wasm"],
 ];
 
+const libfxManifest = JSON.parse(await readFile(resolve(repoRoot, "sdk/package.json"), "utf8"));
+const version = process.env.LIBFX_VERSION || libfxManifest.version;
+const platformPackages = Object.keys(platforms).map((platform) => `@libfx/${platform}`).sort();
+if (JSON.stringify(Object.keys(libfxManifest.optionalDependencies ?? {}).sort()) !== JSON.stringify(platformPackages) ||
+    JSON.stringify(Object.keys(libfxManifest.peerDependenciesMeta ?? {}).sort()) !== JSON.stringify(platformPackages)) {
+  throw new Error(`sdk/package.json must list exactly ${platformPackages.join(", ")} in optionalDependencies and peerDependenciesMeta`);
+}
 if (requestedNativeAddons.length) {
-  const names = nativeAddons.map((addon) => basename(addon));
+  const names = nativeAddons.map(({ path }) => basename(path));
+  const required = Object.keys(platforms).map((platform) => `libfx.${platform}.node`);
   const duplicates = names.filter((name, index) => names.indexOf(name) !== index);
-  const missing = [...requiredNativeNames].filter((name) => !names.includes(name));
-  const unexpected = names.filter((name) => !requiredNativeNames.has(name));
+  const missing = required.filter((name) => !names.includes(name));
+  const unexpected = names.filter((name) => !required.includes(name));
   if (duplicates.length || missing.length || unexpected.length) {
     throw new Error([
-      "publishable package requires exactly one addon for every supported platform",
+      "publishable packages require exactly one addon for every supported platform",
       duplicates.length ? `duplicates: ${duplicates.join(", ")}` : null,
       missing.length ? `missing: ${missing.join(", ")}` : null,
       unexpected.length ? `unexpected: ${unexpected.join(", ")}` : null,
     ].filter(Boolean).join("; "));
   }
-}
-if (!requestedNativeAddons.length && !localNativeName) {
-  throw new Error(`local native packaging is unsupported on ${process.platform}-${process.arch}`);
+} else if (!platforms[localPlatform]) {
+  throw new Error(`local native packaging is unsupported on ${localPlatform}`);
 }
 
-await rm(outputDir, { recursive: true, force: true });
-await mkdir(outputDir, { recursive: true });
+const libfxDir = resolve(distDir, "libfx");
+const termDir = resolve(distDir, "libfx-term");
+const platformDir = (platform) => resolve(distDir, `libfx-${platform}`);
+for (const dir of [libfxDir, termDir, ...Object.keys(platforms).map(platformDir)]) {
+  await rm(dir, { recursive: true, force: true });
+}
+await mkdir(libfxDir, { recursive: true });
+
+// libfx.
 const cjsBuild = spawnSync(process.execPath, [
   resolve(repoRoot, "sdk/scripts/build-node-cjs.mjs"),
-  resolve(outputDir, "node.cjs"),
+  resolve(libfxDir, "node.cjs"),
 ], { cwd: repoRoot, stdio: "inherit" });
 if (cjsBuild.error) throw cjsBuild.error;
 if (cjsBuild.status !== 0) process.exit(cjsBuild.status ?? 1);
-for (const [source, destination] of files) {
-  await cp(resolve(repoRoot, source), resolve(outputDir, destination));
+for (const [source, destination] of libfxFiles) {
+  await cp(resolve(repoRoot, source), resolve(libfxDir, destination));
 }
 // The TypeScript declarations the manifest's `types` conditions name.
 const declarations = (await readdir(resolve(repoRoot, "sdk/types"))).filter((name) => /\.d\.c?ts$/.test(name)).sort();
-await mkdir(resolve(outputDir, "types"), { recursive: true });
-for (const name of declarations) await cp(resolve(repoRoot, "sdk/types", name), resolve(outputDir, "types", name));
-for (const addon of nativeAddons) {
-  if (!addon.endsWith(".node")) throw new Error(`native addon must end in .node: ${addon}`);
-  const destination = requestedNativeAddons.length ? basename(addon) : localNativeName;
-  await cp(addon, resolve(outputDir, destination));
-}
+await mkdir(resolve(libfxDir, "types"), { recursive: true });
+for (const name of declarations) await cp(resolve(repoRoot, "sdk/types", name), resolve(libfxDir, "types", name));
 
 // Each durability module carries the World it wraps; see bundle-durable.mjs.
 if (!existsSync(resolve(repoRoot, "sdk/durable/node_modules/@workflow"))) {
   throw new Error("bundling the durable Worlds needs `npm ci --prefix sdk/durable` first");
 }
-const bundle = spawnSync(process.env.BUN_BIN || "bun", [resolve(repoRoot, "sdk/scripts/bundle-durable.mjs"), outputDir], { cwd: repoRoot, stdio: "inherit" });
+const bundle = spawnSync(process.env.BUN_BIN || "bun", [resolve(repoRoot, "sdk/scripts/bundle-durable.mjs"), libfxDir], { cwd: repoRoot, stdio: "inherit" });
 if (bundle.error) throw bundle.error;
 if (bundle.status !== 0) process.exit(bundle.status ?? 1);
 
@@ -102,27 +131,79 @@ if (bundle.status !== 0) process.exit(bundle.status ?? 1);
 // or an unrelated test does not fail on the website.
 let docs = [];
 try {
-  docs = await packageDocs(resolve(outputDir, "docs"));
+  docs = await packageDocs(resolve(libfxDir, "docs"));
 } catch (error) {
   if (process.env.LIBFX_REQUIRE_DOCS === "1") throw error;
-  await rm(resolve(outputDir, "docs"), { recursive: true, force: true });
+  await rm(resolve(libfxDir, "docs"), { recursive: true, force: true });
   console.warn(`warning: packaging libfx without its docs: ${error.message}`);
 }
 
-const manifest = JSON.parse(await readFile(resolve(outputDir, "package.json"), "utf8"));
-manifest.files = undefined;
-await writeFile(resolve(outputDir, "package.json"), `${JSON.stringify(manifest, null, 2)}\n`);
+await writeManifest(libfxDir, {
+  ...libfxManifest,
+  version,
+  files: undefined,
+  optionalDependencies: Object.fromEntries(platformPackages.map((name) => [name, version])),
+});
 
-console.log(`packaged ${manifest.name} in ${outputDir}`);
-console.log("  node.cjs");
-for (const [, destination] of files) console.log(`  ${destination}`);
-console.log("  durable/local.mjs");
-console.log("  durable/vercel.mjs");
-console.log("  durable/world.mjs");
-for (const name of docs) console.log(`  docs/${name}`);
-for (const name of declarations) console.log(`  types/${name}`);
-for (const addon of nativeAddons) {
-  console.log(`  ${requestedNativeAddons.length ? basename(addon) : localNativeName}`);
+// One package for each addon.
+for (const { path, platform } of nativeAddons) {
+  if (!path.endsWith(".node")) throw new Error(`native addon must end in .node: ${path}`);
+  const { os, cpu, libc, label } = platforms[platform];
+  const dir = platformDir(platform);
+  const addon = `libfx.${platform}.node`;
+  await mkdir(dir, { recursive: true });
+  await cp(path, resolve(dir, addon));
+  await cp(resolve(repoRoot, "LICENSE"), resolve(dir, "LICENSE"));
+  // The URL bundlers and tracers follow to the addon (PKG-10); libfx loads it.
+  await writeFile(resolve(dir, "index.js"), `export default new URL("./${addon}", import.meta.url);\n`);
+  await writeFile(resolve(dir, "README.md"), [
+    `# @libfx/${platform}`,
+    "",
+    `The native addon of [libfx](https://www.npmjs.com/package/libfx) for ${label}. libfx lists it as an optional dependency, so installing libfx installs it on this platform only. Install libfx, not this package.`,
+    "",
+    "## License",
+    "",
+    "[Apache-2.0](https://github.com/vercel-labs/fx/blob/main/LICENSE)",
+    "",
+  ].join("\n"));
+  await writeManifest(dir, {
+    name: `@libfx/${platform}`,
+    version,
+    description: `The ${platform} native addon of libfx`,
+    type: "module",
+    repository: libfxManifest.repository,
+    homepage: libfxManifest.homepage,
+    bugs: libfxManifest.bugs,
+    os: [os],
+    cpu: [cpu],
+    ...(libc ? { libc: [libc] } : {}),
+    exports: { ".": "./index.js", "./package.json": "./package.json" },
+    engines: libfxManifest.engines,
+    publishConfig: libfxManifest.publishConfig,
+    license: libfxManifest.license,
+  });
+}
+
+// @libfx/term.
+await mkdir(termDir, { recursive: true });
+for (const [source, destination] of termFiles) {
+  await cp(resolve(repoRoot, source), resolve(termDir, destination));
+}
+const termManifest = JSON.parse(await readFile(resolve(repoRoot, "sdk/term/package.json"), "utf8"));
+await writeManifest(termDir, { ...termManifest, version, peerDependencies: { ...termManifest.peerDependencies, libfx: version } });
+
+console.log(`packaged libfx ${version} in ${distDir}`);
+for (const dir of [libfxDir, ...nativeAddons.map(({ platform }) => platformDir(platform)), termDir]) {
+  const manifest = JSON.parse(await readFile(resolve(dir, "package.json"), "utf8"));
+  console.log(`${manifest.name} (${basename(dir)}/)`);
+  for (const file of (await readdir(dir, { recursive: true, withFileTypes: true })).filter((entry) => entry.isFile())) {
+    console.log(`  ${relative(dir, resolve(file.parentPath, file.name))}`);
+  }
+}
+if (docs.length === 0) console.log("(libfx has no docs/: see the warning above)");
+
+async function writeManifest(dir, manifest) {
+  await writeFile(resolve(dir, "package.json"), `${JSON.stringify(manifest, null, 2)}\n`);
 }
 
 // The libfx docs ship in the package (PKG-5). They are written in the fx

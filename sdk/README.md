@@ -518,14 +518,22 @@ A journal or `checkpoint` from a newer libfx fails with `FxJournalVersionError`.
 | Browsers | WebAssembly with JSPI, from `libfx/browser` |
 | Bun | The same as Node.js. For WebAssembly, use Bun 1.3.10 or newer, except 1.3.14, which can crash when WebAssembly resumes through JSPI. |
 
+Each platform's native addon is a package of its own: `@libfx/linux-x64`, `@libfx/linux-arm64`, `@libfx/darwin-x64` and `@libfx/darwin-arm64`. libfx lists them as optional dependencies, so `npm install libfx` downloads only the one for the machine it runs on, and so do pnpm and Bun. Install on the platform that runs the app: `node_modules` copied from a Mac into a Linux container has no Linux addon. Without its addon package, such as with `npm install --omit=optional` or on a musl Linux, libfx runs on WebAssembly.
+
 The default `backend: "auto"` tries the native addon first. Pass `"native"` or `"wasm"` to require one, and call `getBackendInfo()` to see what would load without creating anything.
 
-Next.js works in Node.js route handlers, with webpack or Turbopack, and doesn't need `serverExternalPackages`. CommonJS apps can `require("libfx")`. With TypeScript's `moduleResolution: "bundler"`, add `"node"` to `customConditions` to get the Node.js types.
+Next.js works in Node.js route handlers, with webpack or Turbopack, and doesn't need `serverExternalPackages`: the build copies the addon from its package into the output, so a Vercel deployment carries it. CommonJS apps can `require("libfx")`. With TypeScript's `moduleResolution: "bundler"`, add `"node"` to `customConditions` to get the Node.js types.
 
 ## The fx terminal in a browser
 
+The terminal is its own package, `@libfx/term`, so apps that only run agents don't download it. Install it next to libfx, at the same version:
+
+```sh
+npm install libfx @libfx/term
+```
+
 ```js
-import { createFxTerminal, xtermAdapter } from "libfx/browser";
+import { createFxTerminal, xtermAdapter } from "@libfx/term";
 
 const terminal = await createFxTerminal({
   terminal: xtermAdapter(term), // an xterm.js Terminal
@@ -535,21 +543,22 @@ const terminal = await createFxTerminal({
 await terminal.interactive;
 ```
 
-This is the fx CLI's interface compiled to WebAssembly. Your page supplies storage for its sessions, settings and sign-in, and can give it a workspace that runs commands. See [Terminal](https://fx.sh/docs/lib/terminal).
+This is the fx CLI's interface compiled to WebAssembly. Your page supplies storage for its sessions, settings and sign-in, and can give it a workspace that runs commands. It works in Node.js too, and `@libfx/term/fx-term.wasm` is the WebAssembly file itself, for apps that serve it. See [Terminal](https://fx.sh/docs/lib/terminal).
 
 ## Entry points
 
 | Import | What's in it |
 | --- | --- |
-| `libfx` | `createFxAgent`, `createFxEngine`, `createFxTerminal`, `memory`, `listModels`, `createMemoryPersistence`, `FxFencedError`, `FxJournalVersionError`, `supportsJspi`, `xtermAdapter`, `encodeXtermKeyEvent`, and on Node.js `getBackendInfo` and `wakeHandler` |
+| `libfx` | `createFxAgent`, `createFxEngine`, `createFxTerminal`, `memory`, `listModels`, `createMemoryPersistence`, `FxFencedError`, `FxJournalVersionError`, `supportsJspi`, `xtermAdapter`, `encodeXtermKeyEvent`, and on Node.js `getBackendInfo` and `wakeHandler`. Its `createFxTerminal` needs `wasm`. |
 | `libfx/node`, `libfx/browser` | The same, for Node.js or browsers explicitly |
 | `libfx/wasm` | The WebAssembly SDK without packaged asset paths, so you pass `wasm` yourself |
 | `libfx/durable-local`, `libfx/durable-vercel`, `libfx/durable-world` | `local()`, `vercel()` and `world()` |
 | `libfx/chatgpt`, `libfx/grok` | Sign-in for ChatGPT and Grok plans, and `refreshCredentials` |
 | `libfx/mcp` | `createMcpAdapter` |
 | `libfx/skills`, `libfx/skills/node` | `createSkillsAdapter`, and `loadSkillFile` for Node.js and Bun |
+| `@libfx/term` | `createFxTerminal` with the terminal's WebAssembly, `xtermAdapter` and `encodeXtermKeyEvent`. A package of its own. |
 
-Every entry point ships TypeScript types, and the package has no runtime dependencies.
+Every entry point ships TypeScript types. libfx has no runtime dependencies; its native addons are optional dependencies, one package for each platform.
 
 ## For coding agents
 
@@ -562,6 +571,10 @@ Every entry point ships TypeScript types, and the package has no runtime depende
 - **Credentials:** keep keys and ChatGPT or Grok credentials on the server, and the object `startSignIn()` returns too.
 - **Checking a setup:** `getBackendInfo()` reports which backend would load without creating anything or making requests.
 - **Changing libfx:** the source is in the [fx repository](https://github.com/vercel-labs/fx) under `sdk/`. Its `AGENTS.md` files name the tests each change needs.
+
+## Upgrading from 0.0.14
+
+libfx no longer carries every platform's native addon or the terminal's WebAssembly. The addons are optional dependencies, one package per platform, which npm installs for the machine that runs `npm install`. The terminal is `@libfx/term`: install it at libfx's version and import `createFxTerminal` from it. libfx's own `createFxTerminal` now needs `wasm`.
 
 ## Upgrading from 0.0.13
 

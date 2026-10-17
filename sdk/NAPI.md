@@ -242,11 +242,12 @@ Consequently:
 - publishing must preserve provenance and use the exact tested artifacts;
 - addon load failures must not be mistaken for a safe sandbox boundary.
 
-The JavaScript loader uses literal references to the four packaged
-`libfx.<platform>-<arch>.node` names and selects the matching supported tuple.
-Local package assembly renames `zig-out/lib/libfx.node` to that tuple's package
-name. The loader validates `libfxApiVersion` and the expected export shape
-before use. `backend: "native"` fails closed if a compatible addon is
+The JavaScript loader imports the four platform packages, `@libfx/linux-x64`,
+`@libfx/linux-arm64`, `@libfx/darwin-x64` and `@libfx/darwin-arm64`, by their
+literal names and selects the matching supported tuple. Each package's module
+exports the URL of its `libfx.<platform>-<arch>.node`. Local package assembly
+puts `zig-out/lib/libfx.node` in that tuple's package. The loader validates
+`libfxApiVersion` and the expected export shape before use. `backend: "native"` fails closed if a compatible addon is
 unavailable. `backend: "auto"` may fall back to WebAssembly when JSPI is
 available. Explicit `nativeAddon` objects, paths, and URLs remain separate from
 packaged discovery.
@@ -269,26 +270,30 @@ zig build -Dnapi-surface=core -Doptimize=ReleaseSafe
 
 The N-API artifact currently forces `ReleaseSafe` in `build.zig`; the command-line optimization value does not change that module's mode. Retaining safety checks is intentional for code processing untrusted JavaScript and protocol input.
 
-Published packages contain one addon for each supported tuple:
+Each supported tuple's addon is published as a package of its own, which
+libfx lists as an exact-version optional dependency, so an install downloads
+only the machine's addon:
 
-- `linux-x64`;
-- `linux-arm64`;
-- `darwin-x64`;
-- `darwin-arm64`.
+- `@libfx/linux-x64` (`os: linux`, `cpu: x64`, `libc: glibc`);
+- `@libfx/linux-arm64` (`os: linux`, `cpu: arm64`, `libc: glibc`);
+- `@libfx/darwin-x64` (`os: darwin`, `cpu: x64`);
+- `@libfx/darwin-arm64` (`os: darwin`, `cpu: arm64`).
 
-`package-libfx.mjs` requires exactly those four names when assembling a
-publishable multi-platform package. It rejects missing, duplicate, or
-unexpected addon names. Package assembly also generates a self-contained
-`node.cjs` from the dependency-free ESM source with package-relative module
-URLs. The publish workflow builds and tests each addon on its native runner
-before combining the artifacts with both WebAssembly surfaces, the README, and
-the Apache-2.0 license.
+`package-libfx.mjs` requires exactly the four addons
+`libfx.<platform>-<arch>.node` when assembling publishable packages. It
+rejects missing, duplicate, or unexpected addon names. Package assembly also
+generates a self-contained `node.cjs` from the dependency-free ESM source with
+package-relative module URLs. The publish workflow builds and tests each addon
+on its native runner before packaging each in its platform package, and libfx
+with `fx-core.wasm`, the README, the docs and the Apache-2.0 license.
+`fx-term.wasm` ships in `@libfx/term`.
 
 Package assembly and Next tests run without npm publishing credentials. The
-OIDC publisher uploads the tested archive. The workflow then downloads that
-immutable registry version, compares it byte-for-byte with the archive, and
-exercises its Node entrypoints and Next development, production, and isolated
-deployment output. Failed package qualification blocks publication. Next
+OIDC publisher uploads the tested archives, the platform packages and
+`@libfx/term` before libfx. The workflow then downloads each immutable registry
+version and compares it byte-for-byte with its archive. Pull request CI
+exercises the packages' Node entrypoints and Next development, production, and
+isolated deployment output. Failed package qualification blocks publication. Next
 logs and structured results are retained as workflow artifacts, including
 on failure.
 
@@ -298,7 +303,9 @@ The Next and Vercel harnesses retain completed scenarios and structured errors
 when qualification fails, and report success only after cleanup succeeds.
 
 Live Vercel qualification is a separate release check. Run
-`node sdk/tests/test-vercel-package.mjs <tarball>` before publication, then run
+`node sdk/tests/test-vercel-package.mjs <tarball>`, with libfx's tarball and
+the `@libfx/linux-x64` tarball `npm pack` wrote beside it, before publication,
+then run
 the same command with the immutable npm version afterward. Repeat both checks
 with `--webpack` for Next.js 16 webpack and `--next15` for Next.js 15 webpack;
 the default is Next.js 16 Turbopack. The local `test-next-package.mjs` harness
