@@ -127,7 +127,7 @@ createFxAgent({ durability: memory() }); // nothing outlives the process
 
 On `local()`, `vercel()` and `world()`, a session id is a Workflow run id, `wrun_` followed by letters and digits. Take it from `turn.accepted` or `await agent.newSessionId()` instead of making one up. On `memory()`, any 1 to 128 letters, digits, `.`, `_` or `-` work.
 
-`local()` keeps the sessions an older libfx saved in its folder in an older file layout: the first time it opens the folder, it moves their files into the layout it reads. If one can't be moved, such as when a different file already has its name, `prompt()` throws `FX_LOCAL_STORE_LAYOUT` naming it, and nothing in the folder changes.
+`local()` keeps the sessions an older libfx saved in its folder in an older file layout: the first time it opens the folder, it moves their files into the layout it reads. If one can't be moved, such as when a different file already has its name, the prompt's `turn.accepted` rejects with `FX_LOCAL_STORE_LAYOUT` naming it, and nothing in the folder changes.
 
 A session stores the conversation, and with each prompt and steer the caller's `context` and the session object's settings. Every process passes its own model, credentials, tools, MCP clients and skills when it creates the agent.
 
