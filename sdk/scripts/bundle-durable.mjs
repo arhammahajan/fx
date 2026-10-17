@@ -24,6 +24,44 @@ const pinWorldVersion = {
   },
 };
 
+// world-local's in-band fence lock records no holder, so a writer killed
+// while it holds the lock makes the next in-band writer wait 30 s for it to
+// go stale (DUR-88). The bundled World takes that lock through
+// durable/world-local-fence-lock.mjs, which records the holder and frees a
+// dead holder's lock at once. The whole lock call is matched, so a change to
+// it upstream fails the build here.
+const fenceLockImport = "import { lock as lockFile } from 'proper-lockfile';";
+const fenceLockCall = `release = await lockFile(countPath, {
+                    realpath: false,
+                    stale: 30_000,
+                    update: 1_000,
+                    retries: {
+                        retries: 350,
+                        factor: 1,
+                        minTimeout: 100,
+                        maxTimeout: 100,
+                    },
+                    onCompromised(error) {
+                        compromised = error;
+                    },
+                });`;
+const fenceLockFs = fileURLToPath(new URL("../durable/world-local-fence-lock.mjs", import.meta.url));
+const recordFenceLockHolder = {
+  name: "record-fence-lock-holder",
+  setup(build) {
+    build.onLoad({ filter: /[\\/]world-local[\\/]dist[\\/]storage[\\/]events-storage\.js$/ }, async ({ path }) => {
+      const source = await Bun.file(path).text();
+      if (source.split(fenceLockImport).length !== 2 || source.split(fenceLockCall).length !== 2) {
+        throw new Error("world-local's withFenceLock() changed; update the fence lock patch, or drop it if world-local now records the lock's holder");
+      }
+      const patched = source
+        .replace(fenceLockImport, `${fenceLockImport}\nimport { fenceLockFs } from ${JSON.stringify(fenceLockFs)};`)
+        .replace(fenceLockCall, fenceLockCall.replace("realpath: false,", "fs: fenceLockFs(),\n                    realpath: false,"));
+      return { contents: patched, loader: "js" };
+    });
+  },
+};
+
 // libfx ships no copy of undici (PERF-14). The Worlds send their requests
 // through undici dispatchers they build, unless Workflow's `node:http`
 // transport (`WORKFLOW_NODE_HTTP`) is on: then Node's own HTTP client sends
@@ -65,7 +103,7 @@ for (const name of ["local", "vercel", "world"]) {
     minify: true,
     // cbor-x prefers an optional native addon and falls back without it.
     external: ["cbor-extract"],
-    plugins: [pinWorldVersion, noUndici],
+    plugins: [pinWorldVersion, recordFenceLockHolder, noUndici],
     metafile: true,
   });
   if (!result.success) {
@@ -74,4 +112,8 @@ for (const name of ["local", "vercel", "world"]) {
   }
   const bundled = Object.keys(result.metafile.inputs).filter((input) => /(^|[\\/])node_modules[\\/]undici[\\/]/.test(input));
   if (bundled.length > 0) throw new Error(`durable/${name}.mjs would bundle undici: ${bundled.slice(0, 3).join(", ")}`);
+  const inputs = Object.keys(result.metafile.inputs);
+  if (name === "local" && !inputs.some((input) => /(^|[\\/])world-local-fence-lock\.mjs$/.test(input))) {
+    throw new Error("durable/local.mjs bundles world-local without the fence lock patch");
+  }
 }
