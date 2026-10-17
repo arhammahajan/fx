@@ -2063,9 +2063,10 @@ fn writeImagesNeeded(state: *ServerState, alloc: Allocator, id: ?jsonrpc.Request
 }
 
 /// The most images, and image bytes, a host may stage for one open: those of
-/// the largest image window, the newest images a session keeps, and those of
-/// the open turn, which the window leaves out and which holds one prompt's
-/// images at most.
+/// the largest image window, the newest images a session keeps, as many as
+/// one model request carries, and those of the open turn, which the window
+/// leaves out and which holds one prompt's images at most. The window counts
+/// its images' base64, so the bytes staged for it, decoded, are fewer.
 /// An open that needs more, because its open turn's tools returned images
 /// beyond one prompt's, may stage what it reported missing
 /// (`ActiveSessionState.staging_needed`).

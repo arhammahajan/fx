@@ -1339,7 +1339,8 @@ for (const [index, mimeType] of mediaTypes.entries()) {
     { images: [image(quarter), image(quarter)], error: /typed tool result exceeds the result limit/ },
     { images: [image(undefined)], error: /invalid tool image/ },
     ...["", "host\x00bad", "é".repeat(257), "\ud800"].map((sourceRef) => ({ images: [image(undefined, sourceRef)], error: /sourceRef/ })),
-    { images: Array.from({ length: 9 }, () => image(undefined, "host:ninth")), error: /invalid typed tool result/ },
+    // QUAL-18: the error names the limit the result broke.
+    { images: Array.from({ length: 9 }, () => image(undefined, "host:ninth")), error: /a libfx\.tool-result holds at most 8 images, and this one has 9/ },
   ];
   for (const scenario of cases) {
     const gateway = mockGateway((body, step) => {

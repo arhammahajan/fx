@@ -1514,8 +1514,13 @@ test("a steer with an image ends the streaming turn, and runs as the next turn",
   await session.steer("and keep it small", { messageId: "m-after-image" });
   const first = await turn.result;
   assert.notEqual(first.stopReason, "end_turn", "the running turn did not finish its reply");
+  // It ends cancelled, as its record does, and names the steer, so an app
+  // tells it from a cancel.
+  assert.deepEqual([first.stopReason, first.endedBySteer], ["cancelled", "m-image"]);
   assert.ok(slow[before].sent < slowFrames, `the running reply sent ${slow[before].sent} of ${slowFrames} words, not cut short`);
   const lines = await linesUntil(session, (line) => line.type === "turn_end" && line.messageId === "m-image", "the image's turn");
+  assert.equal(lines.find((line) => line.type === "turn_end" && line.messageId === messageId)?.endedBySteer, "m-image");
+  assert.equal(lines.find((line) => line.type === "turn_end" && line.messageId === "m-image")?.endedBySteer, undefined);
   assert.deepEqual(lines.filter((line) => line.type === "turn_start").map((line) => line.messageId), [messageId, "m-image"]);
   const imageRequest = requests.findLast((prompt) => userTexts(prompt).some((text) => text.includes("match this")));
   assert.ok(imageRequest && JSON.stringify(imageRequest).includes("image"), `the image reached the model in its own turn: ${JSON.stringify(requests.slice(-2).map((prompt) => prompt.filter((message) => message.role === "user")))}`.slice(0, 1500));
@@ -1573,10 +1578,12 @@ test("a steer with an image sent while a tool runs ends the turn cancelled after
   await new Promise((wait) => setTimeout(wait, durabilityKind === "memory" ? 50 : 600));
   held.open();
   gates.delete("lookup");
-  assert.equal((await turn.result).stopReason, "cancelled");
+  const result = await turn.result;
+  assert.deepEqual([result.stopReason, result.endedBySteer], ["cancelled", "m-image-tool"]);
   const lines = await linesUntil(session, (line) => line.type === "turn_end" && line.messageId === "m-image-tool", "the image's turn");
   const ofTurn = lines.filter((line) => line.messageId === "m-tool");
-  assert.equal(ofTurn.find((line) => line.type === "turn_end")?.stopReason, "cancelled");
+  // A reader of the stream, on any server, learns it too (DUR-64).
+  assert.deepEqual([ofTurn.find((line) => line.type === "turn_end")?.stopReason, ofTurn.find((line) => line.type === "turn_end")?.endedBySteer], ["cancelled", "m-image-tool"]);
   const started = ofTurn.filter((line) => line.type === "tool_start").map((line) => line.id);
   assert.equal(started.length, 1);
   assert.deepEqual(ofTurn.filter((line) => line.type === "tool_end").map((line) => line.id), started, "the call the turn started ended");
@@ -1597,9 +1604,33 @@ test("a cancel keeps the steer its turn never took, and it runs next", async () 
   await new Promise((wait) => setTimeout(wait, durabilityKind === "memory" ? 50 : 600));
   held.open();
   gates.delete("lookup");
-  assert.equal((await turn.result).stopReason, "cancelled");
+  const result = await turn.result;
+  assert.equal(result.stopReason, "cancelled");
+  assert.equal(result.endedBySteer, undefined, "a cancelled turn names no steer");
   await linesUntil(session, (line) => line.type === "turn_end" && line.messageId === "m-after-stop", "the steer's own turn");
   assert.ok(userTexts(requests.at(-1)).some((text) => text.includes("after the stop")), "the steer ran as the next turn");
+  await agent.close();
+});
+
+// A cancel and a steer with images can both end a turn. The cancel's end
+// names no steer, so an app shows a cancel only when the user cancelled.
+test("a turn a cancel ended names no steer, though a steer with an image was waiting to end it", async () => {
+  const agent = createFxAgent(agentOptions(await durabilityFor()));
+  const held = gate("lookup");
+  const session = agent.session();
+  const turn = session.prompt("use lookup", { messageId: "m-cancel-tool" });
+  void turn.result.catch(() => {});
+  await held.started;
+  await session.steer([{ type: "text", text: "match this" }, { type: "image", data: onePixelPng, mimeType: "image/png" }], { messageId: "m-image-cancel" });
+  await new Promise((wait) => setTimeout(wait, durabilityKind === "memory" ? 50 : 600));
+  await session.cancel();
+  await new Promise((wait) => setTimeout(wait, durabilityKind === "memory" ? 50 : 600));
+  held.open();
+  gates.delete("lookup");
+  const result = await turn.result;
+  assert.deepEqual([result.stopReason, result.endedBySteer], ["cancelled", undefined]);
+  const lines = await linesUntil(session, (line) => line.type === "turn_end" && line.messageId === "m-image-cancel", "the image's turn");
+  assert.equal(lines.find((line) => line.type === "turn_end" && line.messageId === "m-cancel-tool")?.endedBySteer, undefined);
   await agent.close();
 });
 
@@ -1657,12 +1688,13 @@ test("steers stored while a prompt waits join its turn; one with an image ends i
     { cursor: "5", entry: { k: "input", key: "steer:s3", type: "steer", messageId: "s3", input: [{ type: "text", text: "and this" }] } },
   ];
   const waiting = foldSessionLog(log);
-  assert.deepEqual(waiting.pending.map((input) => [input.messageId, input.joiners.map((joiner) => joiner.messageId), input.ends]), [["p1", ["s1"], true], ["s2", ["s3"], false]]);
+  // A turn a steer ends names it.
+  assert.deepEqual(waiting.pending.map((input) => [input.messageId, input.joiners.map((joiner) => joiner.messageId), input.ends]), [["p1", ["s1"], "s2"], ["s2", ["s3"], null]]);
   // Started, the turn has the same steers and still ends for the image.
   const started = foldSessionLog([...log, { cursor: "6", entry: { k: "record", a: "1", key: "r1", data: "AA==", marks: [{ start: "p1" }] } }]);
   assert.equal(started.openTurn.id, "p1");
   assert.deepEqual(started.steers.map((input) => input.messageId), ["s1"]);
-  assert.equal(started.endOpen, true);
+  assert.equal(started.endOpen, "s2");
   assert.deepEqual(started.pending.map((input) => [input.messageId, input.joiners.map((joiner) => joiner.messageId)]), [["s2", ["s3"]]]);
 });
 
@@ -3129,6 +3161,47 @@ test("a checkpoint after an image prompt holds the image, and a new agent sends 
     .filter((part) => part.type === "file");
   assert.deepEqual(files.map((part) => part.data?.data), [png]);
   await restored.close();
+});
+
+// A session keeps the newest images a model request carries, 30 MiB of
+// base64, so its checkpoint carries their bytes within 32 MiB though it saved
+// more; the older ones it names (API-42).
+test("a checkpoint of a session that saved more photos than 32 MiB holds carries the ones it keeps, and a new agent sends them", async () => {
+  // 10 photos of 3.5 MiB: 35 MiB. Each takes 4.67 MiB of base64, so the
+  // session keeps the newest 6.
+  const photoBytes = 3.5 * 1024 * 1024;
+  const photos = Array.from({ length: 10 }, (_, index) => {
+    const bytes = Buffer.alloc(photoBytes);
+    Buffer.from(pngBase64, "base64").copy(bytes);
+    for (let at = 72; at < photoBytes; at += 4) bytes.writeUInt32LE(((at * 2654435761) ^ (index * 40503)) >>> 0, at);
+    return bytes.toString("base64");
+  });
+  const kept = Math.floor(30 * 1024 * 1024 / photos[0].length);
+  assert.equal(kept, 6);
+  const nameOfBase64 = (data) => createHash("sha256").update(Buffer.from(data, "base64")).digest("hex");
+  const agent = createFxAgent(agentOptions(await durabilityFor(), { model: "durable/vision-model" }));
+  try {
+    for (const [index, data] of photos.entries()) {
+      const { stopReason } = await agent.prompt([{ type: "text", text: `photo ${index}` }, { type: "image", data, mimeType: "image/png" }]).result;
+      assert.equal(stopReason, "end_turn");
+      // Each request is about 30 MiB; keep none of them.
+      requests.length = 0;
+      chats.length = 0;
+    }
+    const checkpoint = await agent.checkpoint();
+    assert.ok(checkpoint.byteLength < 32 * 1024 * 1024, `the checkpoint takes ${checkpoint.byteLength} bytes`);
+    const restored = createFxAgent(agentOptions(await durabilityFor(), { checkpoint, model: "durable/vision-model" }));
+    try {
+      assert.equal((await restored.prompt("which photos").result).stopReason, "end_turn");
+      assert.deepEqual(requestFiles(chats.at(-1).prompt).map(nameOfBase64), photos.slice(-kept).map(nameOfBase64));
+    } finally {
+      requests.length = 0;
+      chats.length = 0;
+      await restored.close();
+    }
+  } finally {
+    await agent.close();
+  }
 });
 
 // LIBFX_TEST_ONLY runs only the tests whose names contain it.

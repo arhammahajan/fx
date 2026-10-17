@@ -1534,11 +1534,21 @@ test("an image turn that crashed after a delta reopens with its image", async ()
   assert.equal(toolResults(requests[0]).length, 1, "the step came back from the delta");
 });
 
-// A smaller image window than the core's, so a test reaches its edge.
+// A smaller image window than the core's, so a test reaches its edge. The
+// window counts each image's base64, as a model request does.
 const imageWindow = Symbol.for("libfx.imageWindow");
+const base64Bytes = (bytes) => Math.ceil(bytes / 3) * 4;
 const droppedNote = /\[Image #1 is no longer in this session, which keeps only its newest images\.\]/;
+// The core's window is one model request's image budget
+// (src/core/agent/runtime/request_image_budget.zig): 100 images, whose base64
+// takes at most 30 MiB.
+const requestImageLimit = 100;
+const requestImageBytes = 30 * 1024 * 1024;
+// The names of the images a request carries, oldest first: an assertion
+// that fails on these prints names, not megabytes of base64.
+const requestImageNames = (prompt) => Promise.all(requestImages(prompt).map((data) => nameOf(Buffer.from(data, "base64"))));
 
-for (const [label, limits] of [["images", { images: 2 }], ["bytes", { bytes: 2 * 40_000 }]]) {
+for (const [label, limits] of [["images", { images: 2 }], ["bytes", { bytes: 2 * base64Bytes(40_000) }]]) {
   test(`a session keeps its newest images within its window of ${label}, and an older one leaves as a note`, async () => {
     const store = createImagePersistence();
     const pictures = [pngOf(40_000, 11), pngOf(40_000, 12), pngOf(40_000, 13)];
@@ -1575,6 +1585,106 @@ for (const [label, limits] of [["images", { images: 2 }], ["bytes", { bytes: 2 *
   });
 }
 
+test("the window counts each image's base64, as a model request does", async () => {
+  // Two images of 40,000 bytes come to the window's 80,000 bytes decoded,
+  // but their base64 takes 106,672, so the older leaves.
+  const store = createImagePersistence();
+  const pictures = [pngOf(40_000, 14), pngOf(40_000, 15)];
+  const agent = await createFxEngine(options(sourceBackend, undefined, { ...visionCatalog, persistence: store, [imageWindow]: { bytes: 2 * 40_000 } }));
+  for (const [index, picture] of pictures.entries()) await run(agent, [{ type: "text", text: `look ${index}` }, imageBlock(picture)]);
+  await run(agent, "and then?");
+  await agent.close();
+  assert.deepEqual(await requestImageNames(requests.at(-1)), [await nameOf(pictures[1])]);
+  assert.match(JSON.stringify(requests.at(-1)), droppedNote);
+});
+
+test("a session keeps the photos a model request carries, 30 MiB of base64, and an open reads only those", async () => {
+  // A photo of 3 MiB takes 4 MiB of base64: a request carries the newest 7
+  // of 8, with or without the window, and the window keeps the same 7.
+  const photos = Array.from({ length: 8 }, (_, index) => pngOf(3 * 1024 * 1024, 40 + index));
+  const names = await Promise.all(photos.map(nameOf));
+  const kept = Math.floor(requestImageBytes / base64Bytes(photos[0].length));
+  assert.equal(kept, 7);
+  const store = createImagePersistence();
+  const source = await createFxEngine(options(sourceBackend, undefined, { ...visionCatalog, persistence: store, checkpointAfterBytes: 0 }));
+  for (const [index, photo] of photos.entries()) {
+    requests.length = 0;
+    await run(source, [{ type: "text", text: `photo ${index}` }, imageBlock(photo)]);
+  }
+  // The last photo's own turn carried all 8 the session held then, less the
+  // oldest, which the request left out.
+  assert.deepEqual(await requestImageNames(requests.at(-1)), names.slice(-kept));
+  requests.length = 0;
+  await run(source, "which photos?");
+  await source.close();
+  assert.deepEqual(await requestImageNames(requests.at(-1)), names.slice(-kept));
+  const live = JSON.stringify(requests.at(-1));
+
+  const read = [];
+  const { get } = store[persistenceImages];
+  store[persistenceImages].get = async (name) => { read.push(name); return get(name); };
+  const target = await createFxEngine(options(targetBackend, undefined, { ...visionCatalog, persistence: store }));
+  requests.length = 0;
+  await run(target, "and now?");
+  await target.close();
+  assert.deepEqual(read.sort(), names.slice(-kept).sort(), "the open read only the photos a request carries");
+  assert.deepEqual(await requestImageNames(requests.at(-1)), names.slice(-kept));
+  // The oldest photo is a note: the session no longer holds it.
+  assert.match(live, droppedNote);
+  assert.match(JSON.stringify(requests.at(-1)), droppedNote);
+  requests.length = 0;
+});
+
+test("an open reads the images it stages several at a time, in the history's order", async () => {
+  const pictures = Array.from({ length: 20 }, (_, index) => pngOf(2_000, 60 + index));
+  const store = createImagePersistence();
+  const source = await createFxEngine(options(sourceBackend, undefined, { ...visionCatalog, persistence: store, checkpointAfterBytes: 0 }));
+  for (let start = 0; start < pictures.length; start += 8) {
+    await run(source, [{ type: "text", text: `look ${start}` }, ...pictures.slice(start, start + 8).map(imageBlock)]);
+  }
+  await source.close();
+  let active = 0;
+  let peak = 0;
+  const calls = [];
+  const { get } = store[persistenceImages];
+  store[persistenceImages].get = async (name) => {
+    calls.push(name);
+    active += 1;
+    peak = Math.max(peak, active);
+    // A store over the network: each read takes a while.
+    await new Promise((done) => setTimeout(done, 20));
+    active -= 1;
+    return get(name);
+  };
+  const target = await createFxEngine(options(targetBackend, undefined, { ...visionCatalog, persistence: store }));
+  await target.close();
+  assert.equal(calls.length, pictures.length);
+  assert.deepEqual(calls, [...new Set(calls)], "each image was read once");
+  assert.ok(peak > 1 && peak <= 8, `reads overlapped, at most 8 at once: ${peak}`);
+
+  // A store that lacks two of them fails the open on the first its history
+  // names, though the later one answers first, and only once every read the
+  // open started has settled.
+  calls.length = 0;
+  const missing = [await nameOf(pictures[3]), await nameOf(pictures[5])];
+  for (const name of missing) store.images.delete(name);
+  store[persistenceImages].get = async (name) => {
+    calls.push(name);
+    active += 1;
+    await new Promise((done) => setTimeout(done, name === missing[0] ? 40 : 5));
+    active -= 1;
+    return get(name);
+  };
+  let failure = null;
+  await assert.rejects(
+    createFxEngine(options(targetBackend, undefined, { ...visionCatalog, persistence: store })),
+    (error) => { failure = error; return error.code === "FX_JOURNAL_IMAGE_MISSING"; },
+  );
+  assert.equal(active, 0, "no read was still running when the open failed");
+  assert.ok(calls.indexOf(missing[0]) < calls.indexOf(missing[1]), "the open asked for the images in the history's order");
+  assert.ok(failure.message.endsWith(missing[0]), failure.message);
+});
+
 test("a turn that fails before it enters the history drops no image", async () => {
   const store = createImagePersistence();
   const pictures = [pngOf(40_000, 21), pngOf(40_000, 22), pngOf(40_000, 23)];
@@ -1591,8 +1701,9 @@ test("a turn that fails before it enters the history drops no image", async () =
 });
 
 test("a turn that crashed with a full image window reopens with all of its images", async () => {
-  // An open stages the whole window and the open turn's images, which the
-  // window leaves out: one prompt's, up to 8 of them.
+  // An open stages the whole window, the 100 newest images, as many as a
+  // model request carries, and the open turn's images, which the window
+  // leaves out: one prompt's, up to 8 of them.
   const tiny = (n) => {
     const bytes = pngOf(80, 0);
     new DataView(bytes.buffer).setUint32(70, n);
@@ -1603,11 +1714,17 @@ test("a turn that crashed with a full image window reopens with all of its image
   const images = new Map();
   const journal = eventJournal();
   const source = await createFxEngine(options(sourceBackend, undefined, { ...visionCatalog, persistence: withImageStore(persisted(journal), images) }));
-  for (let turn = 0; turn < 4096 / 8; turn += 1) await run(source, prompt(`look ${turn}`));
+  // 104 images, 4 more than the window keeps.
+  const turns = Math.ceil(requestImageLimit / 8);
+  for (let turn = 0; turn < turns; turn += 1) await run(source, prompt(`look ${turn}`));
   const open = prompt("use the tool");
   assert.equal((await run(source, open)).text, "tool said beta");
   await source.close();
-  assert.equal(images.size, 4096 + 8);
+  assert.equal(images.size, turns * 8 + 8);
+  // The request after the tool step: the model saw the newest 100 of the
+  // session's 112 images.
+  const seen = requestImages(requests.at(-1));
+  assert.equal(seen.length, requestImageLimit);
   // A crash after the last turn's tool step leaves it open, with the window
   // full of the turns before it.
   const stepped = journal.events.findLast((event) => event.type === "turn_progress" && event.steps === 1);
@@ -1622,9 +1739,10 @@ test("a turn that crashed with a full image window reopens with all of its image
   for await (const _ of turn) {}
   assert.equal((await turn.result).stopReason, "end_turn");
   await resumed.close();
-  assert.equal(read.size, 4096 + 8, "the open read the window and the open turn's images");
+  assert.equal(read.size, requestImageLimit + 8, "the open read the window and the open turn's images");
   const sent = requestImages(requests[0]);
   for (const block of open.slice(1)) assert.ok(sent.includes(base64Of(block.data)), "the open turn kept its images");
+  assert.deepEqual(sent, seen, "the model sees the images it saw before the crash");
 });
 
 test("a failed image write fails the prompt before it is sent", async () => {
@@ -1866,9 +1984,9 @@ test("a tool image the store refused leaves the window like any other, as a note
 });
 
 test("a turn whose tools returned more images than a window and a prompt hold reopens with all of them", async () => {
-  // 514 pages of 8: 4,112 images, more than the 4,096 a session keeps and
-  // the 8 of one prompt, all an open stages unless it reports more missing.
-  const pages = 514;
+  // 14 pages of 8: 112 images, more than the 100 a session keeps and the 8
+  // of one prompt, all an open stages unless it reports more missing.
+  const pages = Math.ceil((requestImageLimit + 8 + 1) / 8);
   const journal = eventJournal();
   const images = new Map();
   let staged = 0;

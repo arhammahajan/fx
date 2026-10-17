@@ -442,10 +442,11 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
   // and otherwise the turn waiting before it. A steer that cannot join a
   // turn waits as its own, and the turn it came after ends at its next safe
   // point, at once if it has not started; the steers after it join its turn.
-  // A steer with no turn to join starts one.
+  // A steer with no turn to join starts one. `ends` names the steer that ends
+  // a turn, or is null.
   const pending = [];
   const steers = [];
-  const openOwner = openTurn !== null && !openFailed ? { joiners: steers, ends: false } : null;
+  const openOwner = openTurn !== null && !openFailed ? { joiners: steers, ends: null } : null;
   let cancelOpen = false;
   let owner = null;
   for (const input of inputs) {
@@ -453,15 +454,15 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
     if (consumed.has(input.messageId)) continue;
     const forOpenTurn = openTurn !== null && input.cursor > openTurn.at;
     if (input.type === "prompt") {
-      const entry = { ...input, ...(cancelTargets.has(input.messageId) ? { cancelled: true } : {}), joiners: [], ends: false };
+      const entry = { ...input, ...(cancelTargets.has(input.messageId) ? { cancelled: true } : {}), joiners: [], ends: null };
       pending.push(entry);
       // While a turn runs, steers still join it: a prompt is the next turn.
       if (owner === null || owner !== openOwner) owner = entry;
     } else if (input.type === "steer") {
       if (owner !== null && joinable(input.input)) owner.joiners.push(input);
       else {
-        if (owner !== null) owner.ends = true;
-        owner = { ...input, type: "prompt", joiners: [], ends: false };
+        if (owner !== null) owner.ends = input.messageId;
+        owner = { ...input, type: "prompt", joiners: [], ends: null };
         pending.push(owner);
       }
     } else if (input.type === "cancel") {
@@ -503,8 +504,8 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
     unconsumed: inputs.filter((input) => !consumed.has(input.messageId)),
     held: inputs.filter((input) => held.has(input.messageId)),
     heldIds: [...held],
-    // A steer that cannot join the open turn waits for it to end.
-    endOpen: openOwner?.ends === true,
+    // A steer that cannot join the open turn waits for it to end: its id.
+    endOpen: openOwner?.ends ?? null,
     head,
     // The lease others must respect, and the chain's latest whether or not
     // it still stands: a worker checks the latter is its own.
@@ -2150,10 +2151,15 @@ class SessionWorker {
           fresh = true;
         }
         turnNow = turn;
+        // Whether the worker cancelled the turn before it drives it.
+        let cancelledFirst = false;
         if (this.stopping || claimFailed) turn.cancel({ reason: "handoff" });
-        else if (spent && !(open.calls?.length > 0)) turn.cancel();
+        else if (spent && !(open.calls?.length > 0)) {
+          cancelledFirst = true;
+          turn.cancel();
+        }
         // A new turn takes the steers sent while it waited to start.
-        const joining = fresh ? { ...state, steers: state.pending[0]?.joiners ?? [], endOpen: state.pending[0]?.ends === true } : state;
+        const joining = fresh ? { ...state, steers: state.pending[0]?.joiners ?? [], endOpen: state.pending[0]?.ends ?? null } : state;
         const outcome = await this.drive(log, harness, turn, messageId, joining, ui, !fresh);
         turnNow = null;
         if (outcome === "fenced") return "fenced";
@@ -2201,8 +2207,10 @@ class SessionWorker {
           }
         }
         // The turn's records have landed, so its viewers hear it ended now;
-        // the log is read after, for what comes next.
-        ui.push({ type: "turn_end", messageId, stopReason: result.stopReason, usage: result.usage ?? {}, ...(result.error ? { error: result.error } : {}) });
+        // the log is read after, for what comes next. A turn a steer with
+        // images ended names it, so an app tells it from a cancel.
+        const endedBySteer = !cancelledFirst && result.stopReason === "cancelled" ? outcome.endedBySteer : undefined;
+        ui.push({ type: "turn_end", messageId, stopReason: result.stopReason, usage: result.usage ?? {}, ...(result.error ? { error: result.error } : {}), ...(endedBySteer ? { endedBySteer } : {}) });
         await ui.settle();
         state = this.fold(await log.read());
         if (!fresh && !failed && harness.openTurn?.id === messageId) {
@@ -2249,8 +2257,9 @@ class SessionWorker {
   // Streams one turn to the session's viewers and applies the steers and
   // cancels the log receives while it runs. Returns "fenced", "yielded",
   // `{ stopped }` when its harness stopped under it, or `{ result }` for a
-  // turn that ended, whose end the caller writes. `resumed` says the turn
-  // continues one an earlier worker ran.
+  // turn that ended, whose end the caller writes, with `endedBySteer`, the id
+  // of the steer it ended the turn for, when it cancelled the turn for nothing
+  // else. `resumed` says the turn continues one an earlier worker ran.
   async drive(log, harness, turn, messageId, state, ui, resumed = false) {
     // The inputs `state` was folded from are placed already: the fold gave
     // each a turn, joined it to one, or spent it. The poll applies only the
@@ -2263,19 +2272,25 @@ class SessionWorker {
     let stopped = false;
     // A text steer joins the turn. Any other ends it at its next safe point
     // and, never taken, runs as the next turn, as the fx CLI hands off; the
-    // steers after that one join its turn.
-    let ending = false;
-    const endTurn = () => {
-      if (ending) return;
-      ending = true;
+    // steers after that one join its turn. `ending` is that steer's id, which
+    // the turn's end names unless the turn was cancelled too.
+    let ending = null;
+    let cancelled = false;
+    const cancel = () => {
+      cancelled = true;
+      turn.cancel();
+    };
+    const endTurn = (steerId) => {
+      if (ending !== null) return;
+      ending = steerId;
       void Promise.resolve().then(() => turn.endForSteer?.()).catch(() => {});
     };
     const steerTurn = (steer) => {
       // One id names one input, so a steer with this turn's id is its own
       // opener or one that reused the id, which the log never runs.
       if (steer.messageId === messageId) return;
-      if (!joinable(steer.input)) endTurn();
-      else if (!ending) void turn.steer(steer.input, steer.messageId).catch(() => {});
+      if (!joinable(steer.input)) endTurn(steer.messageId);
+      else if (ending === null) void turn.steer(steer.input, steer.messageId).catch(() => {});
     };
     // One read of the inputs stored past `since`, applied in log order. Reads
     // may overlap; each applies what it found in one synchronous pass, so an
@@ -2287,7 +2302,7 @@ class SessionWorker {
         if (entry?.k !== "input" || applied.has(entry.key)) continue;
         applied.add(entry.key);
         if (entry.type === "steer") steerTurn(entry);
-        else if (entry.type === "cancel" && (entry.target === undefined || entry.target === messageId)) turn.cancel();
+        else if (entry.type === "cancel" && (entry.target === undefined || entry.target === messageId)) cancel();
       }
     };
     const apply = async () => {
@@ -2316,10 +2331,10 @@ class SessionWorker {
       applied.add(steer.key);
       steerTurn(steer);
     }
-    if (state.endOpen) endTurn();
+    if (state.endOpen) endTurn(state.endOpen);
     // An open turn whose engine kept stopping is cancelled the way a user
     // would, so the prompts behind it can run.
-    if (state.cancelOpen || (state.stuck && state.openTurn?.id === messageId)) turn.cancel();
+    if (state.cancelOpen || (state.stuck && state.openTurn?.id === messageId)) cancel();
     const unwatch = log.watch?.(() => { void apply(); });
     const timer = this.backend.pollMs ? setInterval(() => { void apply(); }, this.backend.pollMs) : null;
     void apply();
@@ -2375,7 +2390,7 @@ class SessionWorker {
       await ui.settle();
       return "yielded";
     }
-    return { result };
+    return { result, ...(ending !== null && !cancelled ? { endedBySteer: ending } : {}) };
   }
 }
 

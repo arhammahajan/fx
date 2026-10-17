@@ -46,6 +46,9 @@ const maxPromptImageDataBytes = 5 * 1024 * 1024;
 const maxPromptImagesDataBytes = 8 * 1024 * 1024;
 const maxPromptImageBytes = (maxPromptImageDataBytes / 4) * 3;
 const maxPromptImagesBytes = (maxPromptImagesDataBytes / 4) * 3;
+// Matches the core's limit on one tool result's images (max_tool_images in
+// src/core/images/image_data.zig).
+const maxToolResultImages = 8;
 // Matches the core's kernel checkpoint limit (max_checkpoint_bytes), which
 // holds a session's history with its images, and its turn limit
 // (max_history_turns).
@@ -68,6 +71,9 @@ const checkpointSkips = {
 // table holds.
 const maxPendingAttachments = 8;
 const maxPendingAttachmentBytes = 2 * maxCheckpointBytes;
+// The image store reads an open runs at once: a batch's worth, so a batch is
+// read while the one before it is staged.
+const maxImageReads = maxPendingAttachments;
 const maxOutboundAttachments = 4;
 // Matches the core's journal load limit (journal.max_load_bytes).
 const maxJournalBytes = 32 * 1024 * 1024;
@@ -281,6 +287,8 @@ export const turnEndInputs = Symbol.for("libfx.turnEndInputs");
 export const persistenceImages = Symbol.for("libfx.persistenceImages");
 // `{ images, bytes }`: a smaller image window than the core's, the newest
 // images a session with an image store keeps, so tests can reach its edge.
+// The core's is one model request's budget, 100 images whose base64 takes at
+// most 30 MiB; `bytes` counts base64 too.
 const imageWindowLimits = Symbol.for("libfx.imageWindow");
 // Marks an error the core answered a request with, as opposed to one from a
 // core that stopped answering.
@@ -2410,8 +2418,12 @@ export function normalizeInstructions(value) {
 // the name, so the core names them too.
 function hostToolContent(value, stored = null) {
   if (value?.type === "libfx.tool-result") {
-    if (typeof value.text !== "string" || !Array.isArray(value.images) || value.images.length > 8) {
+    if (typeof value.text !== "string" || !Array.isArray(value.images)) {
       throw new TypeError("invalid typed tool result");
+    }
+    // The tool and the model both read this, so it names the limit.
+    if (value.images.length > maxToolResultImages) {
+      throw new RangeError(`a libfx.tool-result holds at most ${maxToolResultImages} images, and this one has ${value.images.length}`);
     }
     let images = value.images.map((image) => {
       if (image?.type !== "image") throw new TypeError("invalid tool image");
@@ -3240,9 +3252,27 @@ export async function createFxEngine(options = {}) {
         return request("libfx/journal_open", params).catch(openFailed);
       };
       // Stages the images a history names, read from the store, in batches
-      // the attachment table holds. A store that lacks one fails the open:
-      // the history without it is not the one saved.
+      // the attachment table holds. Up to `maxImageReads` reads run at once,
+      // and the next ones start while a batch is staged, so an open waits on
+      // a slow store about once per batch, not once per image, and holds at
+      // most two batches' bytes. The images stage in the history's order. A
+      // store that lacks one fails the open, naming the first one the
+      // history names that it lacks, once every read the open started has
+      // settled: the history without it is not the one saved.
       const stageImages = async (names) => {
+        const wanted = [...new Set(names.map(String))];
+        const read = (name) => {
+          const reading = (async () => {
+            const stored = imageStore ? await imageStorage.get(name) : undefined;
+            if (stored === undefined || stored === null) throw imageMissingError(name);
+            return { name, bytes: persistenceBytes(stored, "an image the image store returns") };
+          })();
+          // A read after one that failed is still waited for, below.
+          reading.catch(() => {});
+          return reading;
+        };
+        const reading = [];
+        let next = 0;
         let batch = [];
         let batchBytes = 0;
         const flush = async () => {
@@ -3253,15 +3283,20 @@ export async function createFxEngine(options = {}) {
           batchBytes = 0;
           await request("libfx/journal_images", { sessionId, images }).catch(openFailed);
         };
-        for (const name of new Set(names.map(String))) {
-          const stored = imageStore ? await imageStorage.get(name) : undefined;
-          if (stored === undefined || stored === null) throw imageMissingError(name);
-          const bytes = persistenceBytes(stored, "an image the image store returns");
-          if (batch.length === maxPendingAttachments || batchBytes + bytes.byteLength > maxPendingAttachmentBytes) await flush();
-          batch.push({ name, bytes });
-          batchBytes += bytes.byteLength;
+        try {
+          while (next < wanted.length || reading.length > 0) {
+            while (reading.length < maxImageReads && next < wanted.length) reading.push(read(wanted[next++]));
+            const { name, bytes } = await reading[0];
+            reading.shift();
+            if (batch.length === maxPendingAttachments || batchBytes + bytes.byteLength > maxPendingAttachmentBytes) await flush();
+            batch.push({ name, bytes });
+            batchBytes += bytes.byteLength;
+          }
+          await flush();
+        } catch (error) {
+          await Promise.allSettled(reading);
+          throw error;
         }
-        await flush();
       };
       // A history that names images opens once they are staged from the
       // store: the core answers with the names it needs, all at once.

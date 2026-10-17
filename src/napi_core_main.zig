@@ -31,8 +31,10 @@ const max_drain_bytes = 1024 * 1024;
 const max_input_bytes = 8 * 1024 * 1024;
 const max_output_bytes = 8 * 1024 * 1024;
 const max_output_message_bytes = 64 * 1024 * 1024;
-// One model request. History keeps every image, and the core leaves a
-// request's oldest images out to keep its body within
+// One model request. An engine's history keeps every image, and a session
+// with an image store the newest a request carries (`ImageWindow` in
+// `src/core/session/session_codec.zig`). The core leaves a request's oldest
+// images out to keep its body within
 // `request_image_budget.default_max_request_bytes`, so a request it can trim
 // that way fits, with 2 MiB more for its method, URL and headers. Text can't
 // be left out: a request whose text alone is over this fails with

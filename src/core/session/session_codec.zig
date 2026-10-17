@@ -2,6 +2,7 @@ const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const image_data = @import("../images/image_data.zig");
+const request_image_budget = @import("../agent/runtime/request_image_budget.zig");
 const session = @import("session.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const mem_utils = @import("../shared/mem_utils.zig");
@@ -673,28 +674,35 @@ pub fn checkpointNamesImages(checkpoint: RecoveryCheckpoint, delta: ?ExecutionCo
     return executionNamesImages(checkpoint.execution, delta orelse .{}, stored);
 }
 
-/// The images a libfx session with an image store keeps: its newest, at most
-/// `max_images` of them holding at most `max_bytes`. An open stages these from
-/// the host's store, with the open turn's, which the window leaves out. Older
-/// images leave the session and keep only their names, so a session never
-/// grows past what it can reopen.
+/// The images a libfx session with an image store keeps: its newest, as many
+/// as one model request carries (`request_image_budget.zig`), at most
+/// `max_images` of them whose base64 takes at most `max_bytes`. A request
+/// leaves every older image out anyway, newest first being what it keeps, so
+/// the model sees the images it would see if the session kept them all. An
+/// open stages these from the host's store, with the open turn's, which the
+/// window leaves out. Older images leave the session and keep only their
+/// names, so a session never grows past what it can reopen.
 pub const ImageWindow = struct {
-    max_images: usize = 4096,
-    max_bytes: usize = 512 * 1024 * 1024,
+    max_images: usize = request_image_budget.default_max_request_images,
+    max_bytes: usize = request_image_budget.default_max_request_bytes,
 
     /// How many of the oldest images leave the window. `sizes` holds each
-    /// image's bytes, oldest first, or null for one that already left, which
-    /// keeps it and every older one out. Once an image does not fit, it and
-    /// every older one leave.
+    /// image's decoded bytes, oldest first, or null for one that already
+    /// left, which keeps it and every older one out. Each counts as the
+    /// base64 a request carries for it (`image_data.encodedImageBytes`).
+    /// Once an image does not fit, it and every older one leave.
     pub fn oldestOutside(self: ImageWindow, sizes: []const ?usize) usize {
         var kept: usize = 0;
         var bytes: usize = 0;
         var start = sizes.len;
         while (start > 0) : (start -= 1) {
             const size = sizes[start - 1] orelse break;
-            if (kept == self.max_images or size > self.max_bytes - bytes) break;
+            // A size a record gives may be any number; one whose base64
+            // overflows fits no window.
+            const encoded = image_data.encodedImageBytes(size) orelse break;
+            if (kept == self.max_images or encoded > self.max_bytes - bytes) break;
             kept += 1;
-            bytes += size;
+            bytes += encoded;
         }
         return start;
     }
@@ -5547,18 +5555,75 @@ test "inline image bytes round trip through the history turn codec" {
 }
 
 test "the image window keeps the newest images that fit, and drops every older one" {
+    // Sizes are decoded bytes; the window counts their base64, 4 bytes for
+    // every 3 or part of 3.
     const window: ImageWindow = .{ .max_images = 3, .max_bytes = 100 };
     try std.testing.expectEqual(@as(usize, 0), window.oldestOutside(&.{}));
-    try std.testing.expectEqual(@as(usize, 0), window.oldestOutside(&.{ 10, 20, 30 }));
+    try std.testing.expectEqual(@as(usize, 0), window.oldestOutside(&.{ 12, 24, 30 }));
     // Three images at most: the oldest of four leaves.
-    try std.testing.expectEqual(@as(usize, 1), window.oldestOutside(&.{ 10, 20, 30, 40 }));
-    // 100 bytes at most: 60 does not fit beside 40 and 30, so it and the
-    // 5 before it leave, though 5 alone would fit.
-    try std.testing.expectEqual(@as(usize, 2), window.oldestOutside(&.{ 5, 60, 30, 40 }));
+    try std.testing.expectEqual(@as(usize, 1), window.oldestOutside(&.{ 3, 3, 3, 3 }));
+    // 100 bytes of base64 at most: 45 and 30 decoded bytes take 60 and 40,
+    // which fit exactly; one byte more takes 4 more and does not.
+    try std.testing.expectEqual(@as(usize, 0), window.oldestOutside(&.{ 45, 30 }));
+    try std.testing.expectEqual(@as(usize, 1), window.oldestOutside(&.{ 45, 31 }));
+    // 45 does not fit beside 30 and 15, so it and the 3 before it leave,
+    // though 3 alone would fit.
+    try std.testing.expectEqual(@as(usize, 2), window.oldestOutside(&.{ 3, 45, 30, 15 }));
     // An image already dropped keeps every older one out.
-    try std.testing.expectEqual(@as(usize, 2), window.oldestOutside(&.{ 10, null, 30, 40 }));
-    // An image larger than the whole window leaves too.
-    try std.testing.expectEqual(@as(usize, 1), window.oldestOutside(&.{101}));
+    try std.testing.expectEqual(@as(usize, 2), window.oldestOutside(&.{ 3, null, 3, 3 }));
+    // An image larger than the whole window leaves too, and so does one
+    // whose base64 would overflow.
+    try std.testing.expectEqual(@as(usize, 0), window.oldestOutside(&.{75}));
+    try std.testing.expectEqual(@as(usize, 1), window.oldestOutside(&.{76}));
+    try std.testing.expectEqual(@as(usize, 1), window.oldestOutside(&.{std.math.maxInt(usize)}));
+}
+
+test "the image window is one model request's image budget, at both of its edges" {
+    const window: ImageWindow = .{};
+    try std.testing.expectEqual(request_image_budget.default_max_request_images, window.max_images);
+    try std.testing.expectEqual(request_image_budget.default_max_request_bytes, window.max_bytes);
+    // 100 images, and no more.
+    const small: [request_image_budget.default_max_request_images + 1]?usize = @splat(12);
+    try std.testing.expectEqual(@as(usize, 0), window.oldestOutside(small[1..]));
+    try std.testing.expectEqual(@as(usize, 1), window.oldestOutside(&small));
+    // 30 MiB of base64 is 22.5 MiB decoded: that fits, one byte more does not.
+    const fills = request_image_budget.default_max_request_bytes / 4 * 3;
+    try std.testing.expectEqual(@as(usize, 0), window.oldestOutside(&.{fills}));
+    try std.testing.expectEqual(@as(usize, 1), window.oldestOutside(&.{fills + 1}));
+    // Photos of 3 MiB take 4 MiB of base64 each: seven fit, and of ten the
+    // three oldest leave.
+    const photos: [10]?usize = @splat(3 * 1024 * 1024);
+    try std.testing.expectEqual(@as(usize, 3), window.oldestOutside(&photos));
+}
+
+test "every image a model request carries is one the image window keeps" {
+    // A request leaves out its oldest images until it fits its budget,
+    // counting the rest of the request too, so it carries the newest few the
+    // window keeps, or fewer; never one the session dropped.
+    var prng = std.Random.DefaultPrng.init(0x1f17);
+    const random = prng.random();
+    const window: ImageWindow = .{};
+    var decoded: [160]?usize = undefined;
+    var encoded: [160]usize = undefined;
+    for (0..2000) |_| {
+        const count = random.uintLessThan(usize, decoded.len + 1);
+        // Mostly screenshots, with a few photos up to the 5 MiB of base64
+        // one image may take.
+        const largest: usize = if (random.boolean()) 512 * 1024 else 3_932_160;
+        var images_bytes: usize = 0;
+        for (decoded[0..count], encoded[0..count]) |*size, *base64| {
+            const value = 1 + random.uintLessThan(usize, largest);
+            size.* = value;
+            base64.* = image_data.encodedImageBytes(value).?;
+            images_bytes += base64.*;
+        }
+        // Text, tools and the JSON around each image, and a request limit a
+        // rejection may have lowered.
+        const other_bytes = random.uintLessThan(usize, 2 * 1024 * 1024) + count * 128;
+        const limits: request_image_budget.Limits = .{ .max_request_bytes = request_image_budget.default_max_request_bytes - random.uintLessThan(usize, 8 * 1024 * 1024) };
+        const withheld = request_image_budget.oldestImagesToWithhold(encoded[0..count], images_bytes + other_bytes, limits);
+        try std.testing.expect(withheld >= window.oldestOutside(decoded[0..count]));
+    }
 }
 
 test "a dropped image parses only as a name without bytes" {

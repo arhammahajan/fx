@@ -810,6 +810,8 @@ export interface FxTurnResult {
   epoch?: number;
   /** Set when a `prompt()` with an already accepted `messageId` reports that turn's outcome. */
   repeated?: true;
+  /** Set on a turn that ended `cancelled` so a steer with images could run as the next turn: that steer's `messageId`, which its own turn has. A turn `cancel()` ended has none. */
+  endedBySteer?: string;
 }
 
 /** What `session.resume()` resolves to when no turn was left open. */
@@ -857,6 +859,8 @@ export type FxStreamLine = (
     usage?: FxUsage;
     error?: FxErrorSummary;
     repeated?: true;
+    /** As `FxTurnResult.endedBySteer`. */
+    endedBySteer?: string;
   }
   | { type: "idle"; requestId: string }
 ) & {
