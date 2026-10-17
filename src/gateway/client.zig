@@ -813,15 +813,23 @@ fn traceReusedConnectionFailure(
     evidence: StaleConnectionEvidence,
     idle_closed: usize,
 ) void {
-    debug_trace.eventf("gateway", event, trace_ctx, "attempt={d} stage={s} err={s} socket_err={s} received_bytes={d} elapsed_ms={d} idle_closed={d}", .{
-        attempt + 1,
-        @tagName(evidence.stage),
-        @errorName(evidence.transport_error),
-        if (evidence.socket_error) |cause| @errorName(cause) else "none",
-        evidence.received_bytes,
-        evidence.elapsed_ms,
-        idle_closed,
-    });
+    const socket_err = if (evidence.socket_error) |cause| @errorName(cause) else "none";
+    switch (evidence.stage) {
+        .send => debug_trace.eventf("gateway", event, trace_ctx, "attempt={d} stage=send err={s} socket_err={s} idle_closed={d}", .{
+            attempt + 1,
+            @errorName(evidence.transport_error),
+            socket_err,
+            idle_closed,
+        }),
+        .head => debug_trace.eventf("gateway", event, trace_ctx, "attempt={d} stage=head err={s} socket_err={s} received_bytes={d} elapsed_ms={d} idle_closed={d}", .{
+            attempt + 1,
+            @errorName(evidence.transport_error),
+            socket_err,
+            evidence.received_bytes,
+            evidence.elapsed_ms,
+            idle_closed,
+        }),
+    }
 }
 
 const StaleConnectionStage = enum { send, head };
@@ -1837,8 +1845,10 @@ fn streamGatewayCompletionCoreWithOptions(
                 .transport_error = err,
                 .reported_error = mapped,
                 .socket_error = conn.stream_reader.err,
-                // TLS keeps an incomplete record undecrypted in the socket buffer.
-                .received_bytes = req.reader.in.buffered().len + conn.stream_reader.interface.buffered().len,
+                // TLS keeps an incomplete record undecrypted in the socket
+                // buffer. Plain HTTP reads the socket buffer directly.
+                .received_bytes = req.reader.in.buffered().len +
+                    if (conn.protocol == .tls) conn.stream_reader.interface.buffered().len else 0,
                 .elapsed_ms = sent_at.durationTo(std.Io.Clock.Timestamp.now(io_mod.getIo(), .boot)).raw.toMilliseconds(),
             };
             if (!stale_retry_used and isStaleConnectionFailure(evidence)) {
@@ -6886,6 +6896,7 @@ const LoopbackGatewayMode = enum {
     keep_alive_close_after_response,
     keep_alive_truncated_head_on_reuse,
     keep_alive_head_stall_on_reuse,
+    keep_alive_partial_head_reset_on_reuse,
     reset_mid_request,
     reset_after_head_read,
     slow_terminal_chunk,
@@ -7245,6 +7256,28 @@ const LoopbackGatewayFixture = struct {
                 _ = self.requests_served.fetchAdd(1, .seq_cst);
                 var resent = (try self.acceptUnexpected(zio)) orelse return;
                 resent.close(zio);
+            },
+            .keep_alive_partial_head_reset_on_reuse => {
+                self.markStage();
+                var socket_buffer: [4096]u8 = undefined;
+                var reader = stream.reader(zio, &socket_buffer);
+                try readKeepAliveRequest(&reader.interface);
+                _ = self.requests_served.fetchAdd(1, .seq_cst);
+                try writeKeepAliveResponse(zio, stream);
+                // Start answering the next request on the pooled connection,
+                // give the client time to read those bytes, then reset it.
+                try readKeepAliveRequest(&reader.interface);
+                _ = self.requests_served.fetchAdd(1, .seq_cst);
+                try writeLoopbackGatewayBytes(zio, stream, "HTTP/1.1 200 OK\r\n");
+                sleepBlocking(300);
+                const rst: std.posix.linger = .{ .onoff = 1, .linger = 0 };
+                try std.posix.setsockopt(
+                    stream.socket.handle,
+                    std.posix.SOL.SOCKET,
+                    std.posix.SO.LINGER,
+                    std.mem.asBytes(&rst),
+                );
+                // Returning closes the connection, which now sends a reset.
             },
             .reset_mid_request => {
                 // Read one byte, then RST: the client fails mid-send or at
@@ -7836,6 +7869,53 @@ test "a deadline on a reused connection ends the request without a resend" {
     try std.testing.expectEqual(@as(usize, 1), harness.fixture.accepted_count.load(.seq_cst));
     try std.testing.expectEqual(@as(usize, 2), harness.fixture.requests_served.load(.seq_cst));
     try std.testing.expect(elapsed_ms < 1_000);
+}
+
+test "a pooled connection reset after the response starts is reported, not resent" {
+    var harness = try ConnectionSetupHarness.init(.keep_alive_partial_head_reset_on_reuse, false);
+    defer harness.deinit();
+    try harness.start();
+
+    var pool = http_pool.HttpPool.init(std.testing.allocator);
+    defer _ = pool.deinit();
+
+    var first = try pooledLoopbackCall(&pool, harness.url);
+    defer first.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("ok", first.completion.content.?);
+
+    // The socket reports a reset, as for a connection closed while idle, but
+    // the client had already read the start of the head. Only the received
+    // bytes tell the two apart. A resend would land on a connection nothing
+    // answers and run into the deadline instead of failing at once.
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var callback_ctx: u8 = 0;
+    const started = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+    const second = streamGatewayCompletionBounded(
+        std.testing.allocator,
+        .{
+            .api_key = "test-key",
+            .model = "test/model",
+            .retry_count = 1,
+            .chat_url = harness.url,
+            .payload = "{}",
+            .shared_pool = &pool,
+        },
+        @ptrCast(&callback_ctx),
+        discardConnectionSetupTestChunk,
+        null,
+        testAwakeDeadlineAfter(3_000),
+        &cancel_flag,
+    );
+    const elapsed_ms = started.durationTo(std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake)).raw.toMilliseconds();
+    if (second) |ok_result| {
+        var r = ok_result;
+        r.deinit(std.testing.allocator);
+        return error.TestExpectedResetFailure;
+    } else |err| try std.testing.expect(err != error.Timeout);
+    try std.testing.expect(elapsed_ms < 2_500);
+    harness.fixture.deinit();
+    if (harness.fixture.failure) |err| return err;
+    try std.testing.expectEqual(@as(usize, 2), harness.fixture.requests_served.load(.seq_cst));
 }
 
 test "a pooled connection that dies after the response starts is reported, not resent" {
