@@ -4640,6 +4640,7 @@ test {
     _ = provider_runtime;
     _ = @import("acp/prompt.zig");
     _ = @import("acp/libfx_hooks.zig");
+    _ = @import("acp/types.zig");
     _ = @import("core/mcp_host/model.zig");
     _ = @import("core/output/activity_status.zig");
     _ = @import("core/agent/agent_runtime.zig");

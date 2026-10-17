@@ -6607,12 +6607,10 @@ test "processQueuedPrompt cancellation during network backoff clears retry statu
 
 test "processQueuedPrompt drops provider option fast after three provider errors in a row" {
     const alloc = std.testing.allocator;
-    const completions = [_]FakeCompletion{
-        .{ .finish_reason = .provider_error },
-        .{ .finish_reason = .provider_error },
-        .{ .finish_reason = .provider_error },
-        .{ .content = "Recovered" },
-    };
+    // A bare `finish: error`, as `src/gateway/client.zig` reports it: no
+    // error event explained it.
+    const unexplained = unclearProviderError(.unexplained_error_finish, null);
+    const completions = [_]FakeCompletion{ unexplained, unexplained, unexplained, .{ .content = "Recovered" } };
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
     const overrides = [_]ModelCapabilityOverride{.{
@@ -6639,6 +6637,94 @@ test "processQueuedPrompt drops provider option fast after three provider errors
     try expectAnyModuleStatus(&hooks, .retrying, "Gateway error · retrying without Fast · attempt 4 · ");
     try expectRecovered(&hooks, 4);
     try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
+}
+
+const fast_body = "\"providerOptions\":{\"gateway\":{\"speed\":\"fast\",\"caching\":\"auto\"}}";
+const standard_body = "\"providerOptions\":{\"gateway\":{\"caching\":\"auto\"}}";
+
+/// Runs `completions` with Fast on for a model that supports it.
+fn runFastPrompt(gateway: *FakeGateway, hooks: *FakeAgentRuntimeDeps) !void {
+    const overrides = [_]ModelCapabilityOverride{.{
+        .model = "anthropic/claude-opus-4.6",
+        .capabilities = model_capabilities.resolveCapabilities("anthropic/claude-opus-4.6", .{ .supports_fast_mode = true }),
+    }};
+    hooks.capability_overrides = &overrides;
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.fast_mode = true;
+    try runFakePrompt(gateway, hooks, config, fixture.job());
+}
+
+test "processQueuedPrompt recovers without Fast before an unexplained error finish can stop it" {
+    const alloc = std.testing.allocator;
+    const unexplained = unclearProviderError(.unexplained_error_finish, null);
+    const completions = [_]FakeCompletion{ unexplained, unexplained, unexplained, .{ .content = "Recovered" } };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+
+    try runFastPrompt(&gateway, &hooks);
+
+    // Three sends with Fast fail; the module drops Fast, so fx does not stop
+    // the request, and the fourth send succeeds without Fast.
+    try std.testing.expectEqual(@as(usize, 4), gateway.request_models.items.len);
+    for (0..3) |index| try expectBodyContains(&gateway, index, fast_body);
+    try expectBodyContains(&gateway, 3, standard_body);
+    try expectRecovered(&hooks, 4);
+}
+
+test "processQueuedPrompt stops an endless unexplained error finish after its sends without Fast" {
+    const alloc = std.testing.allocator;
+    const unexplained = unclearProviderError(.unexplained_error_finish, null);
+    const completions = [_]FakeCompletion{
+        unexplained,                             unexplained, unexplained, unexplained, unexplained, unexplained,
+        .{ .content = "must not be requested" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+
+    try std.testing.expectError(error.ModelError, runFastPrompt(&gateway, &hooks));
+
+    // Three sends with Fast, then three without it, then the stop.
+    try std.testing.expectEqual(@as(usize, 6), gateway.request_models.items.len);
+    for (0..3) |index| try expectBodyContains(&gateway, index, fast_body);
+    for (3..6) |index| try expectBodyContains(&gateway, index, standard_body);
+    const statuses = hooks.route_recovery_statuses.items;
+    try expectRouteStatus(
+        &hooks,
+        statuses.len - 1,
+        .terminal_provider_error,
+        "⚠ Provider unavailable · provider_error · kept failing at the same point · stopped",
+    );
+}
+
+test "processQueuedPrompt lets a content filter finish decide over a non-retryable cause" {
+    // An earlier error event's code must not add a notice or keep the
+    // filtered partial: the content filter ends the turn exactly as before.
+    const alloc = std.testing.allocator;
+    const chunks = [_][]const u8{"filtered partial"};
+    const completions = [_]FakeCompletion{
+        .{ .chunks = &chunks, .content = "filtered partial", .finish_reason = .content_filter, .provider_failure_cause = .non_retryable, .provider_failure_detail = "invalid_request_error: bad input" },
+        .{ .content = "must not be requested" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try std.testing.expectError(
+        error.RouteRecoveryStopped,
+        runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job()),
+    );
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_models.items.len);
+    try std.testing.expectEqual(@as(usize, 0), hooks.system_notices.items.len);
+    try std.testing.expectEqual(@as(usize, 0), hooks.history_turns.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.route_recovery_statuses.items.len);
+    try std.testing.expectEqual(types.RouteRecoveryStatus.Kind.content_filter, hooks.route_recovery_statuses.items[0].kind);
 }
 
 test "processQueuedPrompt preserves fast mode after a streamed rate limit" {

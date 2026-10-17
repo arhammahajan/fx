@@ -10076,6 +10076,43 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   }, 20_000);
 
+  test("fx ask JSON reports only the last request's recovery", async () => {
+    const root = createFixtureRoot("stale-recovery");
+    const tracePath = join(root.root, "trace.log");
+    writeFileSync(join(root.workspace, "notes.txt"), "fixture notes\n");
+    let requestIndex = 0;
+    const gateway = startGateway(() => {
+      const index = requestIndex++;
+      // The first step recovers from a 503 and calls a tool; the second
+      // step's request fails with HTTP 400 on its first try.
+      if (index === 0) return unavailableResponse("1");
+      if (index === 1) return fakeGatewayToolCall("read_notes", "read_file", { path: "notes.txt" });
+      return new Response(JSON.stringify({ error: { message: "bad request body" } }), {
+        status: 400,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Read notes.txt, then answer."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+
+      expect(result.code).toBe(1);
+      expect(json.exit_code).toBe(1);
+      expect(gateway.requestCount()).toBe(3);
+      expect(json.recovery).toBeUndefined();
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 20_000);
+
   test("missing provider finish recovers across framing and content variants", async () => {
     const cases = [
       {

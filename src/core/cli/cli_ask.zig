@@ -1997,6 +1997,7 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .push_system_notice = pushSystemNotice,
         .push_context_notice = pushContextNotice,
         .push_route_recovery_status = pushRouteRecoveryStatus,
+        .begin_route_recovery_request = beginRouteRecoveryRequest,
         .push_command_output_complete = pushCommandOutputComplete,
         .push_http_error = pushHttpError,
         .refresh_gateway_credential = refreshGatewayCredential,
@@ -3219,6 +3220,15 @@ fn pushContextNotice(raw_ctx: *anyopaque, text: []const u8) !void {
     try pushSystemNotice(raw_ctx, text);
 }
 
+/// `--json` reports the last request's recovery, so a new request forgets
+/// the previous one's, such as an earlier step's `recovered`. The turn loop
+/// calls this before the request's ticker starts.
+fn beginRouteRecoveryRequest(raw_ctx: *anyopaque) void {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    ctx.last_recovery_status = null;
+    ctx.last_recovery_notice_kind = null;
+}
+
 fn pushRouteRecoveryStatus(raw_ctx: *anyopaque, status: types.RouteRecoveryStatus) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     ctx.last_recovery_status = status;
@@ -4189,6 +4199,20 @@ fn testProcessQueuedPromptRecoveryLifecycle(_: *agent_runtime.Agent, deps: *cons
 }
 
 const testRecoveryText = types.testRecoveryText;
+
+fn testProcessQueuedPromptRecoveredThenFailed(_: *agent_runtime.Agent, deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, _: agent_runtime.Config, _: worker_runtime.QueuedPrompt) !void {
+    try std.testing.expect(semantic_presentation == null);
+    const begin = deps.begin_route_recovery_request.?;
+    // The first step's request recovers from a 503.
+    begin(deps.ctx);
+    try deps.push_route_recovery_status(deps.ctx, .{ .kind = .waiting, .text = testRecoveryText("Gateway error · next try in 1s · attempt 1 · 0s"), .attempt = 1 });
+    try deps.push_event(deps.ctx, .clear_route_recovery_status);
+    try deps.push_route_recovery_status(deps.ctx, .{ .kind = .recovered, .attempt = 2 });
+    // The second step's request fails with HTTP 400 on its first try.
+    begin(deps.ctx);
+    try deps.push_http_error(deps.ctx, .bad_request, "bad request body", null);
+    return error.ModelError;
+}
 
 fn testProcessQueuedPromptRetryAdmissionFailure(_: *agent_runtime.Agent, deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, _: agent_runtime.Config, _: worker_runtime.QueuedPrompt) !void {
     try std.testing.expect(semantic_presentation == null);
@@ -8264,6 +8288,27 @@ test "fx ask JSON recovery keeps stdout structured and reports progress on stder
         "[notice] Offline · next try in 2s · 0s\n[notice] Offline · retrying · attempt 2 · 2s\n",
         stderr_capture.bytes.items,
     );
+}
+
+test "fx ask JSON reports only the last request's recovery" {
+    const alloc = std.testing.allocator;
+    var stdout_capture: TestCapture = .{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture: TestCapture = .{};
+    defer stderr_capture.deinit(alloc);
+    const deps = testPromptRunDepsWithProcess(
+        &stdout_capture,
+        &stderr_capture,
+        testProcessQueuedPromptRecoveredThenFailed,
+    );
+
+    const exit_code = try runWithDeps(alloc, &.{ "--json", "hello" }, testConfig(), deps);
+    try std.testing.expectEqual(@as(u8, 1), exit_code);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, stdout_capture.bytes.items, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("exit_code").?.integer);
+    // An earlier step's `recovered` does not describe the request that failed.
+    try std.testing.expect(parsed.value.object.get("recovery") == null);
 }
 
 test "fx ask JSON reports the consumed attempt after retry admission failure" {

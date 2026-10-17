@@ -543,7 +543,7 @@ pub const RouteRecoveryStatus = struct {
         interrupted,
     };
 
-    pub fn reportedState(self: RouteRecoveryStatus) ReportedState {
+    fn reportedState(self: RouteRecoveryStatus) ReportedState {
         return switch (self.kind) {
             .waiting => .waiting,
             .retrying => .retrying,
