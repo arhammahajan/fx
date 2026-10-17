@@ -35,6 +35,8 @@ const PARTIAL_CHUNKS = [
 ];
 const VISIBLE_PARTIAL_CHUNKS = PARTIAL_CHUNKS.slice(0, 2);
 const FOLLOW_UP_RESPONSE = "INTERRUPT_FOLLOW_UP_COMPLETE";
+/** What libfx's engine tells the model when it continues a crashed turn (DUR-42). */
+const CRASH_RESUME_NOTICE = "Resuming from unexpected session interruption.";
 const FOLLOW_UP_MODEL = "google/gemini-3.1-flash-lite";
 
 type GatewayHandle = ReturnType<typeof startFakeGateway>;
@@ -1104,9 +1106,11 @@ while :; do sleep 1; done
       await session.waitForComposer(TIMEOUT);
       await waitForCondition(() => continued.started, "the continued turn's request");
       expect(continueGateway.requests).toHaveLength(1);
-      // The prompt, then fx's note that the response was interrupted.
+      // The prompt, what libfx's engine tells the model after a crash
+      // (DUR-42), then fx's note that the response was interrupted.
       const resent = userTexts(continueGateway.requests[0]!.body);
       expect(resent).toContain(prompt);
+      expect(resent).toContain(CRASH_RESUME_NOTICE);
       expect(resent.at(-1)).toContain("The previous response was interrupted");
       const continuedScrollback = (await session.captureFullScrollback()).replaceAll(/\s+/g, " ");
       expect(continuedScrollback).toContain("fx quit unexpectedly before this response finished. Continuing it now.");
@@ -1270,6 +1274,7 @@ echo end >> ledger.txt
         expect(resumeGateway.requests).toHaveLength(1);
         const sent = userTexts(resumeGateway.requests[0]!.body);
         expect(sent).toContain(prompt);
+        expect(sent).toContain(CRASH_RESUME_NOTICE);
         // The model hears the call may have run, and is told not to repeat it blindly.
         expect(sent.at(-1)).toContain("Reconcile the available tool evidence above before continuing");
         const scrollback = (await session.captureFullScrollback()).replaceAll(/\s+/g, " ");

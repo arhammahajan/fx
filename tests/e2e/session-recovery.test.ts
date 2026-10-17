@@ -1343,40 +1343,10 @@ describe("session recovery", () => {
   test("ask resume after a killed ask keeps the interrupted prompt before the new one (DUR-23)", async () => {
     const fixture = createFixture("fx-ask-killed-prompt-");
     const prompt = "Draft the quarterly summary.";
-    let started = false;
-    const encoder = new TextEncoder();
-    let hold: ReturnType<typeof setInterval> | undefined;
-    const held = () => new Response(new ReadableStream<Uint8Array>({
-      start(controller) {
-        started = true;
-        controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "text-delta", id: "partial", delta: "KILLED_ASK_PARTIAL " })}\n\n`));
-        hold = setInterval(() => {
-          try { controller.enqueue(encoder.encode(": hold\n\n")); } catch { clearInterval(hold); }
-        }, 50);
-      },
-      cancel() { clearInterval(hold); },
-    }), { headers: { "content-type": "text/event-stream" } });
-    const first = startFakeGateway([held]);
     const second = startFakeGateway([fakeGatewayFinalText("KILLED_ASK_CONTINUED")]);
     try {
-      const env: Record<string, string> = {};
-      for (const [key, value] of Object.entries({ ...process.env, ...gatewayEnv(fixture, first) })) {
-        if (value !== undefined) env[key] = value;
-      }
-      env.NO_COLOR = "1";
-      env.FX_SOUND = "0";
-      const ask = Bun.spawn([FX_BIN, "ask", "--json", "--auto", prompt], {
-        cwd: fixture.workspace, env, stdin: "ignore", stdout: "ignore", stderr: "ignore",
-      });
+      const sessionId = await killAskMidReply(fixture, prompt);
       const sessions = join(fixture.home, ".fx", "sessions");
-      const checkpointed = () => started && existsSync(sessions) &&
-        readdirSync(sessions).some((id) => existsSync(join(sessions, id, "recovery.json")));
-      const deadline = Date.now() + TIMEOUT;
-      while (!checkpointed() && Date.now() < deadline) await Bun.sleep(50);
-      expect(checkpointed()).toBe(true);
-      ask.kill(9);
-      await ask.exited;
-      const sessionId = readdirSync(sessions).find((id) => existsSync(join(sessions, id, "recovery.json")))!;
 
       const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", sessionId, "continue"], {
         cwd: fixture.workspace, env: gatewayEnv(fixture, second), timeoutMs: TIMEOUT,
@@ -1396,9 +1366,147 @@ describe("session recovery", () => {
       expect(existsSync(join(sessions, sessionId, "recovery.json"))).toBe(false);
       expect(readFileSync(join(sessions, sessionId, "events.jsonl"), "utf8")).toContain(prompt);
     } finally {
-      first.stop();
       second.stop();
       rmSync(fixture.root, { recursive: true, force: true });
     }
   }, TIMEOUT * 2);
+
+  test("ask --continue-recovery after a killed ask tells the model the turn is resuming (DUR-42)", async () => {
+    const fixture = createFixture("fx-ask-killed-recovery-");
+    const prompt = "Draft the release notes.";
+    const gateway = startFakeGateway([fakeGatewayFinalText("KILLED_ASK_RECOVERED")]);
+    try {
+      const sessionId = await killAskMidReply(fixture, prompt);
+      const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", sessionId, "--continue-recovery"], {
+        cwd: fixture.workspace, env: gatewayEnv(fixture, gateway), timeoutMs: TIMEOUT,
+      });
+      expect(resumed.code).toBe(0);
+      expect(JSON.parse(resumed.stdout).output).toBe("KILLED_ASK_RECOVERED");
+      expect(gateway.requests).toHaveLength(1);
+      const users = userTexts(gateway.requests[0]!.body);
+      // The interrupted prompt, then what libfx's engine tells the model.
+      expect(users[0]).toBe(prompt);
+      expect(users.indexOf(CRASH_RESUME_NOTICE)).toBeGreaterThan(0);
+    } finally {
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  }, TIMEOUT * 2);
+
+  test.skipIf(!tmuxAvailable())("fx -c after a killed ask continues its turn once and tells the model it is resuming (DUR-87, DUR-42)", async () => {
+    const fixture = createFixture("fx-ask-killed-continue-");
+    const prompt = "Summarize the open issues.";
+    const continueDir = join(fixture.home, ".fx", "continue");
+    const bookmark = join(continueDir, createHash("sha256").update(fixture.workspace).digest("hex"));
+    let continuing = false;
+    const continueGateway = startFakeGateway([() => heldReply("CONTINUED_PARTIAL ", () => { continuing = true; })]);
+    const askGateway = startFakeGateway([fakeGatewayFinalText("MUST_NOT_RUN")]);
+    let tui: TmuxSession | null = null;
+    const open = (gateway: ReturnType<typeof startFakeGateway>, label: string) => TmuxSession.create({
+      cmd: `${FX_BIN} -c`, cwd: fixture.workspace, env: gatewayEnv(fixture, gateway),
+      stderrPath: join(fixture.root, `${label}.stderr`), isolated: true, remainOnExit: true,
+    });
+    try {
+      const sessionId = await killAskMidReply(fixture, prompt);
+      // A one-shot ask never becomes the interactive selection.
+      expect(existsSync(bookmark)).toBe(false);
+
+      // fx -c reaches the turn the killed ask left and continues it with no
+      // user action, telling the model the process crashed.
+      tui = await open(continueGateway, "continue");
+      await tui.waitForText("fx quit unexpectedly before this response finished. Continuing it now.", TIMEOUT);
+      await until(() => continuing, "the continued turn's request");
+      expect(continueGateway.requests).toHaveLength(1);
+      const users = userTexts(continueGateway.requests[0]!.body);
+      expect(users[0]).toBe(prompt);
+      expect(users.indexOf(CRASH_RESUME_NOTICE)).toBeGreaterThan(0);
+      // The ask's session is the selection now, and nothing else is left
+      // for fx -c to find.
+      await until(() => existsSync(bookmark) && readFileSync(bookmark, "utf8") === `${sessionId}\n`, "the selection");
+      expect(readdirSync(continueDir)).toEqual([basename(bookmark)]);
+
+      // A crash while fx continues the turn: the next fx -c comes back to
+      // the same session and asks instead of looping (D4).
+      Bun.spawnSync(["kill", "-9", String(tui.processPid())]);
+      await tui.waitForPane(() => tui!.paneStatus().dead, TIMEOUT);
+      await tui.kill();
+      tui = await open(askGateway, "ask");
+      await tui.waitForText("fx quit unexpectedly again while continuing this response, so it was not restarted.", TIMEOUT);
+      await Bun.sleep(1_000);
+      expect(askGateway.requests).toHaveLength(0);
+      await tui.sendText("/quit");
+      await tui.waitForPane(() => tui!.paneStatus().dead, TIMEOUT);
+      expect(tui.paneStatus().status).toBe(0);
+      expect(readFileSync(join(fixture.root, "ask.stderr"), "utf8")).toBe("");
+    } finally {
+      await tui?.kill();
+      continueGateway.stop();
+      askGateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  }, TIMEOUT * 3);
 });
+
+/** What libfx's engine tells the model when it continues a crashed turn (DUR-42). */
+const CRASH_RESUME_NOTICE = "Resuming from unexpected session interruption.";
+
+/** A reply that streams `partial`, then holds until fx goes away. */
+function heldReply(partial: string, onStart: () => void): Response {
+  const encoder = new TextEncoder();
+  let hold: ReturnType<typeof setInterval> | undefined;
+  return new Response(new ReadableStream<Uint8Array>({
+    start(controller) {
+      onStart();
+      controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "text-delta", id: "partial", delta: partial })}\n\n`));
+      hold = setInterval(() => {
+        try { controller.enqueue(encoder.encode(": hold\n\n")); } catch { clearInterval(hold); }
+      }, 50);
+    },
+    cancel() { clearInterval(hold); },
+  }), { headers: { "content-type": "text/event-stream" } });
+}
+
+/** Runs `fx ask` on `prompt` and kills it with SIGKILL while the model is replying, once its turn is checkpointed. Returns the session ID. */
+async function killAskMidReply(fixture: ReturnType<typeof createFixture>, prompt: string): Promise<string> {
+  let started = false;
+  const gateway = startFakeGateway([() => heldReply("KILLED_ASK_PARTIAL ", () => { started = true; })]);
+  try {
+    const env: Record<string, string> = {};
+    for (const [key, value] of Object.entries({ ...process.env, ...gatewayEnv(fixture, gateway) })) {
+      if (value !== undefined) env[key] = value;
+    }
+    env.NO_COLOR = "1";
+    env.FX_SOUND = "0";
+    const ask = Bun.spawn([FX_BIN, "ask", "--json", "--auto", prompt], {
+      cwd: fixture.workspace, env, stdin: "ignore", stdout: "ignore", stderr: "ignore",
+    });
+    const sessions = join(fixture.home, ".fx", "sessions");
+    const checkpointed = () => started && existsSync(sessions) &&
+      readdirSync(sessions).some((id) => existsSync(join(sessions, id, "recovery.json")));
+    await until(checkpointed, "the ask's checkpoint");
+    ask.kill(9);
+    await ask.exited;
+    return readdirSync(sessions).find((id) => existsSync(join(sessions, id, "recovery.json")))!;
+  } finally {
+    gateway.stop();
+  }
+}
+
+async function until(predicate: () => boolean, description: string): Promise<void> {
+  const deadline = Date.now() + TIMEOUT;
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error(`Timed out waiting for ${description}.`);
+    await Bun.sleep(50);
+  }
+}
+
+/** The text of every user message in a captured model request body. */
+function userTexts(body: string): string[] {
+  return (JSON.parse(body).prompt as Array<{ role: string; content: unknown }>)
+    .filter((message) => message.role === "user")
+    .map((message) => typeof message.content === "string"
+      ? message.content
+      : (Array.isArray(message.content) ? message.content : [])
+        .map((part: { type?: string; text?: string }) => part?.type === "text" ? part.text ?? "" : "")
+        .join(""));
+}

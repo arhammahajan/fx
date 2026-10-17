@@ -133,6 +133,11 @@ pub const TurnAuthority = struct {
     }
 };
 
+/// What the model is told when a turn continues after the process that ran
+/// it crashed (DUR-42). libfx's engine and the CLI both add it through
+/// `RecoveryCheckpoint.resumed`.
+pub const crash_resume_notice = "Resuming from unexpected session interruption.";
+
 pub const RecoveryCheckpoint = struct {
     version: u8 = 2,
     disposition: enum { continuable, history_only } = .continuable,
@@ -160,6 +165,27 @@ pub const RecoveryCheckpoint = struct {
             .execution = self.execution,
             .terminal_reason = .failed,
         } };
+    }
+
+    /// An owned copy that continues after the steps the turn already took.
+    /// When `crashed`, the model is told the process crashed and the turn is
+    /// resuming (`crash_resume_notice`); then it sees `inputs`, texts the
+    /// turn accepted and never placed, in order.
+    pub fn resumed(self: RecoveryCheckpoint, alloc: Allocator, crashed: bool, inputs: []const []const u8) !RecoveryCheckpoint {
+        const old = self.execution.steering;
+        const notices: usize = @intFromBool(crashed);
+        const steering = try alloc.alloc(types.PersistedSteering, old.len + notices + inputs.len);
+        defer alloc.free(steering);
+        @memcpy(steering[0..old.len], old);
+        const after = self.execution.tool_steps.len;
+        if (crashed) steering[old.len] = .{ .text = @constCast(crash_resume_notice), .after_tool_step_count = after };
+        for (inputs, steering[old.len + notices ..]) |text, *entry| {
+            entry.* = .{ .text = @constCast(text), .after_tool_step_count = after };
+        }
+        // `dupe` copies the steering, so this view only borrows it.
+        var view = self;
+        view.execution.steering = steering;
+        return view.dupe(alloc);
     }
 
     pub fn deinit(self: *RecoveryCheckpoint, alloc: Allocator) void {
@@ -5769,6 +5795,56 @@ test "recovery checkpoint round trips while legacy state stays absent" {
     try std.testing.expectEqual(model_provider.ProviderId.gateway, legacy_state.preferences.provider);
     try std.testing.expect(!legacy_state.preferences.ultrafast_mode);
     try std.testing.expectEqual(@as(?RecoveryCheckpoint, null), legacy_state.recovery_checkpoint);
+}
+
+test "a resumed checkpoint tells the model after its steps that the crashed turn is resuming (DUR-42)" {
+    const alloc = std.testing.allocator;
+    var steps = [_]types.ToolExecutionStep{ .{}, .{} };
+    var steering = [_]types.PersistedSteering{.{ .text = @constCast("use file B"), .after_tool_step_count = 1 }};
+    const checkpoint = RecoveryCheckpoint{
+        .turn_id = 7,
+        .user = .{ .text = @constCast("fix the build") },
+        .assistant_source = @constCast(""),
+        .execution = .{ .tool_steps = &steps, .steering = &steering },
+        .cause = .network_interrupted,
+        .action = .retrying_request,
+        .authority = .{ .provider = .gateway, .model = @constCast("openai/gpt-test") },
+        .requested_fast_mode = false,
+        .fast_mode = false,
+        .max_provider_attempts = 10,
+        .consumed_provider_attempts = 3,
+    };
+    const Case = struct { crashed: bool, inputs: []const []const u8, expected: []const []const u8 };
+    const cases = [_]Case{
+        // The CLI after a crash: the notice follows the steps already taken.
+        .{ .crashed = true, .inputs = &.{}, .expected = &.{ "use file B", crash_resume_notice } },
+        // libfx after a crash, with inputs the turn accepted and never placed.
+        .{ .crashed = true, .inputs = &.{"and B2"}, .expected = &.{ "use file B", crash_resume_notice, "and B2" } },
+        // A turn that stopped on purpose, such as a libfx deadline yield.
+        .{ .crashed = false, .inputs = &.{"and B2"}, .expected = &.{ "use file B", "and B2" } },
+    };
+    for (cases) |case| {
+        var resumed = try checkpoint.resumed(alloc, case.crashed, case.inputs);
+        defer resumed.deinit(alloc);
+        try std.testing.expectEqual(case.expected.len, resumed.execution.steering.len);
+        for (case.expected, resumed.execution.steering, 0..) |text, item, index| {
+            try std.testing.expectEqualStrings(text, item.text);
+            const after: usize = if (index == 0) 1 else steps.len;
+            try std.testing.expectEqual(after, item.after_tool_step_count);
+        }
+        // The rest of the turn is unchanged, the attempt budget included.
+        try std.testing.expectEqual(@as(u64, 7), resumed.turn_id);
+        try std.testing.expectEqualStrings("fix the build", resumed.user.text);
+        try std.testing.expectEqual(steps.len, resumed.execution.tool_steps.len);
+        try std.testing.expectEqual(@as(usize, 3), resumed.consumed_provider_attempts);
+    }
+    try std.testing.expectEqual(@as(usize, 1), checkpoint.execution.steering.len);
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, struct {
+        fn run(failing: Allocator, source: RecoveryCheckpoint) !void {
+            var resumed = try source.resumed(failing, true, &.{"and B2"});
+            resumed.deinit(failing);
+        }
+    }.run, .{checkpoint});
 }
 
 test "recovery checkpoint accepts the exact composer byte limit" {

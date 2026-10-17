@@ -19,8 +19,6 @@ const Allocator = std.mem.Allocator;
 
 pub const Event = journal.Event;
 pub const max_load_bytes = journal.max_load_bytes;
-/// What the model is told when libfx continues a turn a crash left open.
-const resume_notice = "Resuming from unexpected session interruption.";
 
 /// A host's id for a turn, kept in place so copying a journal copies it.
 pub const TurnId = struct {
@@ -771,31 +769,23 @@ pub fn open(
 }
 
 /// An owned copy of `pending` ready to continue: unless the turn yielded,
-/// the model is told the session was interrupted; then it sees the inputs
-/// the turn accepted and never placed, and the attempt budget starts over,
-/// so repeated crashes never turn into a refusal to resume.
+/// the model is told the session was interrupted, as the CLI tells it after
+/// a crash (`RecoveryCheckpoint.resumed`); then it sees the inputs the turn
+/// accepted and never placed, and the attempt budget starts over, so
+/// repeated crashes never turn into a refusal to resume.
 pub fn resumeCheckpoint(
     alloc: Allocator,
     pending: session_codec.RecoveryCheckpoint,
     inputs: []const journal.PendingInput,
     yielded: bool,
 ) !session_codec.RecoveryCheckpoint {
-    var scratch = std.heap.ArenaAllocator.init(alloc);
-    defer scratch.deinit();
-    var view = pending;
-    const old = view.execution.steering;
-    const notices: usize = if (yielded) 0 else 1;
-    const steering = try scratch.allocator().alloc(types.PersistedSteering, old.len + notices + inputs.len);
-    @memcpy(steering[0..old.len], old);
-    const after = view.execution.tool_steps.len;
-    if (!yielded) steering[old.len] = .{ .text = @constCast(resume_notice), .after_tool_step_count = after };
-    for (inputs, steering[old.len + notices ..]) |input, *entry| {
-        entry.* = .{ .text = input.text, .after_tool_step_count = after };
-    }
-    view.execution.steering = steering;
-    view.consumed_provider_attempts = 0;
-    view.outstanding_reservation = false;
-    return view.dupe(alloc);
+    const texts = try alloc.alloc([]const u8, inputs.len);
+    defer alloc.free(texts);
+    for (inputs, texts) |input, *text| text.* = input.text;
+    var resumed = try pending.resumed(alloc, !yielded, texts);
+    resumed.consumed_provider_attempts = 0;
+    resumed.outstanding_reservation = false;
+    return resumed;
 }
 
 /// Forgets a response whose calls never reached the journal. After a

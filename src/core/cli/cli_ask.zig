@@ -1833,7 +1833,12 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         const writable = if (ctx.writable) |*value| value else return failPromptRunResult(error.RecoverySessionUnavailable);
         const checkpoint = writable.state.recovery_checkpoint orelse
             return failPromptRunResult(error.NoPendingRecovery);
-        recovery_checkpoint = try checkpoint.dupe(alloc);
+        // After the fx that ran the turn crashed, the model is told so, as
+        // libfx tells it when it continues a crashed turn (DUR-42).
+        recovery_checkpoint = if (writable.log.previous_owner_died)
+            try checkpoint.resumed(alloc, true, &.{})
+        else
+            try checkpoint.dupe(alloc);
         alloc.free(owned_prompt);
         owned_prompt = try alloc.dupe(u8, recovery_checkpoint.?.user.text);
         ctx.session.setConversationLanguageFromUserMessage(owned_prompt);
@@ -2060,6 +2065,10 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             recovery_checkpoint == null
     else
         false;
+    // Nothing but `fx -c` calls this turn again if a crash cuts it off
+    // (DUR-87). The record outlasts this ask only when it dies mid-turn.
+    const unfinished_ask_id = rememberUnfinishedAsk(&ctx);
+    defer if (unfinished_ask_id) |id| forgetUnfinishedAsk(&ctx, id);
     options.deps.process_queued_prompt(&ctx.session.agent, &deps, semantic_presentation, ctx.lifecycleContext(), .{
         .system_prompt = cfg.prompt_policy.system_prompt,
         .model_prompt_overlay = cfg.prompt_policy.modelPromptOverlay(ctx.model),
@@ -2129,6 +2138,32 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     var result = try takePromptRunResult(&ctx, alloc);
     finalizeFreshAuthSession(&ctx, &result);
     return result;
+}
+
+/// Records the turn about to run for `fx -c` in this workspace and returns
+/// an owned copy of its session ID, or null when nothing was recorded. A
+/// subagent child's session is not a workspace conversation, so it is never
+/// recorded.
+fn rememberUnfinishedAsk(ctx: *AskContext) ?[]u8 {
+    const store = ctx.store orelse return null;
+    const writable = ctx.writable orelse return null;
+    if (writable.external_prompt_origin == .persistent_child) return null;
+    const id = ctx.alloc.dupe(u8, writable.active_id) catch |err| {
+        debug_trace.logf("session", "event=unfinished_ask_record_failed id={s} err={s}", .{ writable.active_id, @errorName(err) });
+        return null;
+    };
+    store.rememberUnfinishedAsk(ctx.alloc, id) catch |err| {
+        debug_trace.logf("session", "event=unfinished_ask_record_failed id={s} err={s}", .{ id, @errorName(err) });
+        ctx.alloc.free(id);
+        return null;
+    };
+    return id;
+}
+
+/// Forgets the record `rememberUnfinishedAsk` wrote and frees `id`.
+fn forgetUnfinishedAsk(ctx: *AskContext, id: []u8) void {
+    defer ctx.alloc.free(id);
+    if (ctx.store) |store| store.forgetUnfinishedAsk(ctx.alloc, id);
 }
 
 /// Starts background title generation for a fresh saved session. The task runs

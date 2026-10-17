@@ -3287,6 +3287,8 @@ for (const sourceChange of ["removed", "changed", "saved snapshot missing", "sav
       }
       expect(parseFxJson(resumed).output).toContain("RECOVERY_IMAGE_COMPLETE");
       expect(gateway.chatRequests).toHaveLength(4);
+      // The first run exited on its own, so the model never hears of a crash (DUR-42).
+      expect(gateway.chatRequests.some((request) => request.body.includes("Resuming from unexpected session interruption."))).toBe(false);
       const parts = nativeFileParts(gateway.chatRequests[2]!.body);
       expect(parts).toHaveLength(1);
       expect(createHash("sha256").update(Buffer.from(parts[0]!.data.data, "base64")).digest("hex")).toBe(digest);

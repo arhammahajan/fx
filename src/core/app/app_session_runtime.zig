@@ -2149,21 +2149,24 @@ pub fn Runtime(comptime App: type) type {
             }
             var remembered: ?[]u8 = null;
             defer if (remembered) |id| app.alloc.free(id);
-            const resume_target: session_store.ResumeTarget = switch (target) {
-                // Nothing to load yet: the picker asks which session to open.
-                .pick => return openSessionPicker(app),
-                .last => .last,
-                .remembered => blk: {
-                    const store = app.session_persistence.store orelse return error.SessionStoreUnavailable;
-                    remembered = store.readRememberedSessionId(app.alloc) catch |err| switch (err) {
-                        error.OutOfMemory => return err,
-                        else => return error.RememberedSessionUnavailable,
-                    };
-                    break :blk .{ .id = remembered orelse return error.NoRememberedSession };
-                },
-                .id => |session_id| .{ .id = session_id },
+            const unfinished_ask = if (target == .remembered) try loadUnfinishedAskForWrite(app) else null;
+            var loaded = unfinished_ask orelse selected: {
+                const resume_target: session_store.ResumeTarget = switch (target) {
+                    // Nothing to load yet: the picker asks which session to open.
+                    .pick => return openSessionPicker(app),
+                    .last => .last,
+                    .remembered => blk: {
+                        const store = app.session_persistence.store orelse return error.SessionStoreUnavailable;
+                        remembered = store.readRememberedSessionId(app.alloc) catch |err| switch (err) {
+                            error.OutOfMemory => return err,
+                            else => return error.RememberedSessionUnavailable,
+                        };
+                        break :blk .{ .id = remembered orelse return error.NoRememberedSession };
+                    },
+                    .id => |session_id| .{ .id = session_id },
+                };
+                break :selected try loadResumeTargetForWrite(app, resume_target, .{});
             };
-            var loaded = try loadResumeTargetForWrite(app, resume_target, .{});
             var loaded_owned = true;
             errdefer if (loaded_owned) loaded.deinit(app.alloc);
 
@@ -2171,7 +2174,33 @@ pub fn Runtime(comptime App: type) type {
             try installResumedSession(app, &loaded, notice);
             errdefer closeWritableSession(app);
             try app.commitStartupResumeReplayAnchor();
-            if (target != .remembered and notice == .session) rememberSelectedSession(app);
+            // The ask's session is the selection now, so a later `fx -c` comes
+            // back to it, for example to ask after a second crash (D4).
+            if ((target != .remembered or unfinished_ask != null) and notice == .session) rememberSelectedSession(app);
+        }
+
+        /// The session of an `fx ask` turn that a crash left unfinished in
+        /// this workspace, opened for write, or null when there is none to
+        /// continue. Nothing but `fx -c` calls such a turn again (DUR-87), so
+        /// `fx -c` opens it before the interactive selection. A session still
+        /// in use belongs to a running ask, and a removed one has no turn.
+        fn loadUnfinishedAskForWrite(app: *App) !?session_store.LoadedWritableSession {
+            const store = app.session_persistence.store orelse return null;
+            const id = (store.readUnfinishedAskId(app.alloc) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => {
+                    debug_trace.logf("session", "event=unfinished_ask_skipped reason=unreadable err={s}", .{@errorName(err)});
+                    return null;
+                },
+            }) orelse return null;
+            defer app.alloc.free(id);
+            return loadResumeTargetForWrite(app, .{ .id = id }, .{}) catch |err| switch (err) {
+                error.SessionBusy, error.SessionNotFound => {
+                    debug_trace.logf("session", "event=unfinished_ask_skipped id={s} reason={s}", .{ id, @errorName(err) });
+                    return null;
+                },
+                else => return err,
+            };
         }
 
         fn resumeRequestedJsHostSession(app: *App) !void {
@@ -2630,7 +2659,7 @@ pub fn Runtime(comptime App: type) type {
                                     }
                                 }
                             }
-                            const queued = continuePausedRecovery(app) catch |err| switch (err) {
+                            const queued = continuePausedRecovery(app, decision == .continue_after_unclean_exit) catch |err| switch (err) {
                                 error.MissingApiKey => missing: {
                                     try app.writeDomainNotice(.{
                                         .topic = "recovery",
@@ -3148,12 +3177,20 @@ pub fn Runtime(comptime App: type) type {
             return try checkpoint.dupe(alloc);
         }
 
-        pub fn continuePausedRecovery(app: *App) !bool {
+        /// Queues the paused turn. After the fx that ran it crashed, the
+        /// model is told so, as libfx tells it when it continues a crashed
+        /// turn (DUR-42).
+        pub fn continuePausedRecovery(app: *App, after_crash: bool) !bool {
             var checkpoint = (try snapshotRecoveryCheckpoint(
                 app,
                 std.heap.c_allocator,
             )) orelse return false;
             defer checkpoint.deinit(std.heap.c_allocator);
+            if (after_crash) {
+                const resumed = try checkpoint.resumed(std.heap.c_allocator, true, &.{});
+                checkpoint.deinit(std.heap.c_allocator);
+                checkpoint = resumed;
+            }
 
             app.session.setConversationLanguageFromUserMessage(checkpoint.user.text);
             return app.queueRecoveryCheckpoint(&checkpoint);

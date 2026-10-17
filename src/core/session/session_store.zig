@@ -462,15 +462,27 @@ pub const Store = struct {
     /// Returns an owned ID, or null when this workspace has no remembered selection.
     /// Reading never creates profile state or enumerates sessions.
     pub fn readRememberedSessionId(self: Store, alloc: Allocator) !?[]u8 {
+        const name = self.rememberedSessionFilename();
+        return self.readContinueFile(alloc, &name);
+    }
+
+    /// Returns an owned ID: the session of an `fx ask` turn in this
+    /// workspace that started and never returned, or null. Only a crash
+    /// leaves one behind, and `fx -c` continues it (DUR-87).
+    pub fn readUnfinishedAskId(self: Store, alloc: Allocator) !?[]u8 {
+        const name = self.unfinishedAskFilename();
+        return self.readContinueFile(alloc, &name);
+    }
+
+    fn readContinueFile(self: Store, alloc: Allocator, name: []const u8) !?[]u8 {
         var directory = (try self.openRememberedDirectory(false)) orelse return null;
         defer directory.close();
-        const name = self.rememberedSessionFilename();
-        const path_stat = directory.dir.statFile(io_mod.getIo(), &name, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        const path_stat = directory.dir.statFile(io_mod.getIo(), name, .{ .follow_symlinks = false }) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return err,
         };
         if (path_stat.kind != .file) return error.InvalidRememberedSession;
-        var file = directory.dir.openFile(io_mod.getIo(), &name, .{
+        var file = directory.dir.openFile(io_mod.getIo(), name, .{
             .mode = .read_only,
             .allow_directory = false,
             .follow_symlinks = false,
@@ -495,21 +507,85 @@ pub const Store = struct {
     }
 
     /// Publishes one interactive selection. Conversation writes retain their own lock.
+    /// The selection comes after any `fx ask` turn a crash left unfinished, so
+    /// `fx -c` opens the selection from now on.
     pub fn rememberSessionId(self: Store, alloc: Allocator, session_id: []const u8) !void {
-        if (self.canonical_root.mode != .writable) return error.SessionStoreReadOnly;
-        try validateSessionId(session_id);
-        var directory = (try self.openRememberedDirectory(true)) orelse return error.SessionStoreUnavailable;
+        var directory = try self.openContinueDirectoryForWrite(session_id);
         defer directory.close();
         const name = self.rememberedSessionFilename();
+        try writeContinueFile(alloc, &directory, &name, session_id);
+        const unfinished = self.unfinishedAskFilename();
+        deleteContinueFile(&directory, &unfinished);
+    }
+
+    /// Records that an `fx ask` turn in `session_id` is running in this
+    /// workspace. The ask forgets it when the turn returns, so it outlasts
+    /// the ask only when the ask dies mid-turn.
+    pub fn rememberUnfinishedAsk(self: Store, alloc: Allocator, session_id: []const u8) !void {
+        var directory = try self.openContinueDirectoryForWrite(session_id);
+        defer directory.close();
+        const name = self.unfinishedAskFilename();
+        try writeContinueFile(alloc, &directory, &name, session_id);
+    }
+
+    /// Forgets the unfinished `fx ask` turn when the record still names
+    /// `session_id`; a record another ask wrote since stays. Advisory, like
+    /// the record: a failure is logged and leaves `fx -c` a session with
+    /// nothing to continue.
+    pub fn forgetUnfinishedAsk(self: Store, alloc: Allocator, session_id: []const u8) void {
+        const recorded = (self.readUnfinishedAskId(alloc) catch |err| {
+            debug_trace.logf("session", "event=unfinished_ask_forget_failed id={s} err={s}", .{ session_id, @errorName(err) });
+            return;
+        }) orelse return;
+        defer alloc.free(recorded);
+        if (!std.mem.eql(u8, recorded, session_id)) return;
+        var directory = (self.openRememberedDirectory(false) catch |err| {
+            debug_trace.logf("session", "event=unfinished_ask_forget_failed id={s} err={s}", .{ session_id, @errorName(err) });
+            return;
+        }) orelse return;
+        defer directory.close();
+        const name = self.unfinishedAskFilename();
+        deleteContinueFile(&directory, &name);
+    }
+
+    fn openContinueDirectoryForWrite(self: Store, session_id: []const u8) !io_mod.VerifiedDir {
+        if (self.canonical_root.mode != .writable) return error.SessionStoreReadOnly;
+        try validateSessionId(session_id);
+        return (try self.openRememberedDirectory(true)) orelse error.SessionStoreUnavailable;
+    }
+
+    fn writeContinueFile(alloc: Allocator, directory: *io_mod.VerifiedDir, name: []const u8, session_id: []const u8) !void {
         var buffer: [256]u8 = undefined;
         const bytes = try std.mem.print(&buffer, "{s}\n", .{session_id});
-        try io_mod.durableReplaceVerified(alloc, &directory, &name, bytes);
+        try io_mod.durableReplaceVerified(alloc, directory, name, bytes);
+    }
+
+    fn deleteContinueFile(directory: *io_mod.VerifiedDir, name: []const u8) void {
+        directory.dir.deleteFile(io_mod.getIo(), name) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => {
+                debug_trace.logf("session", "event=continue_record_delete_failed name={s} err={s}", .{ name, @errorName(err) });
+                return;
+            },
+        };
+        io_mod.syncVerifiedDir(directory.dir) catch |err| {
+            debug_trace.logf("session", "event=continue_record_delete_sync_failed name={s} err={s}", .{ name, @errorName(err) });
+        };
     }
 
     fn rememberedSessionFilename(self: Store) [64]u8 {
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(normalizeWorkspaceRoot(self.workspace_root), &digest, .{});
         return std.fmt.bytesToHex(digest, .lower);
+    }
+
+    const unfinished_ask_suffix = ".ask";
+
+    fn unfinishedAskFilename(self: Store) [64 + unfinished_ask_suffix.len]u8 {
+        var name: [64 + unfinished_ask_suffix.len]u8 = undefined;
+        name[0..64].* = self.rememberedSessionFilename();
+        name[64..].* = unfinished_ask_suffix.*;
+        return name;
     }
 
     fn openRememberedDirectory(self: Store, create: bool) !?io_mod.VerifiedDir {
@@ -9066,6 +9142,42 @@ test "remembered session selection is private per workspace and read-only lookup
         if (value) |id| alloc.free(id);
         return error.TestExpectedError;
     } else |_| {}
+}
+
+test "an unfinished ask names its workspace's session until its ask returns or a selection replaces it (DUR-87)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+    try std.testing.expect((try ctx.store.readUnfinishedAskId(alloc)) == null);
+    try ctx.store.rememberUnfinishedAsk(alloc, "ask-one");
+    // The record is not the interactive selection, and belongs to one workspace.
+    try std.testing.expect((try ctx.store.readRememberedSessionId(alloc)) == null);
+    var other = try Store.initReadOnlyFromHome(alloc, ctx.home, "/other-workspace");
+    defer other.deinit(alloc);
+    try std.testing.expect((try other.readUnfinishedAskId(alloc)) == null);
+    try std.testing.expectError(error.SessionStoreReadOnly, other.rememberUnfinishedAsk(alloc, "ask-other"));
+    try std.testing.expectError(error.InvalidSessionId, ctx.store.rememberUnfinishedAsk(alloc, "../escape"));
+
+    // An ask that returns forgets only its own record, not a later ask's.
+    try ctx.store.rememberUnfinishedAsk(alloc, "ask-two");
+    ctx.store.forgetUnfinishedAsk(alloc, "ask-one");
+    {
+        const recorded = (try ctx.store.readUnfinishedAskId(alloc)).?;
+        defer alloc.free(recorded);
+        try std.testing.expectEqualStrings("ask-two", recorded);
+    }
+    ctx.store.forgetUnfinishedAsk(alloc, "ask-two");
+    try std.testing.expect((try ctx.store.readUnfinishedAskId(alloc)) == null);
+
+    // A selection made after an ask crashed is what `fx -c` opens.
+    try ctx.store.rememberUnfinishedAsk(alloc, "ask-three");
+    try ctx.store.rememberSessionId(alloc, "selected");
+    try std.testing.expect((try ctx.store.readUnfinishedAskId(alloc)) == null);
+    const selected = (try ctx.store.readRememberedSessionId(alloc)).?;
+    defer alloc.free(selected);
+    try std.testing.expectEqualStrings("selected", selected);
 }
 
 test "remembered session reader retains an opened version across atomic replacement" {

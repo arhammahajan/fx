@@ -83,8 +83,11 @@ live session as a whole.
   comment).
 - **Resume by id, by `--resume last` and through the picker.** `--resume last`
   means the newest session of any host.
-- **`-c` returns to the session the interactive app last opened.** `fx ask`
-  and ACP runs never change it.
+- **`-c` returns to the session the interactive app last opened,** unless a
+  crash has since cut off an `fx ask` turn in the workspace. Then `-c`
+  continues that turn and returns to its session from then on (DUR-87;
+  `session_store.zig` `rememberUnfinishedAsk`). A finished `fx ask` and ACP
+  runs never change it.
 - **Portability.** Sessions are global and portable, and each tracks
   `workspace_root` (fx `AGENTS.md`, Configuration and State).
 - **Children.** Child sessions stay out of discovery and cannot be resumed
