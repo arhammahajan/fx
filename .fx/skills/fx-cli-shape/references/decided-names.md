@@ -9,7 +9,7 @@ Names the maintainers already settled. Reuse them; don't add another spelling. "
 | `fx -c`, `fx --continue` | The session you last worked in interactively | Keep |
 | `fx -r [last\|<id>]`, `fx --resume [last\|<id>]` | One flag in short and long form. With no value, the session picker, the same list as `/resume`. `last` opens the newest saved session, and an ID opens that one | Keep |
 | `fx session resume [last\|<id>]` | The newest saved session (also with no value), or an exact one | Keep |
-| `fx ask --resume <last\|id>` | Same, for one-shot runs | Keep |
+| `fx ask --resume <last\|<id>>` | Same, for one-shot runs | Keep |
 | `/resume` | Inside a session | Keep |
 | `fx --resume-last`, `fx --resume-<id>`, hidden `fx resume`, the `--id <id>` forms, `fx ask --resume-id`, `--resume --last` | Duplicates of the above | Removed. Each fails with exit 2 and names its replacement. `fx resume <id> --upgrade-relaunch` stays as the internal restart after an upgrade |
 
@@ -19,7 +19,7 @@ Names the maintainers already settled. Reuse them; don't add another spelling. "
 
 | Surface | Name |
 |---|---|
-| Setting | `permission_mode`: `ask`, `auto`, or `full-access` (legacy `yolo` is read, never written) |
+| Setting | `permission_mode`: `ask`, `auto`, or `full-access` (legacy `yolo` is read until fx 0.0.17, never written) |
 | Flag | `--permission-mode <mode>`, with aliases `--ask`, `--auto`, `--full-access`, `--yolo` |
 | Env var | `FX_PERMISSION_MODE` |
 | Slash command | `/permissions [ask\|auto\|full-access\|reset]` |
@@ -39,11 +39,11 @@ Names the maintainers already settled. Reuse them; don't add another spelling. "
 
 | Concept | Name |
 |---|---|
-| Settings command | `fx config list\|get\|set\|unset`; `--global`, `--workspace` (list and get), `--show-origin` |
+| Settings command | `fx config list\|get\|set\|unset\|schema`; `--global`, `--workspace` (list and get), `--show-origin` |
 | Generic per-run override | `fx ask --config key=value`, with the keys `fx config set` takes |
-| Sound | `sound.turn_end`, `sound.attention_required`, `sound.max` (the older `notifications.*` is still read); `/sound on\|off\|max` and `FX_SOUND` are presets for the group |
-| Status line | `status_line.*` (the older `statusLine` is still read) |
-| Experiments | `experimental.<name>`, for example `experimental.sessions_v2` |
+| Sound | `sound.turn_end`, `sound.attention_required`, `sound.max` (the older `notifications.*` is read until fx 0.0.17); `/sound on\|off\|max` and `FX_SOUND` are presets for the group |
+| Status line | `status_line.*` (the older `statusLine` is read until fx 0.0.17) |
+| Experiments | `experimental.<name>`, for example `experimental.sessions_v2`; `--sessions-v2` and `FX_SESSIONS_V2` warn until fx 0.0.17 |
 | Home | `FX_HOME` (default `~/.fx`) |
 | Test hooks | `FX_TEST_*` |
 | Release channel | `update_channel`; `fx upgrade --channel <name>` saves it, the way a setter command does |
@@ -55,7 +55,7 @@ Names the maintainers already settled. Reuse them; don't add another spelling. "
 | Concept | Name |
 |---|---|
 | Sign in, including pasting an AI Gateway key | `fx login [vercel\|codex\|grok]` |
-| Paste an AI Gateway API key | `fx login vercel --api-key`; in a session, `/login` offers sign-in or an API key. `fx setup` and `/setup` warn and are hidden from help |
+| Paste an AI Gateway API key | `fx login vercel --api-key`; in a session, `/login` offers sign-in or an API key. `fx setup` and `/setup` warn, stop working in fx 0.0.17, and are hidden from help |
 | Choose the active provider | `fx provider <name>`, `/provider` |
 
 ## Other
