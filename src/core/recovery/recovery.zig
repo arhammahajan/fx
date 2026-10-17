@@ -61,7 +61,8 @@ pub const Start = struct {
 
 pub const Failure = struct {
     kind: Kind,
-    /// The server's Retry-After, for `rate_limited`. Zero counts as absent.
+    /// The server's Retry-After, for `rate_limited` and `server`. Zero counts
+    /// as absent.
     retry_after_ms: ?u32 = null,
 
     pub const Kind = enum(u8) {
@@ -99,7 +100,6 @@ pub const Plan = struct {
 pub const Send = packed struct {
     compact_first: bool = false,
     no_fast: bool = false,
-    no_streaming: bool = false,
 };
 
 pub const Finish = enum { succeeded, cancelled };
@@ -178,17 +178,16 @@ const Phase = enum(u8) { idle = 0, sending = 1, waiting = 2, need_user = 3 };
 const Flags = packed struct(u8) {
     clean_exit: bool = false,
     no_fast: bool = false,
-    no_streaming: bool = false,
     compacted: bool = false,
-    unused: u4 = 0,
+    unused: u5 = 0,
 };
 
 const RetryLabel = enum { after_failure, compacting, resuming, after_sign_in, after_user };
 
 // Policy.
 
-/// Waits after dropped, server, and unhinted rate-limit failures. The last
-/// value repeats for every later wait.
+/// Waits after dropped, server, and rate-limit failures without a
+/// Retry-After hint. The last value repeats for every later wait.
 const backoff_ms = [_]u32{ 1_000, 2_000, 4_000, 8_000, 16_000, 30_000 };
 /// Waits while offline. Retrying costs nothing then: a failed connect sends
 /// nothing billable.
@@ -331,7 +330,6 @@ fn sendNow(state: *State, now_ms: u64, extra: Send) Plan {
     const send: Send = .{
         .compact_first = extra.compact_first,
         .no_fast = state.flags.no_fast,
-        .no_streaming = state.flags.no_streaming,
     };
     return .{
         .save = encode(state, now_ms),
@@ -368,10 +366,13 @@ fn transientDelay(state: *State, failure: Failure) u32 {
     state.offline_step = 0;
     noteStreak(state, failure.kind);
     escalate(state, failure.kind);
-    if (failure.kind == .rate_limited) {
-        if (failure.retry_after_ms) |hint| {
-            if (hint > 0) return hint;
-        }
+    // The server's hint replaces the backoff. A rate limit waits exactly as
+    // long as asked; a server error never waits past the ceiling.
+    if (failure.retry_after_ms) |hint| {
+        if (hint > 0) return switch (failure.kind) {
+            .rate_limited => hint,
+            else => @min(hint, backoff_ms[backoff_ms.len - 1]),
+        };
     }
     const base = backoff_ms[@min(state.backoff_step, backoff_ms.len - 1)];
     state.backoff_step +|= 1;
@@ -411,11 +412,10 @@ fn noteStreak(state: *State, kind: Failure.Kind) void {
 fn escalate(state: *State, kind: Failure.Kind) void {
     if (state.streak < escalate_after) return;
     switch (kind) {
-        .dropped => state.flags.no_streaming = true,
         .server => if (state.fast) {
             state.flags.no_fast = true;
         },
-        .offline, .rate_limited, .too_long, .rejected, .sign_in, .quota, .content_filter => {},
+        .offline, .dropped, .rate_limited, .too_long, .rejected, .sign_in, .quota, .content_filter => {},
     }
 }
 
@@ -447,7 +447,7 @@ fn reasonText(state: *const State) []const u8 {
     const cause = state.cause orelse return "Retrying";
     return switch (cause) {
         .offline => "Offline",
-        .dropped => if (state.flags.no_streaming) "Connection keeps dropping" else "Connection lost",
+        .dropped => "Connection lost",
         .server => "Gateway error",
         .rate_limited => "Rate limited",
         .too_long => "Conversation too long",
@@ -475,9 +475,7 @@ fn retryingStatus(state: *const State, now_ms: u64) Status {
         .resuming => textOf("Resuming the interrupted request · attempt {d}", .{state.attempt}),
         .after_sign_in => textOf("Signed in · retrying · attempt {d} · {s}", .{ state.attempt, elapsed.slice() }),
         .after_user => textOf("Retrying · attempt {d} · {s}", .{ state.attempt, elapsed.slice() }),
-        .after_failure => if (state.cause == .dropped and state.flags.no_streaming)
-            textOf("Connection keeps dropping · retrying without streaming · attempt {d} · {s}", .{ state.attempt, elapsed.slice() })
-        else if (state.cause == .server and state.flags.no_fast)
+        .after_failure => if (state.cause == .server and state.flags.no_fast)
             textOf("Gateway error · retrying without Fast · attempt {d} · {s}", .{ state.attempt, elapsed.slice() })
         else
             textOf("{s} · retrying · attempt {d} · {s}", .{ reasonText(state), state.attempt, elapsed.slice() }),
@@ -575,7 +573,7 @@ fn refresh(state: *State, status: Status) Plan {
 //
 //  0      version
 //  1      phase (1 sending, 2 waiting, 3 need_user)
-//  2      flags: clean exit, Fast dropped, streaming dropped, compacted
+//  2      flags: clean exit, Fast dropped, compacted
 //  3      need (0 none)
 //  4..5   attempt, little endian
 //  6      streak
@@ -794,19 +792,29 @@ test "offline retries every few seconds and never escalates" {
     try testing.expectEqual(@as(u8, 0), state.streak);
 }
 
-test "three drops in a row switch to a non-streaming request" {
+test "repeated drops keep retrying the same way" {
     var state: State = .{};
-    _ = startNew(&state, 0, false);
+    _ = startNew(&state, 0, true);
     var now_ms: u64 = 0;
     var last: Plan = .{};
-    for (0..3) |_| {
+    for (0..5) |_| {
         _ = fail(&state, .dropped, now_ms);
         const retry = tickUntilSend(&state, now_ms);
         last = retry.plan;
         now_ms = retry.at_ms;
     }
-    try testing.expectEqual(Send{ .no_streaming = true }, last.send.?);
-    try testing.expect(startsWith(last.status.?.text.slice(), "Connection keeps dropping · retrying without streaming · attempt 4"));
+    try testing.expectEqual(Send{}, last.send.?);
+    try testing.expect(startsWith(last.status.?.text.slice(), "Connection lost · retrying · attempt 6"));
+}
+
+test "a server's Retry-After sets the wait, capped at the ceiling" {
+    var state: State = .{};
+    _ = startNew(&state, 0, false);
+    _ = step(&state, .{ .failed = .{ .kind = .server, .retry_after_ms = 3_000 } }, 1_000);
+    try testing.expectEqual(@as(u64, 4_000), state.wait_until_ms);
+    _ = tickUntilSend(&state, 1_000);
+    _ = step(&state, .{ .failed = .{ .kind = .server, .retry_after_ms = 600_000 } }, 10_000);
+    try testing.expectEqual(@as(u64, 40_000), state.wait_until_ms);
 }
 
 test "three gateway errors drop Fast only when Fast is on" {
@@ -1028,8 +1036,8 @@ test "every status fits, and every short form fits 46 columns" {
     var state: State = .{
         .phase = .waiting,
         .attempt = std.math.maxInt(u16),
-        .cause = .dropped,
-        .flags = .{ .no_streaming = true },
+        .cause = .server,
+        .flags = .{ .no_fast = true },
         .carried_ms = std.math.maxInt(u32),
         .wait_until_ms = std.math.maxInt(u64),
     };

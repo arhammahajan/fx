@@ -38,7 +38,6 @@ const runtime_config = @import("../config.zig");
 const runtime_deps = @import("../deps.zig");
 const runtime_lifecycle = @import("../lifecycle.zig");
 const runtime_agent = @import("../agent.zig");
-const model_response_recovery = @import("../model_response_recovery.zig");
 const runtime_orchestrator = @import("../orchestrator.zig");
 const runtime_tool_contracts = @import("../tool_contracts.zig");
 
@@ -209,7 +208,6 @@ pub const FakeCompletion = struct {
     usage: types.Usage = .{},
     generation_id: ?[]const u8 = null,
     delivery_ambiguous: bool = false,
-    pause_before_output: bool = false,
     cancel_before_output: bool = false,
     cancel_after_chunks: bool = false,
     cancel_during_tool_stream: bool = false,
@@ -246,7 +244,6 @@ pub const FakeGateway = struct {
     request_api_keys: std.ArrayList([]u8) = .empty,
     request_session_ids: std.ArrayList(?[]u8) = .empty,
     admitted_requests: usize = 0,
-    recovery_pause_flag: ?*std.atomic.Value(bool) = null,
     observe_request: ?*const fn (agent_stream_provider.ModelRequest) anyerror!void = null,
     /// A continued tail means history projection ended on an assistant
     /// message. Only tests of that repair may accept it.
@@ -310,11 +307,6 @@ pub const FakeGateway = struct {
             return err;
         }
 
-        if (completion.pause_before_output) {
-            if (self.recovery_pause_flag) |flag| flag.store(true, .seq_cst);
-            request.cancel_flag.store(true, .seq_cst);
-            return error.Cancelled;
-        }
         if (completion.cancel_before_output) {
             request.cancel_flag.store(true, .seq_cst);
             return .{ .completed = .{} };
@@ -381,26 +373,30 @@ pub const FakeGateway = struct {
         request: agent_stream_provider.ModelRequest,
         err: anyerror,
     ) void {
+        // Mirrors `networkFailureEvidence` in src/gateway/client.zig: a path
+        // that is down is `connectivity_lost`, a broken connection is
+        // `transport_interrupted`.
         const cause: agent_stream_provider.NetworkFailureCause = if (err == error.SystemResumed)
             .system_resumed
-        else if (err == error.TlsInitializationFailed or
-            err == error.ConnectionSetupTimedOut or
-            err == error.UnknownHostName or
+        else if (err == error.UnknownHostName or
             err == error.NameServerFailure or
             err == error.NoAddressReturned or
             err == error.DetectingNetworkConfigurationFailed or
             err == error.AddressUnavailable or
-            err == error.ConnectionPending or
             err == error.ConnectionRefused or
+            err == error.ConnectionTimedOut or
             err == error.HostUnreachable or
             err == error.NetworkUnreachable or
-            err == error.NetworkDown or
+            err == error.NetworkDown)
+            .connectivity_lost
+        else if (err == error.TlsInitializationFailed or
+            err == error.ConnectionSetupTimedOut or
+            err == error.ConnectionPending or
             err == error.WouldBlock or
             err == error.WriteFailed or
             err == error.ReadFailed or
             err == error.HttpConnectionClosing or
             err == error.ConnectionResetByPeer or
-            err == error.ConnectionTimedOut or
             err == error.Timeout)
             .transport_interrupted
         else
@@ -689,9 +685,6 @@ pub const FakeAgentRuntimeDeps = struct {
     recovery_checkpoint_calls: usize = 0,
     recovery_checkpoint_clears: usize = 0,
     cancel_on_recovery_reservation: ?*std.atomic.Value(bool) = null,
-    pause_on_auto_retry_status: bool = false,
-    pause_on_auto_retry_attempt: ?usize = null,
-    recovery_pause_flag: ?*std.atomic.Value(bool) = null,
     route_recovery_status_error_attempt: ?usize = null,
     steering_messages: []const []const u8 = &.{},
     steering_take_at: usize = 1,
@@ -1841,32 +1834,25 @@ pub const FakeAgentRuntimeDeps = struct {
 
     fn routeRecoveryStatus(raw: *anyopaque, status: types.RouteRecoveryStatus) !void {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
-        if (status.kind == .auto_retry and
-            status.retry_deadline == null and
-            self.route_recovery_status_error_attempt == status.failed_attempt)
+        // Fails publishing the retrying status of one resend.
+        if (status.kind == .retrying and
+            self.route_recovery_status_error_attempt == status.attempt)
         {
             return error.TestRouteRecoveryPublicationFailed;
         }
         try self.route_recovery_statuses.append(self.alloc, status);
-        if (status.kind == .auto_retry and status.retry_deadline != null) {
+        // Presses Esc while the request waits after the matching attempt.
+        if (status.kind == .waiting) {
             if (self.cancel_on_auto_retry_status) |flag| {
                 if (self.cancel_on_auto_retry_attempt == null or
-                    self.cancel_on_auto_retry_attempt.? == status.failed_attempt)
+                    self.cancel_on_auto_retry_attempt.? == status.attempt)
                 {
                     flag.store(true, .seq_cst);
                 }
             }
         }
-        if (self.pause_on_auto_retry_status and
-            status.kind == .auto_retry and
-            status.retry_deadline != null and
-            (self.pause_on_auto_retry_attempt == null or
-                self.pause_on_auto_retry_attempt.? == status.failed_attempt))
-        {
-            if (self.recovery_pause_flag) |flag| flag.store(true, .seq_cst);
-        }
         var label_buf: [types.RouteRecoveryStatus.label_max_bytes]u8 = undefined;
-        try self.record("route_recovery_status:{s}", .{status.label(&label_buf)});
+        try self.record("route_recovery_status:{s}:{s}", .{ @tagName(status.kind), status.label(&label_buf) });
     }
 
     fn commandOutputComplete(raw: *anyopaque, lifecycle_id: ?types.ToolLifecycleId) !void {
@@ -1917,7 +1903,6 @@ pub const PromptFixture = struct {
         return .{
             .system_prompt = "system",
             .gateway_retry_count = 1,
-            .max_provider_attempts = model_response_recovery.default_max_provider_attempts,
             .gateway_chat_url = "https://example.invalid",
             .agent_step_limit = 8,
             .cancel_flag = &self.cancel_flag,
