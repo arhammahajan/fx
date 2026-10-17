@@ -1397,7 +1397,8 @@ test.skipIf(!tmuxAvailable())(forkTest, async () => {
     expect((await forkMenuRows(app.session)).map((row) => row.selected)).toEqual([false, true, false]);
     await app.session.sendKeys("Enter");
 
-    expect(await scrollbackContains(app.session, `original session fx --sessions-v2 --resume ${source}`)).toContain("* session forked: Fork source (fork)");
+    // experimental.sessions_v2 turns v2 on here, so the command needs no flag.
+    expect(await scrollbackContains(app.session, `original session fx --resume ${source}`)).toContain("* session forked: Fork source (fork)");
     await app.session.waitForPane((pane) => composerContains(pane, "Fork prompt two.") && !pane.includes("enter fork"), TIMEOUT);
     const ids = savedSessions(fixture);
     expect(ids.length).toBe(2);
@@ -1448,7 +1449,7 @@ test.skipIf(!tmuxAvailable())(forkWithoutV2Test, async () => {
     });
     await session.waitForComposer(TIMEOUT);
     await session.sendText("/fork");
-    await session.waitForText("! session: forking needs --sessions-v2", TIMEOUT);
+    await session.waitForText("! session: forking needs experimental.sessions_v2", TIMEOUT);
     expect(await session.capturePane()).not.toContain("enter fork");
     await session.sendText("/quit");
     expect(await session.waitForSessionEnd()).toBe(true);

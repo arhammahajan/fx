@@ -2351,7 +2351,7 @@ pub fn Runtime(comptime App: type) type {
             const v2 = app.session_persistence.v2 orelse return app.writeDomainNotice(.{
                 .topic = "session",
                 .tone = .warning,
-                .body = "forking needs --sessions-v2",
+                .body = "forking needs experimental.sessions_v2: fx config set experimental.sessions_v2 true",
             }, true);
             if (app.stream.active) return app.writeDomainNotice(.{
                 .topic = "session",
@@ -4775,8 +4775,12 @@ pub fn Runtime(comptime App: type) type {
                         .body = display.title,
                     });
                     // A plain line, so the command copies as it is. Forks
-                    // exist only on v2, so the command always names it.
-                    const line = try app.alloc.print("original session fx --sessions-v2 --resume {s}\n", .{source_id});
+                    // exist only on v2, so the command names --sessions-v2
+                    // unless the experimental.sessions_v2 setting turns v2 on.
+                    const line = if (app.session_persistence.sessions_v2_setting)
+                        try app.alloc.print("original session fx --resume {s}\n", .{source_id})
+                    else
+                        try app.alloc.print("original session fx --sessions-v2 --resume {s}\n", .{source_id});
                     defer app.alloc.free(line);
                     try sink.appendRaw(line);
                 },
@@ -7624,7 +7628,7 @@ test "/fork needs v2, waits for the turn and a prompt, then opens on the newest 
         try Runtime(TestApp).initializePersistence(&app, true);
         try Runtime(TestApp).beginFreshPersistedSession(&app);
         try Runtime(TestApp).openForkMenu(&app);
-        try std.testing.expectEqualStrings("! session: forking needs --sessions-v2", app.notices.last().?);
+        try std.testing.expectEqualStrings("! session: forking needs experimental.sessions_v2: fx config set experimental.sessions_v2 true", app.notices.last().?);
         try std.testing.expect(!app.session_persistence.fork_menu.active());
     }
 
