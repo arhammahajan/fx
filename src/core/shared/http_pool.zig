@@ -160,7 +160,9 @@ pub const HttpPool = struct {
 
     /// Opens a request on the shared client with a current certificate
     /// clock, and reports whether it reuses an idle pooled connection, which
-    /// the server may have closed while it sat idle. The setup lock is held
+    /// the server may have closed while it sat idle. When none is idle, std
+    /// may still reuse one that another request released in between; that
+    /// counts as fresh, so its failures are reported. The setup lock is held
     /// shared through connection setup; the exclusive holder only stores a
     /// timestamp, so the wait is bounded.
     pub fn openRequest(

@@ -797,15 +797,30 @@ fn prepareFreshConnectionRetry(
     request_url: []const u8,
     trace_ctx: debug_trace.TraceContext,
     attempt: usize,
-    stage: StaleConnectionStage,
-    err: anyerror,
+    evidence: StaleConnectionEvidence,
 ) void {
     const closed = if (request.shared_pool) |pool| pool.closeIdleConnections(request_url) else 0;
-    debug_trace.eventf("gateway", "stale_connection_retry", trace_ctx, "attempt={d} stage={s} err={s} idle_closed={d}", .{
+    traceReusedConnectionFailure("stale_connection_retry", trace_ctx, attempt, evidence, closed);
+}
+
+/// Records what a failure on a reused connection looked like, whether it was
+/// resent or reported, so a "Network interrupted" report can be explained
+/// from the trace.
+fn traceReusedConnectionFailure(
+    event: []const u8,
+    trace_ctx: debug_trace.TraceContext,
+    attempt: usize,
+    evidence: StaleConnectionEvidence,
+    idle_closed: usize,
+) void {
+    debug_trace.eventf("gateway", event, trace_ctx, "attempt={d} stage={s} err={s} socket_err={s} received_bytes={d} elapsed_ms={d} idle_closed={d}", .{
         attempt + 1,
-        @tagName(stage),
-        @errorName(err),
-        closed,
+        @tagName(evidence.stage),
+        @errorName(evidence.transport_error),
+        if (evidence.socket_error) |cause| @errorName(cause) else "none",
+        evidence.received_bytes,
+        evidence.elapsed_ms,
+        idle_closed,
     });
 }
 
@@ -829,7 +844,7 @@ const StaleConnectionEvidence = struct {
     socket_error: ?anyerror = null,
     /// Response bytes already received, decoded or still undecrypted.
     received_bytes: usize = 0,
-    /// Time from the end of the send to the head failure.
+    /// Time from the end of the send to the head failure, including sleep.
     elapsed_ms: i64 = 0,
 };
 
@@ -1774,24 +1789,28 @@ fn streamGatewayCompletionCoreWithOptions(
                 system_resumed.load(.seq_cst),
                 err,
             );
-            if (!stale_retry_used and isStaleConnectionFailure(.{
+            const evidence: StaleConnectionEvidence = .{
                 .stage = .send,
                 .reused = reused_connection,
                 .transport_error = err,
                 .reported_error = reported,
                 .socket_error = req.connection.?.stream_writer.err,
-            })) {
+            };
+            if (!stale_retry_used and isStaleConnectionFailure(evidence)) {
                 stale_retry_used = true;
                 attempt_limit += 1;
                 delivery_ambiguous = true;
-                prepareFreshConnectionRetry(request, request_url, trace_ctx, attempt, .send, err);
+                prepareFreshConnectionRetry(request, request_url, trace_ctx, attempt, evidence);
                 continue;
             }
+            if (reused_connection) traceReusedConnectionFailure("reused_connection_failure", trace_ctx, attempt, evidence, 0);
             return @as(anyerror!StreamResult, reported);
         };
         debug_trace.eventf("gateway", "after_request_send", trace_ctx, "attempt={d} payload_bytes={d}", .{ attempt + 1, payload.len });
         debug_trace.eventf("gateway", "after_send", trace_ctx, "attempt={d} payload_bytes={d}", .{ attempt + 1, payload.len });
-        const sent_at = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+        // The boot clock keeps counting through sleep, so a laptop that slept
+        // after the send cannot make a late failure look like a quick one.
+        const sent_at = std.Io.Clock.Timestamp.now(io_mod.getIo(), .boot);
 
         if (active_connected_watch) |watch| {
             if (watch.arm_response_head()) |err| {
@@ -1812,7 +1831,7 @@ fn streamGatewayCompletionCoreWithOptions(
                 return @as(anyerror!StreamResult, mapped);
             }
             const conn = req.connection.?;
-            if (!stale_retry_used and isStaleConnectionFailure(.{
+            const evidence: StaleConnectionEvidence = .{
                 .stage = .head,
                 .reused = reused_connection,
                 .transport_error = err,
@@ -1820,14 +1839,16 @@ fn streamGatewayCompletionCoreWithOptions(
                 .socket_error = conn.stream_reader.err,
                 // TLS keeps an incomplete record undecrypted in the socket buffer.
                 .received_bytes = req.reader.in.buffered().len + conn.stream_reader.interface.buffered().len,
-                .elapsed_ms = sent_at.durationTo(std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake)).raw.toMilliseconds(),
-            })) {
+                .elapsed_ms = sent_at.durationTo(std.Io.Clock.Timestamp.now(io_mod.getIo(), .boot)).raw.toMilliseconds(),
+            };
+            if (!stale_retry_used and isStaleConnectionFailure(evidence)) {
                 stale_retry_used = true;
                 attempt_limit += 1;
                 delivery_ambiguous = true;
-                prepareFreshConnectionRetry(request, request_url, trace_ctx, attempt, .head, err);
+                prepareFreshConnectionRetry(request, request_url, trace_ctx, attempt, evidence);
                 continue;
             }
+            if (reused_connection) traceReusedConnectionFailure("reused_connection_failure", trace_ctx, attempt, evidence, 0);
             if (request.provider_attempt_owner == .transport and
                 isRetryableGatewayError(mapped) and attempt + 1 < attempt_limit)
             {
