@@ -7985,9 +7985,7 @@ fn processQueuedPromptLoop(
                 // non-retryable endings keep their terminal path below.
                 const finish_reason = attempt_completion.finish_reason;
                 const failure_cause = attempt_completion.provider_failure_cause;
-                const content_filtered = failure_cause != .gateway_stream_timeout and
-                    failure_cause != .rate_limited and
-                    attempt_disposition == .provider_failure and
+                const content_filtered = attempt_disposition == .provider_failure and
                     finish_reason.? == .content_filter;
                 const cause: types.ModelRecoveryCause = if (failure_cause == .gateway_stream_timeout)
                     .provider_stream_timeout
@@ -8106,11 +8104,7 @@ fn processQueuedPromptLoop(
                     completionContentBytes(attempt_completion),
                     attempt_completion.tool_calls.len,
                 });
-                // A content filter finish decides on its own, as it always
-                // did, even when an earlier error event carried a code.
-                if (finish_reason != .content_filter and
-                    attempt_completion.provider_failure_cause == .non_retryable)
-                {
+                if (attempt_completion.provider_failure_cause == .non_retryable) {
                     try deps.push_system_notice(deps.ctx, diagnostic.view());
                     restorePromptAfterTerminalFailure(deps, job, config);
                     const failed_assistant_source = stream_ctx.interruption_source_or("");
