@@ -195,8 +195,10 @@ const offline_ms = [_]u32{ 1_000, 2_000, 5_000 };
 /// Waits keep 80 to 100 percent of their table value, so retries from many
 /// processes spread out without ever passing the 30-second cap.
 const jitter_floor_percent: u32 = 80;
-/// Consecutive same-kind failures before trying another way.
-const escalate_after: u8 = 3;
+/// Consecutive same-kind failures before trying another way. Public so a
+/// host that asks a copy of `State` how it would send next can look this far
+/// ahead.
+pub const escalate_after: u8 = 3;
 /// Abrupt in-flight deaths before asking the user once.
 const crash_loop_after: u8 = 2;
 const record_version: u8 = 1;

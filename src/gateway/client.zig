@@ -3271,8 +3271,9 @@ const ErrorEventClass = enum {
 fn errorEventClass(root: std.json.Value) ErrorEventClass {
     const status_class = if (providerErrorEventStatus(root)) |status| httpStatusClass(status) else null;
     const code = providerErrorEventCode(root) orelse return status_class orelse .uncoded;
-    // A code fx recognizes decides. One it does not, such as an SDK error
-    // name in `error.type`, says less than the status that came with it.
+    // A code fx recognizes decides. One it does not, such as an upstream
+    // provider's own `upstream_error`, says less than the status that came
+    // with it.
     return recognizedCodeClass(code) orelse status_class orelse .non_retryable;
 }
 
@@ -3344,18 +3345,26 @@ fn streamFailureCause(
 ) ?types.ProviderFailureCause {
     if (finish == .content_filter) return null;
     const error_or_missing = finish == null or finish == .provider_error;
-    const classified = error_or_missing and
-        (class == .non_retryable or class == .rate_limited);
-    if (!classified and (finish_timeout or class == .stream_timeout)) return .gateway_stream_timeout;
-    if (!error_or_missing) return null;
+    if (!error_or_missing) {
+        return if (finish_timeout or class == .stream_timeout) .gateway_stream_timeout else null;
+    }
     const error_finish = finish != null;
-    const event = class orelse return if (error_finish) .unexplained_error_finish else null;
+    const event = class orelse {
+        if (finish_timeout) return .gateway_stream_timeout;
+        return if (error_finish) .unexplained_error_finish else null;
+    };
     return switch (event) {
+        // A classified code beats a timeout the finish names.
         .non_retryable => .non_retryable,
         .rate_limited => .rate_limited,
         .stream_timeout => .gateway_stream_timeout,
-        .transient => null,
-        .uncoded => if (error_finish) .uncoded_error else null,
+        .transient => if (finish_timeout) .gateway_stream_timeout else null,
+        .uncoded => if (finish_timeout)
+            .gateway_stream_timeout
+        else if (error_finish)
+            .uncoded_error
+        else
+            null,
     };
 }
 
@@ -3443,11 +3452,24 @@ fn captureProviderFailureObject(
 ) !bool {
     if (include_type) {
         // A provider's wrapper, `{"type":"error","error":{...}}`, names
-        // nothing itself: its nested error does, as `errorObjectCode` reads it.
+        // nothing itself: its nested error does. Read exactly one level down,
+        // as `errorObjectCode` does, so the detail and the class come from the
+        // same object and a deep chain of wrappers costs no recursion.
         if (nestedErrorObject(object)) |nested| {
-            if (try captureProviderFailureObject(alloc, current, nested, true)) return true;
+            if (try captureErrorObjectFields(alloc, current, nested, true)) return true;
         }
     }
+    return captureErrorObjectFields(alloc, current, object, include_type);
+}
+
+/// Captures the detail one error object names: its code and message, or
+/// whichever it has.
+fn captureErrorObjectFields(
+    alloc: std.mem.Allocator,
+    current: *?[]u8,
+    object: std.json.ObjectMap,
+    include_type: bool,
+) !bool {
     const code = detailCode(object, include_type);
     const message = if (object.get("message")) |value| jsonValueString(value) else null;
     if (code) |code_text| {
@@ -3476,9 +3498,10 @@ fn captureProviderFailureObject(
 }
 
 /// The code a detail names: the object's `code`, else, when `include_type`
-/// is set, its `type`. The detail keeps an SDK error name such as
-/// `AI_APICallError`, which the context-overflow and prefill checks read, but
-/// not a wrapper's generic "error".
+/// is set, its `type`. The notice detail keeps an SDK error name such as
+/// `AI_APICallError`, which it has always shown and which tells the reader
+/// where the error came from, though it is no code to classify by; it drops
+/// a wrapper's generic "error", which says nothing.
 fn detailCode(object: std.json.ObjectMap, include_type: bool) ?[]const u8 {
     if (object.get("code")) |value| return jsonValueString(value);
     if (!include_type) return null;
@@ -4890,8 +4913,8 @@ test "consumeSseStream names the error a provider's wrapper nests in the notice 
             .detail = "provider_error: route unavailable",
             .cause = .uncoded_error,
         },
-        // An SDK error name stays in the detail, which the context-overflow
-        // and prefill checks read, but is no code to classify by.
+        // An SDK error name stays in the notice detail, as it always has,
+        // but is no code to classify by.
         .{
             .payload = "data: {\"type\":\"error\",\"error\":{\"type\":\"AI_APICallError\",\"message\":\"input is too long\"}}\n\n" ++ error_finish,
             .detail = "AI_APICallError: input is too long",
@@ -4905,6 +4928,28 @@ test "consumeSseStream names the error a provider's wrapper nests in the notice 
         try std.testing.expectEqualStrings(case.detail, completion.provider_failure_detail.?);
         try std.testing.expectEqual(case.cause, completion.provider_failure_cause);
     }
+}
+
+test "consumeSseStream reads a deep chain of provider wrappers only one level down" {
+    const alloc = std.testing.allocator;
+    const depth = 20_000;
+    var payload: std.Io.Writer.Allocating = .init(alloc);
+    defer payload.deinit();
+    const writer = &payload.writer;
+    // The event, the wrapper, and its first nested error, which carries the
+    // message. Below it the wrappers go on, ending in a code that neither the
+    // detail nor the class may reach.
+    try writer.writeAll("data: {\"type\":\"error\",\"error\":{\"type\":\"error\",\"error\":{\"type\":\"error\",\"message\":\"first nested\",\"error\":");
+    for (0..depth) |_| try writer.writeAll("{\"type\":\"error\",\"error\":");
+    try writer.writeAll("{\"type\":\"invalid_request_error\",\"message\":\"deep\"}");
+    for (0..depth + 3) |_| try writer.writeByte('}');
+    try writer.writeAll("\n\ndata: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"error\"}}\n\n");
+
+    var completion = try testStreamOutcome(payload.written());
+    defer deinitGatewayCompletion(alloc, &completion);
+    try std.testing.expectEqualStrings("provider_error: first nested", completion.provider_failure_detail.?);
+    // The first nested error names no code, so the class is unclear too.
+    try std.testing.expectEqual(@as(?types.ProviderFailureCause, .uncoded_error), completion.provider_failure_cause);
 }
 
 test "consumeSseStream marks a provider error with neither a code nor a status unclear" {

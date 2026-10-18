@@ -6930,7 +6930,8 @@ test "processQueuedPrompt recovers when a stream ends without a finish twice" {
 }
 
 /// A provider error the gateway could not classify, as `src/gateway/client.zig`
-/// "consumeSseStream marks a provider error without a code unclear" reports it.
+/// "consumeSseStream marks a provider error with neither a code nor a status
+/// unclear" reports it.
 fn unclearProviderError(cause: types.ProviderFailureCause, detail: ?[]const u8) FakeCompletion {
     return .{ .finish_reason = .provider_error, .provider_failure_cause = cause, .provider_failure_detail = detail };
 }

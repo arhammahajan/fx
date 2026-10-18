@@ -289,16 +289,16 @@ pub const RequestRecovery = struct {
 
     /// How the module would send if `failure` kept ending its sends, asked of
     /// a copy of its state: `step` is pure, so stepping a copy changes
-    /// nothing. The copy hears `failure` up to `repeat_stop_sends` times, each
-    /// followed by a tick past any wait it schedules, so a change the module
-    /// makes only after a run of failures, such as dropping Fast, is seen even
-    /// when unclear failures of other kinds started fx's count. Returns the
-    /// first send that differs from the current one, the current one when
+    /// nothing. The copy hears `failure` up to `recovery.escalate_after`
+    /// times, each followed by a tick past any wait it schedules, which is as
+    /// many as the module needs to try another way, such as dropping Fast,
+    /// even when unclear failures of other kinds started fx's count. Returns
+    /// the first send that differs from the current one, the current one when
     /// none does, and null when the module would not send again on its own.
     fn nextSendLocked(self: *RequestRecovery, failure: Failure) ?Send {
         var probe = self.state;
         var now_ms = self.nowMs();
-        for (0..repeat_stop_sends) |_| {
+        for (0..recovery.escalate_after) |_| {
             _ = recovery.step(&probe, .{ .failed = failure }, now_ms);
             now_ms +|= probe_horizon_ms;
             const next = recovery.step(&probe, .tick, now_ms).send orelse return null;
@@ -802,6 +802,50 @@ test "a request gets its sends without Fast before a repeating failure stops it"
     request.beginSend();
     request.endSend();
     try std.testing.expect(request.repeatedFailure(server, .unexplained_error_finish, 0));
+    try std.testing.expect(request.stoppedRepeating());
+}
+
+test "the stop looks ahead through the module's whole run toward dropping Fast" {
+    var fake = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
+    defer fake.deinit();
+    const deps = fake.deps();
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+    defer request.deinit();
+
+    try request.start(true);
+    const dropped: Failure = .{ .kind = .dropped };
+    const server: Failure = .{ .kind = .server };
+    for (0..repeat_stop_sends - 1) |_| {
+        request.beginSend();
+        request.endSend();
+        try std.testing.expect(!request.repeatedFailure(dropped, .missing_finish, 0));
+        try request.failed(dropped);
+        _ = (try request.waitForSend()).?;
+    }
+    // fx's count passes its bound on the first gateway error, while the
+    // module's run of them starts at zero: the request keeps Fast for all
+    // `recovery.escalate_after` of them only if the lookahead reaches that
+    // far.
+    for (0..recovery.escalate_after) |_| {
+        request.beginSend();
+        request.endSend();
+        try std.testing.expect(!request.send.no_fast);
+        try std.testing.expect(!request.repeatedFailure(server, .uncoded_error, 0));
+        try request.failed(server);
+        _ = (try request.waitForSend()).?;
+    }
+    for (0..repeat_stop_sends - 1) |_| {
+        request.beginSend();
+        request.endSend();
+        try std.testing.expect(request.send.no_fast);
+        try std.testing.expect(!request.repeatedFailure(server, .uncoded_error, 0));
+        try request.failed(server);
+        _ = (try request.waitForSend()).?;
+    }
+    request.beginSend();
+    request.endSend();
+    try std.testing.expect(request.repeatedFailure(server, .uncoded_error, 0));
     try std.testing.expect(request.stoppedRepeating());
 }
 
