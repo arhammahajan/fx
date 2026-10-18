@@ -2656,6 +2656,11 @@ export async function createFxEngine(options = {}) {
   // behind it.
   let journalInFlight = null;
   let journalBarrier = false;
+  // Events that hold one of the turn's steps, a call or its result, or a
+  // progress after the turn's first: a model request after them carries the
+  // step. Whether the append in flight holds one.
+  const holdsStep = (event) => event?.type === "tool_intent" || event?.type === "tool_result" || (event?.type === "turn_progress" && event.base !== undefined);
+  let journalInFlightSteps = false;
   let journalFailure = null;
   // Set by `turn.cancel({ reason: "handoff" })`: the journal keeps the open
   // turn for another agent, so this one stores nothing more.
@@ -2728,6 +2733,7 @@ export async function createFxEngine(options = {}) {
     journalQueue = [];
     const barrier = journalBarrier;
     journalBarrier = false;
+    journalInFlightSteps = batch.some(holdsStep);
     emit("journal.append", { events: batch.length, barrier });
     let appended;
     try {
@@ -2755,6 +2761,7 @@ export async function createFxEngine(options = {}) {
     }).finally(() => {
       journalPending.delete(settled);
       journalInFlight = null;
+      journalInFlightSteps = false;
       flushJournal();
     });
     journalInFlight = settled;
@@ -2771,6 +2778,20 @@ export async function createFxEngine(options = {}) {
     for (;;) {
       // This caller waits for every event queued so far.
       if (journalQueue.length > 0) journalBarrier = true;
+      if (journalFlushScheduled || journalQueue.length > 0) flushJournal();
+      if (journalPending.size === 0) break;
+      await Promise.all([...journalPending]);
+    }
+    if (journalFailure) throw journalFailure;
+  }
+  // The store's answer to every append so far, without making any of them a
+  // barrier. The core marks each event it needs stored before it goes on, so
+  // its waits use this. So does a model request after a step: it waits to
+  // learn whether the store refused the step, but a store may acknowledge a
+  // record that is no barrier before it is durable, and the request then
+  // still runs ahead of the commit (DUR-18, DUR-30).
+  async function journalAnswered() {
+    for (;;) {
       if (journalFlushScheduled || journalQueue.length > 0) flushJournal();
       if (journalPending.size === 0) break;
       await Promise.all([...journalPending]);
@@ -2855,17 +2876,24 @@ export async function createFxEngine(options = {}) {
     if (catalogRequest && options[catalogMemory]) {
       return rememberedCatalog(options[catalogMemory], String(input?.url ?? input), init.signal ?? input?.signal, () => networkFetch(input, init, method, endpoint));
     }
+    if (journal && (journalFailure || journalInFlightSteps || journalQueue.some(holdsStep))) {
+      // A model request carries the turn's steps. It waits for the store's
+      // answer to the appends that hold them, however long that takes, and
+      // never goes out once the store refused one, as a fenced store does
+      // (DUR-30). On AI Gateway the core has already waited, at the
+      // progress before the request (`setJournalProgress` in
+      // src/acp/prompt.zig); other providers write no such progress. A
+      // turn's first request holds no step and runs ahead (DUR-18): its
+      // prompt is in the store already, or in the session's log.
+      await journalAnswered().catch(() => {});
+      if (journalFailure) {
+        runtime.abortHostEffects();
+        throw new DOMException("Aborted", "AbortError");
+      }
+    }
     return networkFetch(input, init, method, endpoint);
   };
   const networkFetch = async (input, init, method, endpoint) => {
-    // The core sends a step's journal events before its next request. On
-    // native that request reaches this host after them, in a task of its
-    // own, so a store that refuses a write at once, as a fenced one does,
-    // has stopped the turn before the request starts. The WebAssembly core
-    // asks in the task that queued the events, so the request waits one
-    // task for the store's first answer. It does not wait for the write to
-    // be durable: requests still run ahead of commits (DUR-18, DUR-30).
-    if (journal && (journalQueue.length > 0 || journalInFlight)) await new Promise((resolve) => setTimeout(resolve, 0));
     for (let attemptIndex = 0; attemptIndex < 2; attemptIndex++) {
       const startedAt = performance.now();
       const attempt = activeTurn ? ++activeTurn.transportAttempts : attemptIndex + 1;
@@ -3009,7 +3037,7 @@ export async function createFxEngine(options = {}) {
     args: ["acp"],
     env: agentEnvironment(options),
     hostToolExecutor: executeHostTool,
-    journalFlush: () => journalSettled(),
+    journalFlush: () => journalAnswered(),
     // A cancel or deadline doesn't wait for this read, as it doesn't wait
     // for a tool. A turn that is no longer current, cancelled or with the
     // agent closing, can take no steer (startSteer), so it reads nothing and
@@ -3179,7 +3207,7 @@ export async function createFxEngine(options = {}) {
     if (message.method === "libfx/journal_flush") {
       // Every append the core sent before this request is already queued.
       let failure = null;
-      try { await journalSettled(); } catch (error) { failure = error; }
+      try { await journalAnswered(); } catch (error) { failure = error; }
       if (closing) return;
       send(failure
         ? { jsonrpc: "2.0", id: message.id, error: { code: -32000, message: failure.message } }

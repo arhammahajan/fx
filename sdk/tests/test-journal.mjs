@@ -421,9 +421,12 @@ test("events that arrive while an append is in flight go out as one record, and 
     // turn's end, which the turn waits for.
     if (waits) assert.equal(intent.barrier, true, `the intent of ${flags} is a barrier: ${shape}`);
     else assert.ok(!intent.barrier || typesOf(intent).includes("turn_committed"), `the intent of ${flags} is no barrier: ${shape}`);
-    // Events that came while an append was in flight went out together, so
-    // the turn took fewer appends than it has events.
-    assert.ok(store.appends.length < store.events().length && store.appends.some((append) => append.events.length > 1), shape);
+    // A call that runs ahead returns while its intent is on its way, so its
+    // result and the progress after it went out with the intent, in one
+    // record: the turn took fewer appends than it has events. A call that
+    // waits may leave nothing to join, since the request after it waits for
+    // the store's answer to its result (DUR-30).
+    if (!waits) assert.ok(store.appends.length < store.events().length && store.appends.some((append) => append.events.length > 1), shape);
   }
 });
 
@@ -837,6 +840,66 @@ test("a session taken over mid-turn fences the first agent, which stops at once"
   assert.equal(reopened.resume(), null);
   assert.equal((await run(reopened, "what did I say")).text, "answer to what did I say");
   await reopened.close();
+});
+
+// DUR-30 (checkpoints.mdx: "The engine whose append you fence stops"): the
+// request after a tool carries its result, so it waits for the store's
+// answer to the append that holds that result, however long the store takes
+// to refuse it, and never goes out once refused.
+test("a fenced agent whose store refuses late sends no request carrying what the store refused", async () => {
+  const journal = eventJournal();
+  const inner = persisted(journal);
+  let refusals = 0;
+  const refusedBarriers = [];
+  const lateRefusals = {
+    load: () => inner.load(),
+    async append(write) {
+      const head = journal.events.length ? String(journal.events.at(-1).seq) : null;
+      if (write.expected !== head) {
+        refusals += 1;
+        refusedBarriers.push(write.barrier === true);
+        await new Promise((resolveWait) => setTimeout(resolveWait, 150));
+      }
+      return inner.append(write);
+    },
+  };
+  let toolStarted;
+  const started = new Promise((resolveStarted) => { toolStarted = resolveStarted; });
+  let releaseTool;
+  const released = new Promise((resolveReleased) => { releaseTool = resolveReleased; });
+  const slowLookup = { ...lookup, execute: async () => { toolStarted(); await released; return "value of alpha is beta"; } };
+  requests.length = 0;
+  const laptop = await createFxEngine(options(sourceBackend, undefined, { tools: [slowLookup], persistence: lateRefusals }));
+  const turn = laptop.prompt("keep using the tool");
+  const drained = (async () => { for await (const _ of turn) {} })();
+  await started;
+  const laptopSession = requests[0].sessionId;
+
+  const takeover = await createFxEngine(options(targetBackend, journal));
+  const resumed = takeover.resume();
+  assert.ok(resumed, "the function finds the laptop's turn open");
+  for await (const _ of resumed) {}
+  assert.equal((await resumed.result).stopReason, "end_turn");
+  await takeover.close();
+  const eventsAfterTakeover = journal.events.length;
+  const laptopRequests = () => requests.filter((prompt) => prompt.sessionId === laptopSession);
+  const requestsBeforeRelease = laptopRequests().length;
+
+  releaseTool();
+  const fenced = (error) => error instanceof FxFencedError && error.code === "FX_FENCED";
+  await assert.rejects(drained, fenced);
+  await assert.rejects(turn.result, fenced);
+  await laptop.close();
+  await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+  assert.ok(refusals > 0, "the store refused the laptop");
+  // The laptop waited only for the store's answer: the record is no barrier,
+  // so a store may acknowledge it before it is durable and the request runs
+  // ahead of the commit (DUR-18).
+  assert.deepEqual(refusedBarriers, refusedBarriers.map(() => false), "the record the request waited on is no barrier");
+  const late = laptopRequests().slice(requestsBeforeRelease);
+  assert.equal(late.length, 0, `the laptop sent no request once its tool returned (${late.length}, ${late.map((prompt) => toolResults(prompt).length).join(", ")} tool results)`);
+  assert.equal(journal.events.length, eventsAfterTakeover, "the laptop wrote nothing after the fence");
+  assertContiguous(journal.events);
 });
 
 // The fencing invariants for a call a takeover catches running.
@@ -2201,8 +2264,10 @@ test("a tool receives the model's call id as its execution id, and its session's
   await agent.close();
   assert.deepEqual(seen, [{ keys: ["executionId", "sessionId", "signal"], executionId: "call-1", sessionId, signal: true }]);
 });
+// LIBFX_TEST_ONLY runs only the tests whose names contain it.
+const only = process.env.LIBFX_TEST_ONLY;
 try {
-  for (const { name, body } of cases) {
+  for (const { name, body } of only ? cases.filter((entry) => entry.name.includes(only)) : cases) {
     await body();
     console.log(`ok - ${name}`);
   }

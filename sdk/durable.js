@@ -1665,8 +1665,9 @@ export function earlyStart(entries, state, message, fold) {
 // The log as a worker writes it under a claim still in flight: each write
 // waits for the claim, and none is made once it failed. `ready` resolves
 // true when the claim landed and false when it failed. A UI line written
-// under a failed claim is dropped: its turn never ran for anyone.
-function gatedLog(log, ready, claimError) {
+// under a failed claim is dropped: its turn never ran for anyone, and so is
+// one `mayShow()` refuses: its worker was replaced, or may have been.
+function gatedLog(log, ready, claimError, mayShow) {
   return {
     ...log,
     async append(entry) {
@@ -1676,7 +1677,7 @@ function gatedLog(log, ready, claimError) {
     ui: {
       ...log.ui,
       async write(lines) {
-        if (await ready) await log.ui.write(lines);
+        if ((await ready) && (await mayShow())) await log.ui.write(lines);
       },
     },
   };
@@ -1924,7 +1925,7 @@ class SessionWorker {
       claimFailed = true;
       return false;
     });
-    const log = gatedLog(raw, ready, () => failed);
+    const log = gatedLog(raw, ready, () => failed, () => mayShow());
     let chain = ready;
     // The turns a record this worker stored started, and the open turn's
     // cut-offs as this worker's own records leave them.
@@ -2042,16 +2043,45 @@ class SessionWorker {
     // The turn running now, which a deadline or a lost lease cancels.
     let turnNow = null;
     let renew = null;
-    if (!heldToDeadline(this.backend, deadline)) {
+    const renewable = !heldToDeadline(this.backend, deadline);
+    // When the lease runs out as the last of this worker's lease writes to
+    // land left it: the claim's, then each renewal's.
+    let leaseLandedUntil = lease.expiresAt ?? null;
+    // One renewal at a time; a renewal fenced out by another worker's write
+    // stops the turn at once, as a claim that failed does.
+    let renewing = null;
+    const renewLease = () => {
+      if (renewing) return renewing;
+      const expiresAt = leaseEnd(this.backend, deadline);
+      leaseExpiresAt = expiresAt;
+      renewing = chained({ k: "lease", holder: this.holder, epoch: lease.epoch, expiresAt, ...this.backend.holderInfo(), ...(lease.delivery ? { delivery: lease.delivery } : {}) })
+        .then(() => { leaseLandedUntil = expiresAt; }, (error) => { if (isFenced(error)) turnNow?.cancel({ reason: "handoff" }); })
+        .finally(() => { renewing = null; });
+      return renewing;
+    };
+    // Whether this worker still shows its turn on the UI stream. One that
+    // learned another worker took the session over shows nothing more. One
+    // past its lease's end by its own clock, as after a stall, may have been
+    // taken over without knowing it, so it shows a line only once a lease
+    // write of its own lands: a renewal, or for a lease that runs to the
+    // deadline, the lease again. One fenced out shows nothing. So a replaced
+    // worker that wakes adds no line to the stream, past the write it had on
+    // its way to the World when it froze (DUR-30, DUR-38;
+    // `tests/tla/sdk/DurableSession.tla` LateLine, Landing,
+    // StaleShownPerFreeze).
+    const mayShow = async () => {
+      if (isFenced(failed)) return false;
+      if (leaseLandedUntil === null || Date.now() < leaseLandedUntil) return true;
+      if (released) return false;
+      await renewLease();
+      return !isFenced(failed);
+    };
+    if (renewable) {
       // A lease nothing else shows alive is renewed while its worker runs,
-      // and never after its release, which would take the session back. A
-      // renewal fenced out by another worker's write stops the turn at once,
-      // as a claim that failed does.
+      // and never after its release, which would take the session back.
       renew = setInterval(() => {
         if (released || failed || this.stopping) return;
-        leaseExpiresAt = leaseEnd(this.backend, deadline);
-        void chained({ k: "lease", holder: this.holder, epoch: lease.epoch, expiresAt: leaseExpiresAt, ...this.backend.holderInfo(), ...(lease.delivery ? { delivery: lease.delivery } : {}) })
-          .catch((error) => { if (isFenced(error)) turnNow?.cancel({ reason: "handoff" }); });
+        void renewLease();
       }, Math.max(1, Math.floor(this.backend.leaseMs / 3)));
     }
     // Shortly before the deadline the worker hands the open turn back to the

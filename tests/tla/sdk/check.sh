@@ -76,11 +76,17 @@ done
 # not hold its reply, as before libfx put it there, a holder that crashed
 # while its answer's last text lines were on their way leaves the reply cut
 # short, and the worker that writes its missing turn_end cannot finish it.
+# LeasedStaleShown breaks StaleShownPerFreeze, which the leased graph checks:
+# when a woken worker whose renewed lease ran out writes before a renewal of
+# its own lands, as before libfx waited for one, more of a replaced worker's
+# late lines show between its successor's claim and first line than the one
+# it had on its way when it froze.
 for pair in UiInOrder:UiInOrder NoStaleShown:NoStaleShown NotTwoActive:NotTwoActive \
     NoSelfStop:TwoActiveNeedsFreeze NoClaimFence:EffectsAtMostOnce NoCutoffBound:HandoffsBounded \
     LeasedTwoActive:NotTwoActive LookupRunsAhead:EveryCallAfterIntent LookupNewId:IdsAtMostOne \
     WriteRunsAhead:OneExecutionId NoEndRepair:EndRecoverable NoRefusedRepair:EndRecoverable \
-    NoEndHow:EndSaysHow NoRefusedHow:EndSaysHow NoReplyRepair:ReplyShownOnce; do
+    NoEndHow:EndSaysHow NoRefusedHow:EndSaysHow NoReplyRepair:ReplyShownOnce \
+    LeasedStaleShown:StaleShownPerFreeze; do
     witness="${pair%%:*}" invariant="${pair#*:}"
     if "$java" -cp "$jar" tlc2.TLC -deadlock -workers auto -cleanup -metadir "$work/w-$witness" \
         -config "Witness-$witness.cfg" DurableSession.tla 2>&1 | grep -q -E "Invariant $invariant is violated"; then
@@ -128,10 +134,16 @@ done
 # UiStream.tla: a session's UI stream as a reader in another process sees it
 # while a worker writes it. libfx writes each line before the next unless
 # the World keeps a batch's order, as Vercel's does: on either World the
-# live reader gets what a replay gets. The witness writes batches to a World
-# that writes a batch's chunks in parallel, as libfx did on world-local, and
-# the live reader gets a line under another cursor than a replay gives it.
-for config in local vercel; do
+# live reader gets what a replay gets. The Batched witness writes batches to
+# a World that writes a batch's chunks in parallel, as libfx did on
+# world-local, and the live reader gets a line under another cursor than a
+# replay gives it. The takeover config freezes the first worker with a write
+# on its way while a second takes over, on a World that places a chunk where
+# it lands, as memory() and Vercel's do: the late chunk lands after what
+# readers have. The LateLine witness does the same on a World that places a
+# chunk where its write started, as world-local does: the late chunk goes
+# ahead of lines a reader already has, the risk libfx can't close there.
+for config in local vercel takeover; do
     echo "== UiStream ($config)"
     if ! "$java" -cp "$jar" tlc2.TLC -deadlock -workers 1 -cleanup -metadir "$work/ui-$config" \
         -config "UiStream-$config.cfg" UiStream.tla > "$work/ui-$config.log" 2>&1; then
@@ -139,12 +151,14 @@ for config in local vercel; do
     fi
     grep -E 'distinct states|depth of' "$work/ui-$config.log"
 done
-if "$java" -cp "$jar" tlc2.TLC -deadlock -workers auto -cleanup -metadir "$work/uw-Batched" \
-    -config UiStreamWitness-Batched.cfg UiStream.tla 2>&1 | grep -q -E "Invariant LiveIsReplay is violated"; then
-    echo "== ui witness Batched reached"
-else
-    echo "== ui witness Batched NOT reached" >&2; status=1
-fi
+for witness in Batched LateLine; do
+    if "$java" -cp "$jar" tlc2.TLC -deadlock -workers auto -cleanup -metadir "$work/uw-$witness" \
+        -config "UiStreamWitness-$witness.cfg" UiStream.tla 2>&1 | grep -q -E "Invariant LiveIsReplay is violated"; then
+        echo "== ui witness $witness reached"
+    else
+        echo "== ui witness $witness NOT reached" >&2; status=1
+    fi
+done
 
 # PromptIntake.tla: how a session object takes prompts in. Deadlock checking
 # stays on, since a prompt left waiting forever is a failure there; the

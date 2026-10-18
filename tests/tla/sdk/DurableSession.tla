@@ -33,6 +33,10 @@
 (* stall long enough for the lease to run out, and a renewal is a write:   *)
 (* one that lands after a worker wakes keeps its lease when it still heads *)
 (* the chain, and stops it when another worker took the session over.      *)
+(* Its own clock tells a woken worker that its lease ran out, so with      *)
+(* StalledWait it shows nothing more until a renewal of its own lands: a   *)
+(* replaced worker that wakes adds no line to the stream (LateLine). With  *)
+(* StalledWait = FALSE its late lines land (Witness-LeasedStaleShown).     *)
 (*                                                                         *)
 (* With QueueHeld, the queue shows whether a holder lives, as Vercel       *)
 (* Queues does: a holder's delivery keeps its message from every other     *)
@@ -125,7 +129,9 @@ CONSTANTS
                  \* before any record
     RecordsHow,  \* whether the entry that ends the turn says how it ended
     RecordsReply, \* whether the record that ends the turn holds its reply
-    ReplyParts   \* how many text lines the model's answer streams as
+    ReplyParts,  \* how many text lines the model's answer streams as
+    StalledWait  \* whether a worker whose renewed lease ran out by its own
+                 \* clock shows nothing until a renewal of its own lands
 
 ASSUME Tool \in {"lookup", "write", "send"}
 ASSUME WritesWait \in BOOLEAN
@@ -140,6 +146,7 @@ ASSUME Refused \in BOOLEAN
 ASSUME RecordsHow \in BOOLEAN
 ASSUME RecordsReply \in BOOLEAN
 ASSUME ReplyParts \in Nat /\ ReplyParts >= 1
+ASSUME StalledWait \in BOOLEAN
 ASSUME ~(QueueHeld /\ Heartbeat)
 
 None == "none"
@@ -259,6 +266,26 @@ Recorded == IF RecordsHow THEN how ELSE "unknown"
 \* A write that does not count may still have put a line in the UI stream.
 MaybeLine(w) == ui' \in {ui, Append(ui, Line(w))}
 
+\* w writes no line now: its renewed lease ran out while it was frozen, so
+\* it shows nothing until a renewal of its own lands, and that renewal,
+\* fenced out, stops it. Only a renewed lease shows its holder, by its own
+\* clock, that it may have run out; a lease the queue holds does not.
+Gated(w) == StalledWait /\ Heartbeat /\ froze[w] /\ ~Heads(w)
+
+\* The line a write that does not count may have put in the UI stream, as
+\* MaybeLine, unless w writes none.
+LateLine(w) == IF Gated(w) THEN UNCHANGED ui ELSE MaybeLine(w)
+
+\* The lines w writes now, whether or not it heads the chain: `lines`, or
+\* none when it writes none.
+Writes(w, lines) == IF Gated(w) THEN <<>> ELSE lines
+
+\* What can land of the lines w owes when it froze waiting to write them:
+\* all of them, or when it writes none, the first or nothing. libfx checks
+\* a line when its write starts, so the first may have been on its way to
+\* the World, past that check, when w froze; the rest start after w wakes.
+Landing(w, lines) == IF Gated(w) THEN {SubSeq(lines, 1, k) : k \in 0..1} ELSE {lines}
+
 \* The lines every reader shows: each line no earlier line outranks. The
 \* same stored stream always shows the same lines.
 ShownAt(lines) == {i \in 1..Len(lines) : \A j \in 1..(i - 1) : lines[j].e <= lines[i].e}
@@ -368,7 +395,7 @@ Announce(w) ==
                /\ progress' = "done"
                /\ Ends(w, "error")
                /\ pc' = [pc EXCEPT ![w] = "ending"]
-               /\ ui' = Append(ui, Line(w))
+               /\ ui' = ui \o Writes(w, <<Line(w)>>)
                /\ UNCHANGED <<runs, lease, chain, cutoffs, lapse>>
           ELSE IF spent /\ from \in {"start", "result"}
           THEN /\ UNCHANGED runs
@@ -382,7 +409,7 @@ Announce(w) ==
                           /\ cutoffs' = 0
                           /\ UNCHANGED <<lease, lapse>>
                      ELSE /\ pc' = [pc EXCEPT ![w] = "stopped"]
-                          /\ ui' = Append(ui, Line(w))
+                          /\ ui' = ui \o Writes(w, <<Line(w)>>)
                           /\ UNCHANGED <<progress, lease, chain, cutoffs, lapse, ending>>
           ELSE /\ UNCHANGED ending
                /\ pc' = [pc EXCEPT ![w] =
@@ -392,7 +419,7 @@ Announce(w) ==
                /\ runs' = IF rerun THEN runs + 1 ELSE runs
                \* then tool_start for a rerun, or tool_end for a call answered
                \* as possibly run
-               /\ ui' = IF from = "intent" THEN ui \o <<Line(w), Line(w)>> ELSE Append(ui, Line(w))
+               /\ ui' = ui \o Writes(w, IF from = "intent" THEN <<Line(w), Line(w)>> ELSE <<Line(w)>>)
                \* a call answered as possibly run is the turn's next record
                /\ IF from = "intent" /\ ~rerun /\ Heads(w)
                      THEN /\ progress' = "result"
@@ -419,14 +446,14 @@ Model1(w) ==
           THEN /\ runs' = runs + 1
                /\ ids' = ids + 1
                /\ \/ /\ pc' = [pc EXCEPT ![w] = "ahead"]
-                     /\ ui' = Append(ui, Line(w))
+                     /\ ui' = ui \o Writes(w, <<Line(w)>>)
                      /\ \/ UNCHANGED <<chain, cutoffs>>
                         \/ /\ Heads(w)
                            /\ chain' = chain + 1
                            /\ cutoffs' = 0
                   \/ /\ ~Heads(w)
                      /\ pc' = [pc EXCEPT ![w] = "stopped"]
-                     /\ MaybeLine(w)
+                     /\ LateLine(w)
                      /\ UNCHANGED <<chain, cutoffs>>
                /\ UNCHANGED progress
           ELSE /\ IF Heads(w)
@@ -436,7 +463,7 @@ Model1(w) ==
                           /\ pc' = [pc EXCEPT ![w] = "tool"]
                           /\ ui' = Append(ui, Line(w))
                      ELSE /\ pc' = [pc EXCEPT ![w] = "stopped"]
-                          /\ MaybeLine(w)
+                          /\ LateLine(w)
                           /\ UNCHANGED <<progress, runs, ids>>
                /\ chain' = IF Heads(w) THEN chain + 1 ELSE chain
                /\ cutoffs' = IF Heads(w) THEN 0 ELSE cutoffs
@@ -456,7 +483,7 @@ Intent(w) ==
                /\ cutoffs' = 0
                /\ UNCHANGED ui
           ELSE /\ pc' = [pc EXCEPT ![w] = "stopped"]
-               /\ MaybeLine(w)
+               /\ LateLine(w)
                /\ UNCHANGED <<progress, chain, cutoffs>>
     /\ UNCHANGED <<epoch, frozen, lease, runs, ids, freezes, froze, seen, lapse, ending, owed>>
     /\ act' = [name |-> "Intent", w |-> w]
@@ -470,7 +497,7 @@ ToolEnd(w) ==
                /\ pc' = [pc EXCEPT ![w] = "model2"]
                /\ ui' = Append(ui, Line(w))
           ELSE /\ pc' = [pc EXCEPT ![w] = "stopped"]
-               /\ MaybeLine(w)
+               /\ LateLine(w)
                /\ UNCHANGED progress
     /\ chain' = IF Heads(w) THEN chain + 1 ELSE chain
     /\ cutoffs' = IF Heads(w) THEN 0 ELSE cutoffs
@@ -480,12 +507,13 @@ ToolEnd(w) ==
 \* The model answers, and the record that ends the turn lands, saying it
 \* ended end_turn, while the answer's text streams: the first `landed` of
 \* its lines have landed, and w still writes the rest. Its turn_end line is
-\* a write of its own, EndLine. A replaced worker's answer still streams.
+\* a write of its own, EndLine. A replaced worker's answer still streams,
+\* unless it writes none (Gated).
 Model2(w) ==
     /\ pc[w] = "model2"
     /\ ~frozen[w]
     /\ \E landed \in 0..ReplyParts :
-          /\ ui' = ui \o TextLines(w, PartsFrom(1, landed))
+          /\ ui' = ui \o Writes(w, TextLines(w, PartsFrom(1, landed)))
           /\ IF Heads(w)
                 THEN /\ progress' = "done"
                      /\ Ends(w, "end_turn")
@@ -501,11 +529,12 @@ Model2(w) ==
 \* w writes the text lines it still owes, then the turn's turn_end line,
 \* then lets the session go. A worker another took the session from still
 \* writes its lines, which readers hide behind the other's, and then learns
-\* it was replaced and stops.
+\* it was replaced and stops, unless it writes none (Gated): then only a
+\* line already on its way when it froze lands (Landing).
 EndLine(w) ==
     /\ pc[w] = "ending"
     /\ ~frozen[w]
-    /\ ui' = ui \o TextLines(w, owed[w]) \o <<EndOf(w)>>
+    /\ \E landing \in Landing(w, TextLines(w, owed[w]) \o <<EndOf(w)>>) : ui' = ui \o landing
     /\ owed' = [owed EXCEPT ![w] = <<>>]
     /\ IF Heads(w)
           THEN /\ pc' = [pc EXCEPT ![w] = "done"]
@@ -577,7 +606,7 @@ Deadline(w) ==
                      /\ UNCHANGED <<epoch, froze, seen>>
                /\ lapse' = "none"
           ELSE /\ pc' = [pc EXCEPT ![w] = "stopped"]
-               /\ MaybeLine(w)
+               /\ LateLine(w)
                /\ UNCHANGED <<epoch, lease, froze, chain, cutoffs, seen, lapse>>
     /\ UNCHANGED <<frozen, progress, runs, ids, freezes, ending, owed>>
     /\ act' = [name |-> "Deadline", w |-> w]
@@ -668,6 +697,16 @@ ReplyShownOnce ==
                 LET run == TextTail({j \in ShownAt(ui) : j < i /\ ui[j].legit})
                 IN \A p \in Parts : Cardinality({j \in run : p \in ui[j].text}) = 1
 
+\* ReplyShownOnce, unless a replaced worker's text line shows. The leased
+\* graph checks this in its place. There a replaced worker's late line is at
+\* most the one it had on its way when it froze (StaleShownPerFreeze), but
+\* when that line is a part of the answer it can still land between its
+\* successor's claim and first line: then the reader sees that part twice,
+\* or the successor counts it as shown and the head's own lines lack it.
+ReplyShownOnceUnlessLate ==
+    \/ ReplyShownOnce
+    \/ \E i \in ShownAt(ui) : ~ui[i].legit /\ ui[i].text # {}
+
 \* A step of w's own work, as opposed to a freeze, a wake or the platform's.
 Works(w) ==
     \/ Start(w) \/ Claim(w) \/ Announce(w) \/ Model1(w) \/ Intent(w) \/ ToolEnd(w) \/ Model2(w)
@@ -696,6 +735,14 @@ TwoActiveNeedsFreeze ==
 \* it lands between its successor's claim and first line. Only a World
 \* that refuses stale stream writes closes that window.
 NoStaleShown == \A i \in ShownAt(ui) : ui[i].legit
+
+\* Where its own clock tells a woken worker it may have been replaced, the
+\* window narrows to one line a freeze: with Heartbeat and StalledWait every
+\* replaced worker froze, and once it wakes it writes no line, so only the
+\* one it had on its way when it froze can show (Landing). The leased graph
+\* checks this; Witness-LeasedStaleShown breaks it without StalledWait,
+\* where a woken worker's owed text and turn_end all show.
+StaleShownPerFreeze == Cardinality({i \in ShownAt(ui) : ~ui[i].legit}) <= freezes
 
 \* The stream as stored, expected to FAIL: late lines land out of order.
 UiInOrder == \A i \in 1..(Len(ui) - 1) : ui[i].e <= ui[i + 1].e

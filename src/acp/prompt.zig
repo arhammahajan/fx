@@ -3041,7 +3041,9 @@ fn appendJournalToolIntent(raw_ctx: *anyopaque, progress: agent_runtime.TurnProg
     if (waits) return flushJournal(ctx.state, ctx.alloc, session.session_id);
 }
 
-/// Waits until the host holds every journal event sent so far.
+/// Waits until the host's store accepted every journal event sent so far:
+/// durably for those sent marked barriers (`appendWith`), and for the rest
+/// in whatever way the store acknowledges a record that is no barrier.
 fn flushJournal(state: *server.ServerState, alloc: Allocator, session_id: []const u8) !void {
     if (comptime host_target.is_wasm) return js_host_journal.flush();
     awaitHostRequest(state, alloc, .journal, "libfx/journal_flush", session_id) catch |err| return switch (err) {
@@ -3347,7 +3349,12 @@ fn clearRecoveryCheckpoint(raw_ctx: *anyopaque) !void {
 /// `recovery_checkpoint.set` for a journaled libfx session: the open turn
 /// so far reaches the host before each model request.
 /// The first progress of a turn is a barrier: it holds the prompt, or a
-/// resumed turn's answers for calls a crash left running.
+/// resumed turn's answers for calls a crash left running. Every progress
+/// before a model request once the turn took a step is waited for too, but
+/// only for the store's answer, not marked a barrier: the request carries
+/// the step, such as a tool's result, so it never goes out once the store
+/// refused the progress that holds it (DUR-30), and it still runs ahead of
+/// the commit when the store answers before the record is durable (DUR-18).
 ///
 /// When the host gave the turn a time to stop at and it has passed, the
 /// progress before a model request is where the turn yields: the journal
@@ -3356,7 +3363,7 @@ fn setJournalProgress(raw_ctx: *anyopaque, checkpoint: session_codec.RecoveryChe
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const session = if (ctx.state.active_session) |*value| value else return error.SessionPersistenceUnavailable;
     var yields = false;
-    const barrier = barrier: {
+    const waits = waits: {
         session.session_write_mutex.lockUncancelable(io_mod.getIo());
         defer session.session_write_mutex.unlock(io_mod.getIo());
         const journal = if (session.journal) |*value| value else return error.SessionPersistenceUnavailable;
@@ -3369,11 +3376,17 @@ fn setJournalProgress(raw_ctx: *anyopaque, checkpoint: session_codec.RecoveryChe
             try journal.appendMarked(ctx.alloc, session.session_id, .turn_yielded, true);
             yields = true;
         }
-        const barrier = journal.barrier_next_progress or yields;
+        // A model request goes out after this progress: the turn's next
+        // step, or compaction's, which carries the turn so far too.
+        const before_request = checkpoint.outstanding_reservation or checkpoint.cause == .compaction_prepared;
+        const took_step = checkpoint.execution.tool_steps.len > 0 or checkpoint.assistant_source.len > 0;
+        const waits = journal.barrier_next_progress or yields or (before_request and took_step);
         journal.barrier_next_progress = false;
-        break :barrier barrier;
+        break :waits waits;
     };
-    if (barrier) flushJournal(ctx.state, ctx.alloc, session.session_id) catch |err| {
+    // The host marks nothing a barrier for this wait: the events that need
+    // one went to it marked (`appendWith`).
+    if (waits) flushJournal(ctx.state, ctx.alloc, session.session_id) catch |err| {
         // The turn commits from this progress as interrupted.
         if (err == error.Cancelled) try keepCancelledProgress(ctx.state.alloc, session, checkpoint);
         return err;

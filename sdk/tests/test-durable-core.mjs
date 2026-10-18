@@ -2241,6 +2241,81 @@ if (durabilityKind === "world" || durabilityKind === "queue") {
   });
 }
 
+if (durabilityKind === "world") {
+  // DUR-30 ("does no more work"), DUR-38: a worker that stalls past its
+  // lease, as a frozen process does, may have been taken over without
+  // knowing it. When it goes on, it writes no line to the session's stream
+  // until a renewal of its own lands, and none at all once that renewal is
+  // fenced out (`tests/tla/sdk/DurableSession.tla` LateLine).
+  test("a worker whose lease ran out while it stalled, which another worker took over, writes no line to the stream when it goes on", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-core-stalled-"));
+    dirs.push(dir);
+    const { durability, broker } = await queueWorldAt(dir, { leaseMs: 1000 });
+    // The first worker's renewals are held while it stalls.
+    const instance = await durability.world();
+    const events = instance.events;
+    let stalledHolder = null;
+    let stalled = false;
+    const heldRenewals = [];
+    instance.events = new Proxy(events, {
+      get(target, key) {
+        if (key !== "create") {
+          const value = Reflect.get(target, key);
+          return typeof value === "function" ? value.bind(target) : value;
+        }
+        return async (runId, event, options) => {
+          const entry = event?.eventData?.stepName === "fx.log" ? JSON.parse(decoder.decode(event.eventData.input)) : null;
+          if (entry?.k === "lease") {
+            stalledHolder ??= entry.holder;
+            if (stalled && entry.holder === stalledHolder) await new Promise((go) => heldRenewals.push(go));
+          }
+          return target.create(runId, event, options);
+        };
+      },
+    });
+    answers.set("eta", [{ type: "text_delta", delta: "the " }, { type: "text_delta", delta: "answer" }]);
+    const fenced = [];
+    const first = createAnsweringAgent({ durability, onEvent: (event) => { if (event.type === "session.fenced") fenced.push(event); } });
+    const second = createAnsweringAgent({ durability });
+    await first.newSessionId();
+    await second.newSessionId();
+    const held = holdStep("eta-0");
+    const session = first.session();
+    const turn = session.prompt("eta", { messageId: "turn-eta" });
+    await held.holding;
+    // The first worker stalls past its lease; the second worker's step runs.
+    stalled = true;
+    holds.delete("eta-0");
+    await sleep(1300);
+    const holders = globalThis[Symbol.for("libfx.liveHolders")];
+    for (const holder of [...holders]) holders.delete(holder);
+    const [message] = broker.held((input) => input.messageId === "turn-eta");
+    assert.ok(message, "the prompt's message is still held");
+    broker.lapse(message);
+    const { text, result } = await textOf(turn);
+    assert.equal(result.stopReason, "end_turn");
+    assert.equal(text, "the answer");
+    // The first worker goes on: its reply streams while its renewal is still
+    // on its way, then the renewal lands and is fenced out.
+    held.release();
+    await sleep(200);
+    stalled = false;
+    for (const go of heldRenewals.splice(0)) go();
+    for (let waited = 0; fenced.length === 0 && waited < 5000; waited += 20) await sleep(20);
+    assert.equal(fenced.length, 1, "the stalled worker stopped at its renewal");
+    await sleep(200);
+    const log = await first[Symbol.for("libfx.durableInternals")].openLog(session.id);
+    const stored = (await readLines(log.ui.read(0), 64)).filter((line) => Number.isSafeInteger(line.epoch));
+    const firstEpoch = stored[0].epoch;
+    const takeover = stored.findIndex((line) => line.epoch > firstEpoch);
+    assert.ok(takeover > 0, JSON.stringify(stored.map((line) => `${line.type}@${line.epoch}`)));
+    const late = stored.slice(takeover).filter((line) => line.epoch === firstEpoch);
+    assert.deepEqual(late.map((line) => `${line.type}@${line.epoch}`), [], "the stalled worker wrote no line after the takeover");
+    await first.close();
+    await second.close();
+  });
+}
+
 if (durabilityKind === "queue") {
   test("a worker holds a session the queue shows it holds without renewing its lease", async () => {
     const dir = await mkdtemp(join(tmpdir(), "libfx-core-held-"));
