@@ -1074,6 +1074,9 @@ while :; do sleep 1; done
       await session.waitForComposer(TIMEOUT);
       await session.sendText(prompt);
       await waitForCondition(() => held.started, "held response start");
+      // fx has read part of the reply, so the recovery it saves restarts that
+      // reply rather than resending the request.
+      await session.waitForText(VISIBLE_PARTIAL_CHUNKS.at(-1)!.trim(), TIMEOUT);
       // Drop the live stream so the turn enters recovery, then kill fx before
       // any cleanup can run: the checkpoint and the owner marker both survive.
       gateway.stop();
