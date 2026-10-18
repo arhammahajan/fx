@@ -6521,6 +6521,41 @@ test "processQueuedPrompt stops an endless unexplained error finish after its se
     );
 }
 
+test "processQueuedPrompt drops Fast before mixed unclear failures can stop it" {
+    const alloc = std.testing.allocator;
+    const uncoded = unclearProviderError(.uncoded_error, "provider_error: wafer route unavailable");
+    const completions = [_]FakeCompletion{
+        .{ .omit_finish = true },
+        uncoded,
+        uncoded,
+        uncoded,
+        uncoded,
+        uncoded,
+        uncoded,
+        .{ .content = "must not be requested" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+
+    try std.testing.expectError(error.ModelError, runFastPrompt(&gateway, &hooks));
+
+    // The missing finish starts fx's count before the gateway errors start
+    // the module's run toward dropping Fast. fx waits for that drop: four
+    // sends with Fast, three without it, then the stop.
+    try std.testing.expectEqual(@as(usize, 7), gateway.request_models.items.len);
+    for (0..4) |index| try expectBodyContains(&gateway, index, fast_body);
+    for (4..7) |index| try expectBodyContains(&gateway, index, standard_body);
+    const statuses = hooks.route_recovery_statuses.items;
+    try expectRouteStatus(
+        &hooks,
+        statuses.len - 1,
+        .terminal_provider_error,
+        "⚠ Provider unavailable · provider_error: wafer route unavailable · kept failing at the same point · stopped",
+    );
+}
+
 test "processQueuedPrompt preserves fast mode after a streamed rate limit" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{
@@ -7071,6 +7106,45 @@ test "processQueuedPrompt reports failed when an HTTP error ends a request that 
     try std.testing.expectEqual(types.RouteRecoveryStatus.Kind.failed, statuses[statuses.len - 1].kind);
     try std.testing.expectEqual(@as(usize, 2), statuses[statuses.len - 1].attempt);
     try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
+}
+
+test "processQueuedPrompt ends the turn on an HTTP 429 that names a used-up quota" {
+    const alloc = std.testing.allocator;
+    const quota_body = "{\"error\":{\"message\":\"You exceeded your current quota\",\"type\":\"insufficient_quota\",\"code\":\"insufficient_quota\"}}";
+    const completions = [_]FakeCompletion{
+        .{ .status = .too_many_requests, .retry_after_seconds = 0, .err_body = quota_body },
+        .{ .content = "must not be requested" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_models.items.len);
+    try std.testing.expectEqual(std.http.Status.too_many_requests, hooks.http_status.?);
+    try std.testing.expect(std.mem.find(u8, hooks.http_detail.?, "insufficient_quota") != null);
+    try std.testing.expectEqual(@as(usize, 0), hooks.route_recovery_statuses.items.len);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
+}
+
+test "processQueuedPrompt still waits out an HTTP 429 rate limit" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{
+        .{ .status = .too_many_requests, .retry_after_seconds = 0, .err_body = "{\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"slow down\"}}" },
+        .{ .content = "Recovered" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
+    try std.testing.expect(hooks.http_status == null);
+    try expectRecovered(&hooks, 2);
 }
 
 test "processQueuedPrompt a network failure after server errors waits as a dropped connection" {
