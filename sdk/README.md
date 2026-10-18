@@ -522,7 +522,7 @@ A checkpoint records the libfx version, a hash of the tool set and the model it 
 
 Each platform's native addon is a package of its own: `@libfx/linux-x64`, `@libfx/linux-arm64`, `@libfx/darwin-x64` and `@libfx/darwin-arm64`. libfx lists them as optional dependencies, so `npm install libfx` downloads only the one for the machine it runs on, and so do pnpm and Bun. Install on the platform that runs the app: `node_modules` copied from a Mac into a Linux container has no Linux addon. Without its addon package, such as with `npm install --omit=optional` or on a musl Linux, libfx runs on WebAssembly.
 
-The default `backend: "auto"` tries the native addon first. Pass `"native"` or `"wasm"` to require one, and call `getBackendInfo()` to see what would load without creating anything.
+The default `backend: "auto"` tries the native addon first. Pass `"native"` or `"wasm"` to require one, and call `getBackendInfo()` to see what would load without creating anything. A `wasm` URL whose server answers with an error, such as a 404 for a file it doesn't serve, rejects with `LIBFX_WASM_LOAD_FAILED`, naming the URL and the status.
 
 A process runs at most 64 native runtimes at once, across its worker threads. A durable session's turn holds one while it runs, and an engine from `createFxEngine()` holds one until it closes. When agents contend for them, no agent holds more than its share, so one agent's turns can't keep another's off the native addon:
 
@@ -552,6 +552,8 @@ await terminal.interactive;
 ```
 
 This is the fx CLI's interface compiled to WebAssembly. Your page supplies storage for its sessions, settings and sign-in, and can give it a workspace that runs commands. It works in Node.js too, and `@libfx/term/fx-term.wasm` is the WebAssembly file itself, for apps that serve it. See [Terminal](https://fx.sh/docs/lib/terminal).
+
+The terminal's `onEvent` gets the `transport.*` diagnostics an agent's does, and `terminal.size` only when the size changes. When the session store refuses a save with `FX_SESSION_REVISION_CONFLICT`, the store keeps its record, fx says on screen that it stopped saving the conversation, and `onEvent` gets `session.persist_error`. A workspace that breaks the version 1 rules is refused: fx runs without it, says so, and `onEvent` gets `workspace.invalid` naming the rule. With `permission: "prompt"`, fx asks before a command it would otherwise review, in `auto` mode too, since the browser has no safety reviewer.
 
 ## Entry points
 

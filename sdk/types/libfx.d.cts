@@ -667,7 +667,7 @@ export interface FxGatewayProvider {
 /** Runs on a user's plan instead of AI Gateway. */
 interface FxSubscriptionProvider<Provider extends "codex" | "grok"> {
   provider: Provider;
-  /** Credentials for the provider's requests, asked for in whichever process runs the turn. `sessionId` is set for model requests and absent for the model list. */
+  /** Credentials for the provider's requests, asked for in whichever process runs the turn. `sessionId` names the session the request is for, the model list's included. */
   credentials: (request: { provider: Provider; sessionId?: string }) => FxProviderCredentials | Promise<FxProviderCredentials>;
   /** Receives credentials libfx refreshed, so the host can save them. */
   onCredentials?: (credentials: FxProviderCredentials, info: { provider: Provider; sessionId?: string }) => void | Promise<void>;
@@ -1012,7 +1012,13 @@ export interface FxWorkspace {
   readFile?(request: { path: string; signal: AbortSignal }): string | FxBytes | null | undefined | Promise<string | FxBytes | null | undefined>;
 }
 
-/** A diagnostic a terminal runtime passes to `onEvent`. */
+/**
+ * A diagnostic a terminal runtime passes to `onEvent`: the `runtime.*` and `transport.*` events an engine reports,
+ * where `attempt` numbers the terminal's requests; `terminal.size` when fx reads a size it has not reported yet;
+ * `terminal.resize`; the stores' `config.*` and `history.*`; `session.persist_error` with `sessionId` and the
+ * `error` the session store threw, after which a revision conflict stops fx saving that conversation; and
+ * `workspace.invalid` with the `reason` fx refused the workspace adapter.
+ */
 export interface FxTerminalEvent {
   type: string;
   timestamp: number;

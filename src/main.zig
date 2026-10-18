@@ -438,6 +438,11 @@ const App = struct {
         return null;
     }
 
+    pub fn workspaceHostRefusal(self: *const Self) ?js_host_workspace.InfoError {
+        if (comptime host_profile.js_host_workspace) return self.workspace_host.refusal;
+        return null;
+    }
+
     pub fn promptPolicy(_: *const Self) prompt_policy.Policy {
         return builtin_context.prompt_policy;
     }
@@ -679,7 +684,7 @@ const App = struct {
                 if (err != error.WorkspaceUnavailable) {
                     debug_trace.logf("workspace", "js host workspace unavailable err={s}", .{@errorName(err)});
                 }
-                break :blk .{};
+                break :blk js_host_workspace.Runtime.without(err);
             };
         }
         if (comptime host_profile.js_host_prompt_history) {

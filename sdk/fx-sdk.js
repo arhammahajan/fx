@@ -714,20 +714,30 @@ function workspaceInstructionPathAllowed(info, path) {
     (workspacePathInside(info.root, path) || workspacePathInside(info.home, path));
 }
 
+// The first rule of workspace version 1 an adapter breaks, or null.
+function workspaceContractBreak(workspace, info, permission, readFile) {
+  if (!info) return "workspace.info is required";
+  if (typeof workspace.exec !== "function") return "workspace.exec must be a function";
+  if (info.version !== 1) return "workspace.info.version must be 1";
+  if (readFile !== undefined && typeof readFile !== "function") return "workspace.readFile must be a function when present";
+  for (const key of ["root", "cwd", "home"]) {
+    if (!validWorkspacePath(info[key])) return `workspace.info.${key} must be a normalized absolute path`;
+  }
+  if (info.cwd !== info.root) return "workspace.info.cwd must equal workspace.info.root";
+  if (info.gitAvailable !== false) return "workspace.info.gitAvailable must be false";
+  if (info.ephemeral !== true) return "workspace.info.ephemeral must be true";
+  if (permission !== "allow-sandboxed" && permission !== "prompt") return "workspace.permission must be \"allow-sandboxed\" or \"prompt\"";
+  return null;
+}
+
 function prepareWorkspaceAdapter(workspace) {
   if (workspace == null) return { present: false, valid: false };
   try {
     const info = workspace.info;
     const permission = workspace.permission;
     const readFile = workspace.readFile;
-    if (!info || typeof workspace.exec !== "function" || info.version !== 1 ||
-      (readFile !== undefined && typeof readFile !== "function") ||
-      !validWorkspacePath(info.root) || !validWorkspacePath(info.cwd) ||
-      !validWorkspacePath(info.home) || info.cwd !== info.root ||
-      info.gitAvailable !== false || info.ephemeral !== true ||
-      (permission !== "allow-sandboxed" && permission !== "prompt")) {
-      return { present: true, valid: false };
-    }
+    const broken = workspaceContractBreak(workspace, info, permission, readFile);
+    if (broken) return { present: true, valid: false, reason: broken };
     const value = {
       version: 1,
       root: info.root,
@@ -739,10 +749,12 @@ function prepareWorkspaceAdapter(workspace) {
       instruction_files: typeof readFile === "function",
     };
     const encoded = encoder.encode(JSON.stringify(value));
-    if (encoded.length > workspaceInfoLimit) return { present: true, valid: false };
+    if (encoded.length > workspaceInfoLimit) {
+      return { present: true, valid: false, reason: `workspace.info must take at most ${workspaceInfoLimit} bytes as JSON` };
+    }
     return { present: true, valid: true, adapter: workspace, info: value, encoded };
-  } catch {
-    return { present: true, valid: false };
+  } catch (error) {
+    return { present: true, valid: false, reason: `reading the workspace adapter threw ${error?.name ?? "an error"}` };
   }
 }
 
@@ -961,6 +973,10 @@ function createRuntime(options) {
   let nextOutboundAttachment = 1;
   const workspaceOperations = new Set();
   const workspace = prepareWorkspaceAdapter(options.workspace);
+  // fx runs without a workspace it refuses, and shows that it refused one;
+  // the app hears which rule the adapter broke.
+  if (workspace.present && !workspace.valid) options.emit?.("workspace.invalid", { reason: workspace.reason });
+  let reportedTerminalSize = { cols: 0, rows: 0 };
   const args = ["fx", ...(options.args || [])];
   const env = Object.entries(options.env || {}).map(([key, value]) => `${key}=${value}`);
   let instance;
@@ -1501,7 +1517,12 @@ function createRuntime(options) {
       bytes(revisionPtr, revision.length).set(revision);
       writeU32(revisionLenOut, revision.length);
       return 0;
-    }).catch((error) => error?.code === "FX_SESSION_REVISION_CONFLICT" ? -2 : -1);
+    }).catch((error) => {
+      // The app learns that a turn was not saved, and why: on a revision
+      // conflict, fx stops saving this conversation (app_session_runtime.zig).
+      options.emit?.("session.persist_error", { sessionId: id, error });
+      return error?.code === "FX_SESSION_REVISION_CONFLICT" ? -2 : -1;
+    });
   }
 
   function sessionList(outPtr, outCap) {
@@ -1769,11 +1790,16 @@ function createRuntime(options) {
     fx_session_commit: new WebAssembly.Suspending(sessionCommit),
     fx_session_list: new WebAssembly.Suspending(sessionList),
     fx_session_remove: new WebAssembly.Suspending(sessionRemove),
+    // The browser has no SIGWINCH, so fx asks for the size on every pass of
+    // its loop, about 60 times a second while idle; only a size it has not
+    // reported yet is a diagnostic.
     fx_term_size(cols, rows) {
       const width = options.terminal?.cols || 80;
       const height = options.terminal?.rows || 24;
       new DataView(memory().buffer).setUint16(cols, width, true);
       new DataView(memory().buffer).setUint16(rows, height, true);
+      if (width === reportedTerminalSize.cols && height === reportedTerminalSize.rows) return;
+      reportedTerminalSize = { cols: width, rows: height };
       options.emit?.("terminal.size", { cols: width, rows: height });
     },
   };
@@ -1850,6 +1876,43 @@ async function instantiate(options) {
   return runtime;
 }
 
+// The terminal's requests report the transport.* diagnostics an engine's do.
+// fx retries inside the core, so `attempt` numbers the terminal's requests
+// from 1, which pairs each start with its response or error. The endpoint
+// carries no query string, so no team or token reaches a diagnostic.
+function terminalTransport(hostFetch, emit) {
+  const send = hostFetch ?? globalThis.fetch.bind(globalThis);
+  let requests = 0;
+  return async (input, init = {}) => {
+    const attempt = ++requests;
+    const method = String(init.method ?? input?.method ?? "GET").toUpperCase();
+    let endpoint = String(input?.url ?? input);
+    try {
+      const url = new URL(endpoint);
+      endpoint = `${url.origin}${url.pathname}`;
+    } catch {}
+    const startedAt = performance.now();
+    emit("transport.start", { attempt, method, endpoint, model: undefined });
+    try {
+      const response = await send(input, init);
+      const headers = response.headers;
+      emit("transport.response", {
+        attempt,
+        status: response.status,
+        elapsedMs: performance.now() - startedAt,
+        requestId: headers.get("x-vercel-id"),
+        generationId: headers.get("x-generation-id"),
+        model: headers.get("x-model-id") ?? undefined,
+        provider: headers.get("x-vercel-ai-gateway-provider") ?? headers.get("x-ai-gateway-provider"),
+      });
+      return response;
+    } catch (error) {
+      emit("transport.error", { attempt, elapsedMs: performance.now() - startedAt, error: error instanceof Error ? error.name : "Error" });
+      throw error;
+    }
+  };
+}
+
 export async function createFxTerminal(options) {
   if (!options?.terminal) throw new TypeError("terminal is required");
   const emit = (type, detail = {}) => {
@@ -1876,7 +1939,7 @@ export async function createFxTerminal(options) {
     });
   };
   emit("runtime.start", { surface: "terminal" });
-  const runtime = await instantiate({ ...options, emit, stdout, onTerminalPoll });
+  const runtime = await instantiate({ ...options, fetch: terminalTransport(options.fetch, emit), emit, stdout, onTerminalPoll });
   runtime.exited.then((code) => {
     if (!interactiveScheduled) rejectInteractive(new Error(`fx terminal exited with code ${code} before becoming interactive`));
   });
