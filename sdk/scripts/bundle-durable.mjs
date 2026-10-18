@@ -1,6 +1,7 @@
 // Bundles each durability module with the World it wraps into one
 // self-contained ES module, so an app installs nothing more and never loads a
 // World of its own. Run with Bun: `bun sdk/scripts/bundle-durable.mjs <out>`.
+import { createHash } from "node:crypto";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -62,6 +63,38 @@ const recordFenceLockHolder = {
   },
 };
 
+// world-local names a stream chunk when its write is called, and readers
+// order chunks by name, so a write that stalls before it lands can land
+// ahead of chunks readers already have (DUR-38). The bundled World lands its
+// chunks through durable/world-local-stream-place.mjs, which names each one
+// as it lands. World-local's `write`, `writeMulti` and `close` are replaced
+// whole, and their source is checked by its digest, so a change to them
+// upstream fails the build here.
+const streamWritesStart = "            async write(_runId, name, chunk) {\n";
+const streamWritesEnd = "            async list(runId) {\n";
+const streamWritesDigest = "a878ddc2aeadb4a742cc529e7bb7177a3e4ba0153727593b4049cf64eed5fc93";
+const streamerImport = "import { withInProcessLock } from './util.js';\n";
+const streamPlace = fileURLToPath(new URL("../durable/world-local-stream-place.mjs", import.meta.url));
+const placeStreamChunks = {
+  name: "place-stream-chunks-on-landing",
+  setup(build) {
+    build.onLoad({ filter: /[\\/]world-local[\\/]dist[\\/]streamer\.js$/ }, async ({ path }) => {
+      const source = await Bun.file(path).text();
+      const start = source.indexOf(streamWritesStart);
+      const end = source.indexOf(streamWritesEnd);
+      const once = (text) => source.split(text).length === 2;
+      const region = start >= 0 && end > start ? source.slice(start, end) : "";
+      const digest = createHash("sha256").update(region).digest("hex");
+      if (!once(streamWritesStart) || !once(streamWritesEnd) || !once(streamerImport) || digest !== streamWritesDigest) {
+        throw new Error("world-local's stream writes changed; update the stream chunk patch, or drop it if world-local now names a chunk as it lands");
+      }
+      const placed = `            ...placedStreamWrites({ basedir, tagSuffix, streamEmitter, registerStreamForRun, toBuffer, serializeChunk, chunkDirForStream, writeFile: (filePath, data) => write(filePath, data, { overwrite: true }), retry: withWindowsRetry, mint: () => monotonicUlid() }),\n`;
+      const patched = source.slice(0, start) + placed + source.slice(end);
+      return { contents: patched.replace(streamerImport, `${streamerImport}import { placedStreamWrites } from ${JSON.stringify(streamPlace)};\n`), loader: "js" };
+    });
+  },
+};
+
 // libfx ships no copy of undici (PERF-14). The Worlds send their requests
 // through undici dispatchers they build, unless Workflow's `node:http`
 // transport (`WORKFLOW_NODE_HTTP`) is on: then Node's own HTTP client sends
@@ -103,7 +136,7 @@ for (const name of ["local", "vercel", "world"]) {
     minify: true,
     // cbor-x prefers an optional native addon and falls back without it.
     external: ["cbor-extract"],
-    plugins: [pinWorldVersion, recordFenceLockHolder, noUndici],
+    plugins: [pinWorldVersion, recordFenceLockHolder, placeStreamChunks, noUndici],
     metafile: true,
   });
   if (!result.success) {
@@ -115,5 +148,8 @@ for (const name of ["local", "vercel", "world"]) {
   const inputs = Object.keys(result.metafile.inputs);
   if (name === "local" && !inputs.some((input) => /(^|[\\/])world-local-fence-lock\.mjs$/.test(input))) {
     throw new Error("durable/local.mjs bundles world-local without the fence lock patch");
+  }
+  if (name === "local" && !inputs.some((input) => /(^|[\\/])world-local-stream-place\.mjs$/.test(input))) {
+    throw new Error("durable/local.mjs bundles world-local without the stream chunk patch");
   }
 }

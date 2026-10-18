@@ -243,6 +243,8 @@ A World that delivers queue messages over HTTP needs `agent.wakeHandler()`, or `
 
 On a World with Workflow's in-band writer fence, libfx writes each claim and record so that the World itself refuses a write from a worker another has replaced, and nothing of it is stored. libfx finds the fence in the World's capabilities, so there's nothing to configure. On a World without it, libfx detects the replaced worker after its write instead, and the session's log ignores what that worker wrote.
 
+A stream cursor counts the lines before it, so a World must put each stream chunk after every chunk the stream holds when it lands. The World `local()` bundles does. Workflow's file system World, `@workflow/world-local` 5.1.1, places a chunk where its write started instead: passed to `world()`, a line that a stalled function had already started writing when another took its session over can land ahead of lines a reader has, and move the cursor of every line after it.
+
 ## Tools
 
 ```js

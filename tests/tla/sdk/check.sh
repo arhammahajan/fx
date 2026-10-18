@@ -21,6 +21,7 @@
 #   bun ../drivers/drive-agents.mjs   # AgentRouting
 #   bun ../drivers/drive-steer.mjs ideal && bun ../drivers/drive-steer.mjs faults   # DurableSteer
 #   bun ../drivers/drive-tenants.mjs   # TenantIsolation
+#   bun ../drivers/drive-uistream.mjs   # UiStream, a takeover on libfx's bundled world-local
 set -eu
 cd "$(dirname "$0")"
 
@@ -140,18 +141,25 @@ done
 # replay gives it. The takeover config freezes the first worker with a write
 # on its way while a second takes over, on a World that places a chunk where
 # it lands, as memory() and Vercel's do: the late chunk lands after what
-# readers have. The LateLine witness does the same on a World that places a
-# chunk where its write started, as world-local does: the late chunk goes
-# ahead of lines a reader already has, the risk libfx can't close there.
-for config in local vercel takeover; do
+# readers have. The local-takeover config does the same on libfx's bundled
+# world-local, which lands a chunk only at the place after the newest, and
+# its graph is the one drive-uistream.mjs walks. The LateLine witness places
+# a chunk where its write started, as world-local 5.1.1 does: the late chunk
+# goes ahead of lines a reader already has. The StaleName witness names a
+# chunk just before it lands but lands it there even when another chunk
+# landed since, as a writer frozen between the two would.
+for config in local vercel takeover local-takeover; do
     echo "== UiStream ($config)"
-    if ! "$java" -cp "$jar" tlc2.TLC -deadlock -workers 1 -cleanup -metadir "$work/ui-$config" \
+    dump=""
+    [ "$config" = local-takeover ] && dump="-dump dot,actionlabels graphs/ui-local-takeover"
+    # shellcheck disable=SC2086 # $dump is two words or none
+    if ! "$java" -cp "$jar" tlc2.TLC -deadlock -workers 1 -cleanup -metadir "$work/ui-$config" $dump \
         -config "UiStream-$config.cfg" UiStream.tla > "$work/ui-$config.log" 2>&1; then
         cat "$work/ui-$config.log"; status=1; continue
     fi
     grep -E 'distinct states|depth of' "$work/ui-$config.log"
 done
-for witness in Batched LateLine; do
+for witness in Batched LateLine StaleName; do
     if "$java" -cp "$jar" tlc2.TLC -deadlock -workers auto -cleanup -metadir "$work/uw-$witness" \
         -config "UiStreamWitness-$witness.cfg" UiStream.tla 2>&1 | grep -q -E "Invariant LiveIsReplay is violated"; then
         echo "== ui witness $witness reached"

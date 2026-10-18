@@ -15,7 +15,7 @@ TLA+ specifications for fx, checked with TLC, together with the scripts and Bun 
 | `shell_command/` | How an agent git command is admitted and run (`src/core/shell_command/safe_git.zig`), and one model turn through the shell tool, for the current design and a redesign. | `shell_command/check.sh`, `bun test drivers/shell_command/` |
 | `terminal/` | The in-memory shell snapshot owner (`src/core/terminal/shell_snapshot.zig`) and the lifecycle of hosted terminals. | `terminal/check.sh` |
 | `usage/` | `/usage` refreshes and the shared usage cache (`src/usage/`): `LeanUsage.tla` and `UsageModel.tla`. | `usage/check.sh`, then the drivers in `drivers/usage/` |
-| `drivers/` | The Bun drivers. They run the real fx binary or SDK code, record what happens, and have TLC check each run against its model. `drive.mjs`, `drive-intake.mjs`, `drive-images.mjs`, `drive-agents.mjs`, `drive-tenants.mjs`, and `drive-steer.mjs` walk the SDK code along the `sdk/` state graphs. | See each folder's `check.sh` |
+| `drivers/` | The Bun drivers. They run the real fx binary or SDK code, record what happens, and have TLC check each run against its model. `drive.mjs`, `drive-intake.mjs`, `drive-images.mjs`, `drive-agents.mjs`, `drive-tenants.mjs`, `drive-steer.mjs`, and `drive-uistream.mjs` walk the SDK code along the `sdk/` state graphs; `drive-uistream.mjs` walks a takeover with a write held on its way against the world-local libfx bundles, or with `--world-local` against another. | See each folder's `check.sh` |
 | `lib/` | `tlc.sh`, which finds TLC and Java and runs a table of configs with their expected verdicts, `tlc.py`, which asks `tlc.sh` for TLC and Java on behalf of the Python checkers, and `run-tlc.sh`, which runs TLC once for the drivers. | |
 
 ## Requirements
@@ -78,6 +78,7 @@ bun tests/tla/drivers/drive-agents.mjs --walks 60       # agent routing
 bun tests/tla/drivers/drive-tenants.mjs --walks 60      # tenants in one process
 bun tests/tla/drivers/drive-tenants.mjs --development   # the same in a development server, where the newest agent replaces the old
 bun tests/tla/drivers/drive-steer.mjs ideal --walks 20  # steering
+bun tests/tla/drivers/drive-uistream.mjs --walks 40     # a UI stream takeover on the bundled world-local
 bun test ./tests/tla/drivers/shell_command/             # a driver written as bun tests; see each check.sh for its own
 ```
 

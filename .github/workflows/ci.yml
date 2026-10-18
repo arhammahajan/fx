@@ -406,6 +406,7 @@ jobs:
           bun tests/tla/drivers/drive-steer.mjs faults --walks 10 --seed 4 --hooks
           bun tests/tla/drivers/drive-steer.mjs faults --walks 10 --seed 6 --backend wasm
           bun tests/tla/drivers/drive-steer.mjs ideal --walks 30 --seed 5 --backend wasm
+          bun tests/tla/drivers/drive-uistream.mjs --walks 40 --seed 1
 
       - name: Test libfx on a World
         run: |
@@ -456,6 +457,7 @@ jobs:
           node sdk/scripts/package-libfx.mjs sdk/dist native-addons/libfx.linux-x64.node native-addons/libfx.linux-arm64.node native-addons/libfx.darwin-x64.node native-addons/libfx.darwin-arm64.node
           node --experimental-wasm-jspi sdk/tests/test-node-async-assets.mjs sdk/dist
           node sdk/tests/test-world-local-fence-lock.mjs sdk/dist/libfx
+          node sdk/tests/test-world-local-stream-place.mjs sdk/dist/libfx
           # The tests install libfx's tarball with this runner's addon package
           # and @libfx/term from beside it, as npm would from the registry.
           mkdir -p /tmp/libfx-packages
