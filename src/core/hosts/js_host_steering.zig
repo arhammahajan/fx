@@ -31,13 +31,21 @@ pub const State = union(enum) {
     open: struct { queued: usize, handoff: bool },
 };
 
-/// The host reports -1 when closed, else twice the queued count, plus one
-/// for a pending handoff.
+/// The host reports -1 when closed, -2 when closed because the user
+/// cancelled the turn, else twice the queued count, plus one for a pending
+/// handoff.
 pub fn state() State {
     const raw = fx_steering_state();
     if (raw < 0) return .closed;
     const value: usize = @intCast(raw);
     return .{ .open = .{ .queued = value >> 1, .handoff = value & 1 == 1 } };
+}
+
+/// Whether the host closed the running turn's steering because the user
+/// cancelled the turn. The web core reads the cancel itself only once it
+/// reads its input again, which can be after the turn ended.
+pub fn cancelled() bool {
+    return fx_steering_state() == -2;
 }
 
 /// One steer the host handed over, with the input id a journaled session

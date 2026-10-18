@@ -3274,6 +3274,99 @@ if (durabilityKind === "memory") {
     await agent.close();
   });
 
+  // DUR-20, DUR-64: a cancel stored while the record that ends a turn is on
+  // its way to the log stops nothing. The turn ends as that record says, in
+  // its result and its turn_end line, with its whole reply, and the cancel
+  // is spent with it (`tests/tla/sdk/DurableSession.tla` LateCancel).
+  test("a cancel that reaches a turn while its end is being stored stops nothing: the turn ends as that end says", async () => {
+    const hold = { armed: true, release: null };
+    const base = memory();
+    let wrapped = null;
+    const durability = {
+      ...base,
+      create() {
+        const backend = base.create();
+        wrapped ??= Object.assign(Object.create(backend), {
+          async session(id) {
+            const log = await backend.session(id);
+            return {
+              ...log,
+              async append(entry) {
+                if (hold.armed && entry?.k === "record" && (entry.marks ?? []).some((mark) => mark?.end === true)) {
+                  hold.armed = false;
+                  await new Promise((go) => { hold.release = go; });
+                }
+                return log.append(entry);
+              },
+            };
+          },
+        });
+        return wrapped;
+      },
+    };
+    const agent = createFxAgent(agentOptions(durability));
+    const session = agent.session();
+    const messageId = `late-cancel-${requests.length}`;
+    const turn = session.prompt("several words", { messageId });
+    await turn.accepted;
+    await until(() => hold.release !== null, "the record that ends the turn");
+    const asked = requests.length;
+    await session.cancel();
+    // The worker reads the cancel while the record is held.
+    await new Promise((resolveWait) => setTimeout(resolveWait, 100 * timeScale));
+    hold.release();
+    assert.equal((await withinSeconds(turn.result, "the turn's result never came")).stopReason, "end_turn");
+    const lines = (await readLines(session.stream(0), 16)).filter((line) => line.messageId === messageId);
+    assert.deepEqual(lines.filter((line) => line.type.startsWith("turn_")).map((line) => [line.type, line.stopReason]), [["turn_start", undefined], ["turn_end", "end_turn"]]);
+    assert.equal(lines.filter((line) => line.type === "text_delta").map((line) => line.delta).join(""), "one two three ", "the reply once and whole");
+    assert.equal(requests.length, asked, "nothing asked the model again");
+    // The cancel is spent with the turn it came for.
+    assert.equal((await withinSeconds(session.prompt("hello there").result, "the next turn never ended")).stopReason, "end_turn");
+    await agent.close();
+  });
+
+  // DUR-64: a cancel that reaches a turn before the record that ends it is
+  // written is in that record. The web core reads the cancel itself only
+  // after the turn, so it learns of it from its host's steering, and the log
+  // says cancelled as the result and the turn_end line do, not that the
+  // request the cancel cut short failed.
+  test("a cancel that cuts a streaming reply short is in the record that ends the turn", async () => {
+    const base = memory();
+    const ends = [];
+    let wrapped = null;
+    const durability = {
+      ...base,
+      create() {
+        const backend = base.create();
+        wrapped ??= Object.assign(Object.create(backend), {
+          async session(id) {
+            const log = await backend.session(id);
+            return {
+              ...log,
+              async append(entry) {
+                if (entry?.k === "record") for (const mark of entry.marks ?? []) if (mark?.end === true) ends.push(mark.stopReason);
+                return log.append(entry);
+              },
+            };
+          },
+        });
+        return wrapped;
+      },
+    };
+    const agent = createFxAgent(agentOptions(durability));
+    const session = agent.session();
+    const before = slow.length;
+    const messageId = `cut-short-${requests.length}`;
+    const turn = session.prompt("slow reply", { messageId });
+    await until(() => slow.length > before && slow.at(-1).sent > 0, "the reply to stream");
+    await session.cancel();
+    assert.equal((await withinSeconds(turn.result, "the turn's result never came")).stopReason, "cancelled");
+    const lines = (await readLines(session.stream(0), 64)).filter((line) => line.messageId === messageId);
+    assert.equal(lines.find((line) => line.type === "turn_end").stopReason, "cancelled");
+    assert.ok(ends.length > 0 && ends.every((reason) => reason === "cancelled"), `the records that end the turn say ${JSON.stringify(ends)}`);
+    await agent.close();
+  });
+
   // The reply an end mark carries is for libfx's own sessions: a store that
   // set `marks: true` gets the marks its type lists.
   test("a store that asks for marks hears how a turn ended, and not its reply", async () => {

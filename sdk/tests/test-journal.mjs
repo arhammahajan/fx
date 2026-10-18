@@ -724,6 +724,54 @@ test("a turn's result waits until its end is stored", async () => {
   await agent.close();
 });
 
+// Once the record that ends a turn is on its way to the store, the turn ended
+// as that record says: a cancel or a handoff then stops nothing, and the
+// turn's result, its updates and a later reader of the store all agree
+// (DUR-20, DUR-64; `tests/tla/durable/Resumption.tla` ResultSaysHow).
+for (const reason of [undefined, "handoff"]) {
+  test(`a ${reason ?? "cancel"} while a turn's end is being stored stops nothing: the turn ends as that end says`, async () => {
+    const journal = eventJournal();
+    const store = persisted(journal);
+    let holding = false;
+    let release;
+    const held = new Promise((resolveHeld) => { release = resolveHeld; });
+    const holdingEnd = {
+      ...store,
+      async append(input) {
+        if (!holding && decodeRecord(input.data).some((event) => event.type === "turn_committed")) {
+          holding = true;
+          await held;
+        }
+        return store.append(input);
+      },
+    };
+    const agent = await createFxEngine(options(sourceBackend, undefined, { persistence: holdingEnd }));
+    const turn = agent.prompt("hold the end");
+    let text = "";
+    const updates = (async () => { for await (const update of turn) if (update.type === "text_delta") text += update.delta; })();
+    for (let waited = 0; !holding && waited < 5_000; waited += 10) await sleepMs(10);
+    assert.ok(holding, "the turn's end reached the store");
+    turn.cancel(reason === undefined ? undefined : { reason });
+    await sleepMs(50);
+    release();
+    await updates;
+    assert.equal((await turn.result).stopReason, "end_turn", "the turn's result says what its end says");
+    assert.equal(text, "answer to hold the end", "the turn's updates hold its whole reply");
+    const end = journal.events.at(-1);
+    assert.equal(end.type, "turn_committed");
+    assert.equal(end.stopReason, "end_turn");
+    // The turn ended; nothing waits to continue it, here or in a new engine.
+    const next = await run(agent, "and then");
+    assert.equal(next.result.stopReason, "end_turn");
+    assert.equal(next.text, "answer to and then");
+    await agent.close();
+    const reopened = await createFxEngine(options(targetBackend, journal));
+    assert.equal(reopened.resume(), null, "a new engine finds no open turn");
+    await reopened.close();
+    assertContiguous(journal.events);
+  });
+}
+
 test("a turn whose end fails to store rejects its result", async () => {
   const journal = eventJournal();
   const store = persisted(journal);

@@ -56,6 +56,16 @@ const answers = new Map();
 // the turn with the saved reply, asking no model and streaming none of it,
 // as fx's engine does in a session whose stream already holds it.
 const savesReply = new Set();
+// Inputs in `savesReply` whose resume restarts the saved reply instead of
+// ending the turn with it, as fx's engine does when the resume brings inputs
+// the saved reply never saw: it shows `restartNotice` as a text line, as fx
+// does when it restarts an answer, then streams the reply again.
+const restarts = new Set();
+const restartNotice = "\n\n[Response interrupted. Restarting.]\n\n";
+// Inputs in `answers` whose engine, cancelled once the record that ends its
+// turn is on its way, drops the rest of its reply and answers cancelled, as
+// fx's engine did before it followed that record.
+const lateCancels = new Set();
 const replyOf = (input) => answers.get(input).filter((event) => event.type === "text_delta").map((event) => event.delta).join("");
 const endMarks = (input, stopReason) => [unsaidEnds.has(input) ? { end: true }
   : { end: true, stopReason, ...(answers.has(input) && stopReason === "end_turn" ? { reply: replyOf(input) } : {}) }];
@@ -113,6 +123,10 @@ function scriptedHarness({ steps = 3 } = {}) {
           throw harnessStopped("the engine exited mid-turn");
         }
         if (records.some((record) => record.turnId === turnId && record.saved)) {
+          if (restarts.has(input)) {
+            push({ type: "text_delta", delta: restartNotice });
+            for (const event of answers.get(input)) push(event);
+          }
           await append({ turnId, end: true }, endMarks(input, "end_turn"));
           return { stopReason: "end_turn" };
         }
@@ -135,12 +149,18 @@ function scriptedHarness({ steps = 3 } = {}) {
           ran.push(`${turnId}:${step}`);
           const last = step === steps - 1;
           if (last && answers.has(input)) {
-            for (const event of answers.get(input)) push(event);
+            const reply = answers.get(input);
+            const late = lateCancels.has(input);
+            for (const event of late ? reply.slice(0, 1) : reply) push(event);
             if (savesReply.has(input)) {
               await append({ turnId, step, word, saved: true }, []);
               await append({ turnId, end: true }, endMarks(input, "end_turn"));
             } else {
               await append({ turnId, step, word, end: true }, endMarks(input, "end_turn"));
+            }
+            if (late) {
+              if (signal.aborted) return { stopReason: "cancelled" };
+              for (const event of reply.slice(1)) push(event);
             }
             continue;
           }
@@ -1968,6 +1988,107 @@ if (durabilityKind === "memory") {
       await agent.close();
     });
   }
+
+  // DUR-38: a resume that restarts a saved reply shows the restart notice as
+  // a text line, then the reply again, so the turn's text ends with the dead
+  // worker's start of the reply, that notice and the resumed worker's start
+  // of it. When that worker dies after the record that ends the turn, the
+  // worker that writes the end shows only what of that reply the resumed
+  // worker's lines never did, once (`tests/tla/sdk/DurableSession.tla`
+  // Unshown, with Restarts).
+  test("a turn whose resume restarted its saved reply, and whose worker then died after its end, shows that reply once after the restart", async () => {
+    answers.set("restarted", [{ type: "text_delta", delta: "one " }, { type: "text_delta", delta: "two " }, { type: "text_delta", delta: "three " }]);
+    savesReply.add("restarted");
+    restarts.add("restarted");
+    const late = { now: false, lost: (event) => event.type === "text_delta" && (event.delta === "two " || event.delta === "three ") };
+    const dies = { armed: true, dead: false, lost: (event) => event.type === "text_delta" && event.delta !== "one " };
+    const durability = dyingAfterSave(dyingAfterEnd(memory(), late), dies);
+    const agent = createAnsweringAgent({ durability });
+    const internals = agent[Symbol.for("libfx.durableInternals")];
+    const session = agent.session();
+    const first = session.prompt("restarted", { messageId: "turn-restarted" });
+    const { sessionId } = await first.accepted;
+    while (!dies.dead) await sleep(10);
+    while (internals.liveWorkers() > 0) await sleep(10);
+    dies.dead = false;
+    // The resuming worker restarts the reply, ends the turn, then dies.
+    late.now = true;
+    void session.prompt("restarted", { messageId: "turn-restarted" }).result.catch(() => {});
+    const log = await durability.create().session(sessionId);
+    while (foldSessionLog(await log.read()).lastTurnId !== "turn-restarted") await sleep(10);
+    await sleep(landMs);
+    while (internals.liveWorkers() > 0) await sleep(10);
+    late.now = false;
+    const retried = await within(session.prompt("restarted", { messageId: "turn-restarted" }).result, "the retry waited for an end nobody writes");
+    assert.equal(retried.stopReason, "end_turn");
+    const lines = await linesOf(session, "turn-restarted");
+    assert.deepEqual(lines.filter(([epoch]) => epoch > 2).map(([, type, delta]) => [type, delta]), [
+      ["text_delta", "two three "],
+      ["turn_end", null],
+    ], `after ${JSON.stringify(lines.filter(([epoch]) => epoch <= 2))}`);
+    const text = replyText(lines);
+    assert.equal(text.slice(text.lastIndexOf(restartNotice) + restartNotice.length), "one two three ", "the reply once and whole after the restart");
+    answers.delete("restarted");
+    savesReply.delete("restarted");
+    restarts.delete("restarted");
+    await agent.close();
+  });
+
+  // memory(), holding the first record that ends a turn while `hold.armed`
+  // is set, until the test calls `hold.release()`.
+  const holdingEnd = (base, hold) => {
+    let wrapped = null;
+    return {
+      ...base,
+      create() {
+        const backend = base.create();
+        wrapped ??= Object.assign(Object.create(backend), {
+          async session(id) {
+            const log = await backend.session(id);
+            return {
+              ...log,
+              async append(entry) {
+                if (hold.armed && recordEnds(entry)) {
+                  hold.armed = false;
+                  await new Promise((go) => { hold.release = go; });
+                }
+                return log.append(entry);
+              },
+            };
+          },
+        });
+        return wrapped;
+      },
+    };
+  };
+
+  // DUR-20, DUR-64: once the record that ends a turn is on its way to the
+  // log, the turn ended as that record says. A cancel then stops nothing,
+  // even with an engine that answers it cancelled and drops the rest of its
+  // reply: the turn's end line says what the log says, after the whole reply
+  // (`tests/tla/sdk/DurableSession.tla` LateCancel, EndSaysHow).
+  test("a cancel that reaches a turn once its end is on its way stops nothing: the turn ends as that end says, with its whole reply", async () => {
+    answers.set("late cancel", [{ type: "text_delta", delta: "one " }, { type: "text_delta", delta: "two " }, { type: "text_delta", delta: "three " }]);
+    lateCancels.add("late cancel");
+    const hold = { armed: true, release: null };
+    const agent = createAnsweringAgent({ durability: holdingEnd(memory(), hold) });
+    const session = agent.session();
+    const turn = session.prompt("late cancel", { messageId: "turn-late" });
+    await turn.accepted;
+    while (hold.release === null) await sleep(5);
+    await session.cancel();
+    await sleep(landMs);
+    hold.release();
+    assert.equal((await within(turn.result, "the turn's result never came")).stopReason, "end_turn");
+    const lines = (await readLines(session.stream(0), 100)).filter((line) => line.messageId === "turn-late");
+    assert.deepEqual(lines.filter((line) => line.type.startsWith("turn_")).map((line) => [line.type, line.stopReason]), [["turn_start", undefined], ["turn_end", "end_turn"]]);
+    assert.equal(lines.filter((line) => line.type === "text_delta").map((line) => line.delta).join(""), "one two three ", "the reply once and whole");
+    // The cancel is spent with the turn it came for.
+    assert.equal((await within(session.prompt("after", { messageId: "turn-after-late" }).result, "the next turn never ended")).stopReason, "end_turn");
+    answers.delete("late cancel");
+    lateCancels.delete("late cancel");
+    await agent.close();
+  });
 }
 
 // memory(), with a worker that dies right after the first entry that ends a

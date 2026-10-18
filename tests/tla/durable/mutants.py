@@ -164,6 +164,12 @@ MUTANTS = [
     # violated, proving that a resume really delivers a saved reply.
     ("Resumption", "witness: a resume delivers a saved reply",
      [], "NoDelivery", ["NoDelivery"]),
+    ("Resumption", "a cancel while the turn's end is on its way makes turn.result say cancelled",
+     [("    /\\ resultHow' = endHow\n",
+       "    /\\ resultHow' = IF lateCancel THEN \"cancelled\" ELSE endHow\n")],
+     "ResultSaysHow"),
+    ("Resumption", "witness: a cancel comes while the turn's end is on its way",
+     [], "NoLateCancel", ["NoLateCancel"]),
 
     # ParallelBatch.tla
     ("ParallelBatch", "a writer starts while earlier calls still run",

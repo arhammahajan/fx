@@ -975,6 +975,9 @@ function createRuntime(options) {
   let steeringOpen = false;
   // A steer that cannot join the running turn waits to run next.
   let steeringHandoff = false;
+  // The running turn's steering closed because the turn was cancelled. The
+  // core reads this as it ends the turn, before it reads the cancel itself.
+  let steeringCancelled = false;
   // Raw payloads beside ACP frames: the core copies inbound bytes into its
   // own memory and publishes outbound bytes for the agent to take.
   const inboundAttachments = new Map();
@@ -1780,9 +1783,10 @@ function createRuntime(options) {
     fx_host_tool_result_release() { pendingHostToolResult = null; },
     fx_steering_take: steeringTake,
     fx_steering_close() { steeringOpen = false; clearSteering(); },
-    // -1 once the turn takes no more steering, else twice how many steers
-    // wait, plus one when a handoff does.
-    fx_steering_state() { return steeringOpen ? steering.length * 2 + (steeringHandoff ? 1 : 0) : -1; },
+    // -1 once the turn takes no more steering, -2 when that is because the
+    // turn was cancelled, else twice how many steers wait, plus one when a
+    // handoff does.
+    fx_steering_state() { return steeringOpen ? steering.length * 2 + (steeringHandoff ? 1 : 0) : steeringCancelled ? -2 : -1; },
     fx_attachment_size: attachmentSize,
     fx_attachment_take: attachmentTake,
     fx_attachment_put: attachmentPut,
@@ -1826,7 +1830,7 @@ function createRuntime(options) {
     discardAttachments() { inboundAttachments.clear(); },
     wake() { stdin.wake(); },
     closeStdin() { steeringOpen = false; clearSteering(); stdin.close(); },
-    openSteering() { clearSteering(); steeringOpen = true; },
+    openSteering() { clearSteering(); steeringOpen = true; steeringCancelled = false; },
     steer: queueSteering,
     withdrawSteering,
     // Ends the running turn at its next safe point; false when none runs.
@@ -1836,6 +1840,8 @@ function createRuntime(options) {
       return true;
     },
     closeSteering() { steeringOpen = false; clearSteering(); },
+    // Closes the running turn's steering because the turn was cancelled.
+    cancelSteering() { steeringOpen = false; steeringCancelled = true; clearSteering(); },
     abortHostEffects,
     abort(error) {
       aborted = true;
@@ -2785,6 +2791,7 @@ export async function createFxEngine(options = {}) {
       return;
     }
     noteJournalEnds(events);
+    activeTurn?.noteRecords?.(events);
     journalQueue.push(...events);
     // A caller waits for its steer or withdrawal to be stored, and a turn's
     // result for the turn's end or yield.
@@ -3851,6 +3858,24 @@ export async function createFxEngine(options = {}) {
     let providerError = null;
     let finished = false;
     let cancelled = false;
+    // How the record that ends this turn says it ended, once that record is
+    // on its way to the store: undefined until then, and null for an end
+    // that does not say. A resumed turn's first progress is in the journal
+    // already; a new turn's end follows its own.
+    let recordedEnd;
+    let progressed = resuming;
+    // What the core sent after a cancel, until the turn's end says whether
+    // the cancel came in time.
+    const held = [];
+    let heldBytes = 0;
+    // Hands an update to the turn's reader, or queues it for the next read.
+    const deliver = (update, size) => {
+      if (update?.sessionUpdate === "tool_call") shownCalls.add(update.toolCallId);
+      else if (update?.sessionUpdate === "tool_call_update" && (update.status === "completed" || update.status === "failed")) shownCalls.delete(update.toolCallId);
+      const waiter = waiters.shift();
+      if (waiter) waiter.resolve({ value: update, done: false });
+      else { queue.push({ update, size }); queuedBytes += size; }
+    };
     const turn = {
       // The host's id: the one it gave, or for a resumed turn, the one the
       // turn started with.
@@ -3868,7 +3893,17 @@ export async function createFxEngine(options = {}) {
         if (cancelled || finished) {
           // A call the events showed still gets the end the core gave it,
           // unless the turn was handed off for another agent to continue.
-          if (finished || handedOff || !ended || !shownCalls.has(update.toolCallId)) { discardedBytes += size; return; }
+          if (finished || handedOff || !ended || !shownCalls.has(update.toolCallId)) {
+            // What the core sent after a cancel waits for the turn's end,
+            // which says whether the cancel came in time (`noteRecords`).
+            if (!finished && !handedOff && recordedEnd === undefined && journal && size <= maxUnreadEventBytes - heldBytes) {
+              held.push({ update, size });
+              heldBytes += size;
+            } else {
+              discardedBytes += size;
+            }
+            return;
+          }
         }
         if (size > maxCoreMessageBytes) throw new RangeError("core output message exceeds 64 MiB");
         if (queue.length && (queue.length >= maxUnreadEvents || size > maxUnreadEventBytes - queuedBytes)) {
@@ -3879,11 +3914,31 @@ export async function createFxEngine(options = {}) {
           }
           return capacity.then(() => turn.push(update, size));
         }
-        if (update?.sessionUpdate === "tool_call") shownCalls.add(update.toolCallId);
-        else if (ended) shownCalls.delete(update.toolCallId);
-        const waiter = waiters.shift();
-        if (waiter) waiter.resolve({ value: update, done: false });
-        else { queue.push({ update, size }); queuedBytes += size; }
+        deliver(update, size);
+      },
+      // This turn's records as they go to the store. Once the record that
+      // ends the turn is on its way, the turn ended as that record says: a
+      // cancel the core took too late to stop it stops nothing, and what the
+      // core sent after it is the turn's (DUR-20, DUR-64;
+      // `tests/tla/durable/Resumption.tla` ResultSaysHow).
+      noteRecords(events) {
+        for (const event of events) {
+          if (event?.type === "turn_progress") progressed = true;
+          else if (progressed && recordedEnd === undefined && isJournalEnd(event)) {
+            recordedEnd = journalEndReason(event);
+            const late = held.splice(0);
+            heldBytes = 0;
+            // An end that says the turn finished overrides a cancel the core
+            // took too late; one that says it failed does not, since a cancel
+            // that comes first is why its request failed.
+            if (cancelled && recordedEnd !== null && recordedEnd !== "cancelled" && recordedEnd !== "error") {
+              cancelled = false;
+              for (const { update, size } of late) deliver(update, size);
+            } else {
+              for (const { size } of late) discardedBytes += size;
+            }
+          }
+        }
       },
       toolControllers,
       transportAttempts: 0,
@@ -3950,7 +4005,9 @@ export async function createFxEngine(options = {}) {
         const reason = cancelOptions?.reason;
         if (reason !== undefined && reason !== "handoff") throw new TypeError('cancel() reason must be "handoff" when given');
         if (reason === "handoff" && !journal) throw new TypeError("a handoff needs persistence to keep the turn in");
-        if (finished || cancelled) return;
+        // A turn whose end is on its way to the store has ended, as that end
+        // says; there is nothing left to stop or hand off.
+        if (finished || cancelled || recordedEnd !== undefined) return;
         if (reason === "handoff") {
           handedOff = true;
           // The journal keeps queued follow-ups for the next agent.
@@ -3962,7 +4019,10 @@ export async function createFxEngine(options = {}) {
         rejectImagePrep = null;
         resolvePromptStart?.(false);
         resolvePromptStart = null;
-        runtime.closeSteering?.();
+        // The web core hears of the cancel at once through its steering, so
+        // an end it writes before it reads `session/cancel` says cancelled.
+        if (typeof runtime.cancelSteering === "function") runtime.cancelSteering();
+        else runtime.closeSteering?.();
         resumeOutput?.();
         resumeOutput = null;
         if (!closing) send({ jsonrpc: "2.0", method: "session/cancel", params: { sessionId } });
@@ -4045,8 +4105,11 @@ export async function createFxEngine(options = {}) {
           if (turn.id) lastTurnId = turn.id;
           openTurnId = null;
         }
-        const refused = !cancelled && value.stopReason === "refused" && providerError !== null;
-        return { stopReason: cancelled ? "cancelled" : value.stopReason, usage: value.usage, ...(refused ? { error: { name: "Error", message: providerError } } : {}) };
+        // A turn whose end went to the store ended as that end says, and
+        // the result resolves from it (DUR-20).
+        const stopReason = recordedEnd ?? (cancelled ? "cancelled" : value.stopReason);
+        const refused = stopReason === "refused" && providerError !== null;
+        return { stopReason, usage: value.usage, ...(refused ? { error: { name: "Error", message: providerError } } : {}) };
       })
       .catch(async (error) => {
         cancelImagePrep = null;
@@ -4086,6 +4149,8 @@ export async function createFxEngine(options = {}) {
         queueMicrotask(() => { void maybeCheckpoint(); });
         runtime.closeSteering?.();
         toolControllers.clear();
+        // What a cancel stopped and no end of this turn ever said otherwise.
+        for (const { size } of held.splice(0)) discardedBytes += size;
         if (discardedBytes) emit("output.discarded", { reason: "cancelled", bytes: discardedBytes });
         for (const waiter of waiters.splice(0)) {
           if (terminalError) waiter.reject(terminalError);

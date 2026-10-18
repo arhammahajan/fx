@@ -50,9 +50,11 @@ for tool in send lookup write cutoff leased queue refuse; do
 done
 # The send graph with SavesReply: a turn's answer is saved before its end, so
 # a crash between them leaves the turn open with its answer, and the worker
-# that resumes it ends it with that answer, asking the model nothing. No
-# driver walks it: a driver would have to hold the record that ends a turn
-# apart from the one that saved its answer, which the engine may send as one.
+# that resumes it ends it with that answer, asking the model nothing, or with
+# Restarts restarts it after a notice. With LateCancel the user may cancel the
+# turn while the record that ends it is on its way. No driver walks it: a
+# driver would have to hold the record that ends a turn apart from the one
+# that saved its answer, which the engine may send as one.
 echo "== DurableSession (saved)"
 if ! "$java" -XX:+UseParallelGC -cp "$jar" tlc2.TLC -deadlock -workers auto -cleanup \
     -metadir "$work/saved" -config DurableSession-saved.cfg DurableSession.tla > "$work/saved.log" 2>&1; then
@@ -98,12 +100,20 @@ fi
 # when the worker that ends a resumed turn with its saved answer shows only
 # its turn_end, as the engine streams none of that answer, the answer stays
 # as cut short as the crashed holder's lines left it.
+# NoReplyAtLine breaks it too: when a resumed worker restarted the answer
+# after a notice and died after the record that ends the turn, a worker that
+# reads the turn's text only whole or from the last turn_resume line, as
+# libfx did, finds no start of the answer there and shows all of it again.
+# NoEndDecides breaks EndSaysHow: when a cancel that came while the record
+# that ends the turn was on its way is answered, as libfx answered it, the
+# turn_end says cancelled while the log says the turn ended end_turn.
 for pair in UiInOrder:UiInOrder NoStaleShown:NoStaleShown NotTwoActive:NotTwoActive \
     NoSelfStop:TwoActiveNeedsFreeze NoClaimFence:EffectsAtMostOnce NoCutoffBound:HandoffsBounded \
     LeasedTwoActive:NotTwoActive LookupRunsAhead:EveryCallAfterIntent LookupNewId:IdsAtMostOne \
     WriteRunsAhead:OneExecutionId NoEndRepair:EndRecoverable NoRefusedRepair:EndRecoverable \
     NoEndHow:EndSaysHow NoRefusedHow:EndSaysHow NoReplyRepair:ReplyShownOnce \
-    LeasedStaleShown:StaleShownPerFreeze NoResumeFill:ReplyShownOnceUnlessLate; do
+    LeasedStaleShown:StaleShownPerFreeze NoResumeFill:ReplyShownOnceUnlessLate \
+    NoReplyAtLine:ReplyShownOnceUnlessLate NoEndDecides:EndSaysHow; do
     witness="${pair%%:*}" invariant="${pair#*:}"
     if "$java" -cp "$jar" tlc2.TLC -deadlock -workers auto -cleanup -metadir "$work/w-$witness" \
         -config "Witness-$witness.cfg" DurableSession.tla 2>&1 | grep -q -E "Invariant $invariant is violated"; then

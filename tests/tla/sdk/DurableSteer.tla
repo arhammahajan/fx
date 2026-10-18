@@ -332,8 +332,9 @@ ToolEnd ==
 
 \* The user cancels the running turn. Steers it never placed run next, and
 \* so do the ones its worker never read, which no turn took. A turn that is
-\* `ending` ends as it was going to, unless the cancel reaches its engine
-\* before the engine has finished it.
+\* `ending` ends cancelled when the cancel reaches its engine before the
+\* engine writes the record that ends it, and otherwise as that record says
+\* (`DurableSession.tla` LateCancel).
 Cancel ==
     /\ Running
     /\ cancels < MaxCancels

@@ -116,6 +116,23 @@
 (* across turn_resume lines (Unshown), since the resumed worker's own text *)
 (* adds to the reply the text before its turn_resume line.                 *)
 (*                                                                         *)
+(* With Restarts, the worker that resumes such a turn may restart its      *)
+(* answer instead, as fx does when the resume brings inputs the saved      *)
+(* answer never saw: it shows a notice as a text line that is no part of   *)
+(* the answer, then streams the answer again. The turn's text then ends    *)
+(* with the crashed holder's start of the answer, that notice, and the     *)
+(* resumed worker's start of it. With ReplyAtLine, a worker that writes    *)
+(* the end finds the answer's shown start on a line of its own (Unshown);  *)
+(* without it, as before, it shows the whole answer again after the        *)
+(* resumed worker's start of it (Witness-NoReplyAtLine).                   *)
+(*                                                                         *)
+(* With LateCancel, the user may cancel the turn while the record that     *)
+(* ends it is on its way to the log, after the record that saved its       *)
+(* answer. With EndDecides the turn ends as that record says, and the      *)
+(* cancel stops nothing; without it, as libfx had it, the worker's         *)
+(* turn_end says the turn was cancelled while the log says it ended        *)
+(* end_turn (Witness-NoEndDecides).                                        *)
+(*                                                                         *)
 (* `act` names each step and its worker, so a driver can replay any path   *)
 (* of the state graph against the real code and compare every state:       *)
 (* tests/tla/drivers/drive.mjs.                                            *)
@@ -147,8 +164,15 @@ CONSTANTS
                  \* clock shows nothing until a renewal of its own lands
     SavesReply,  \* whether the answer saves the reply in a record before
                  \* the record that ends the turn
-    ResumeFills  \* whether a worker that ends a resumed turn with its saved
+    ResumeFills, \* whether a worker that ends a resumed turn with its saved
                  \* reply first shows what of it the stream does not
+    Restarts,    \* whether a resume may restart a saved answer, showing a
+                 \* notice that is no part of it first
+    ReplyAtLine, \* whether a worker that writes the end finds the answer's
+                 \* shown start on a line of its own
+    LateCancel,  \* whether the user may cancel the turn while the record
+                 \* that ends it is on its way
+    EndDecides   \* whether the turn then ends as that record says
 
 ASSUME Tool \in {"lookup", "write", "send"}
 ASSUME WritesWait \in BOOLEAN
@@ -166,12 +190,18 @@ ASSUME ReplyParts \in Nat /\ ReplyParts >= 1
 ASSUME StalledWait \in BOOLEAN
 ASSUME SavesReply \in BOOLEAN
 ASSUME ResumeFills \in BOOLEAN
+ASSUME Restarts \in BOOLEAN /\ ReplyAtLine \in BOOLEAN
+ASSUME LateCancel \in BOOLEAN /\ EndDecides \in BOOLEAN
 ASSUME ~(QueueHeld /\ Heartbeat)
 
 None == "none"
 \* The parts of the model's answer, in the order it streams them.
 Parts == 1..ReplyParts
+\* What a text line that is no part of the answer carries instead, such as
+\* the notice fx shows when it restarts an answer.
+Notice == 0
 Max(S) == CHOOSE m \in S : \A n \in S : n <= m
+Min(S) == CHOOSE m \in S : \A n \in S : m <= n
 \* How a turn ended, as a turn_end line says it: "none" on any other line,
 \* but "resume" on a turn_resume line the answer's text reads across
 \* (ResumeLine).
@@ -232,7 +262,7 @@ TypeOK ==
     /\ progress \in Progress
     /\ runs \in 0..(MaxEpoch + 1)
     /\ ids \in 0..(MaxEpoch + 1)
-    /\ ui \in Seq([e: 0..MaxEpoch, legit: BOOLEAN, end: BOOLEAN, how: How \cup {"resume"}, text: SUBSET Parts])
+    /\ ui \in Seq([e: 0..MaxEpoch, legit: BOOLEAN, end: BOOLEAN, how: How \cup {"resume"}, text: SUBSET (Parts \cup {Notice})])
     /\ freezes \in 0..MaxFreezes
     /\ froze \in [Workers -> BOOLEAN]
     /\ chain \in Nat
@@ -243,7 +273,7 @@ TypeOK ==
     /\ endHow \in [Workers -> How]
     /\ owed \in [Workers -> Seq(SUBSET Parts)]
     /\ act \in [name: {"Init", "Start", "Claim", "Announce", "Model1", "Intent", "ToolEnd", "Model2",
-                       "Commit", "EndLine", "Freeze", "Wake", "Deadline", "Expire"},
+                       "Commit", "EndLine", "Freeze", "Wake", "Deadline", "Expire", "Cancel"},
                 w: Workers \cup {None}]
 
 Init ==
@@ -278,6 +308,8 @@ EndOf(w) == [e |-> epoch[w], legit |-> Heads(w), end |-> TRUE, how |-> endHow[w]
 \* "resume", the text reading across it; elsewhere it is like any other line,
 \* and every graph a driver walks is as before.
 ResumeLine(w) == [Line(w) EXCEPT !.how = IF SavesReply THEN "resume" ELSE "none"]
+\* The notice w shows as a text line when it restarts the answer.
+NoticeLine(w) == [Line(w) EXCEPT !.text = {Notice}]
 \* The text lines w writes now, each carrying the parts `lines` gives it.
 TextLines(w, lines) == [k \in 1..Len(lines) |-> [Line(w) EXCEPT !.text = lines[k]]]
 \* The answer's parts from..to as its worker streams them, one line each.
@@ -338,14 +370,24 @@ IsStart(parts) == \E k \in 0..ReplyParts : parts = 1..k
 
 \* What a worker that writes the end of a turn whose answer it did not
 \* stream shows of the answer first, as one line: the parts after those the
-\* text lines the shown lines end with carry, read across turn_resume lines,
-\* or else read from the last of them, or all of them when neither is the
-\* answer's start (sdk/durable.js unshownReply).
-Unshown == LET across == PartsAt(TailOf(ShownAt(ui), TRUE))
+\* text lines the shown lines end with carry, read across turn_resume lines.
+\* With ReplyAtLine those lines are read from the first one whose text from
+\* there on is the answer's start, since the answer starts a line of its
+\* own; the lines before it hold a restarted answer and its notice, and
+\* all of the answer is owed when none is (sdk/durable.js unshownReply).
+\* Without it, as before, they are read whole, or else from the last
+\* turn_resume line, or not at all (Witness-NoReplyAtLine).
+Unshown == LET tail == TailOf(ShownAt(ui), TRUE)
+               from(p) == PartsAt({i \in tail : i >= p})
+               starts == {p \in tail : ui[p].text # {} /\ IsStart(from(p))}
+               across == PartsAt(tail)
                since == PartsAt(TextTail(ShownAt(ui)))
-               rest == IF IsStart(across) THEN Parts \ across
-                       ELSE IF IsStart(since) THEN Parts \ since
-                       ELSE Parts
+               shown == IF ReplyAtLine
+                        THEN IF starts = {} THEN {} ELSE from(Min(starts))
+                        ELSE IF IsStart(across) THEN across
+                        ELSE IF IsStart(since) THEN since
+                        ELSE {}
+               rest == Parts \ shown
            IN IF rest # {} THEN <<rest>> ELSE <<>>
 
 \* What a worker that writes a crashed holder's missing turn_end shows of the
@@ -428,7 +470,8 @@ Claim(w) ==
 \* the chain's head writes. With Refused, a turn that has recorded nothing
 \* ends at once: its `ended` entry is outside the chain, so it lands whether
 \* or not w still heads it. A turn whose answer was saved goes on to end with
-\* that answer, asking the model nothing (Commit).
+\* that answer, asking the model nothing (Commit), or with Restarts asks
+\* the model again, after a notice that it restarts the answer.
 Announce(w) ==
     /\ pc[w] = "announce"
     /\ ~frozen[w]
@@ -457,17 +500,20 @@ Announce(w) ==
                           /\ ui' = ui \o Writes(w, <<ResumeLine(w)>>)
                           /\ UNCHANGED <<progress, lease, chain, cutoffs, lapse, ending>>
           ELSE /\ UNCHANGED ending
-               /\ pc' = [pc EXCEPT ![w] =
-                          CASE from = "start" -> "model1"
-                            [] from = "intent" -> IF rerun THEN "tool" ELSE "model2"
-                            [] from \in {"result", "done"} -> "model2"
-                            [] from = "saved" -> "delivering"]
+               /\ \E restart \in IF Restarts /\ from = "saved" THEN BOOLEAN ELSE {FALSE} :
+                     /\ pc' = [pc EXCEPT ![w] =
+                                CASE from = "start" -> "model1"
+                                  [] from = "intent" -> IF rerun THEN "tool" ELSE "model2"
+                                  [] from \in {"result", "done"} -> "model2"
+                                  [] from = "saved" -> IF restart THEN "model2" ELSE "delivering"]
+                     \* turn_start, or turn_resume, then tool_start for a rerun,
+                     \* tool_end for a call answered as possibly run, or the
+                     \* notice of a restarted answer
+                     /\ ui' = ui \o Writes(w, CASE from = "start" -> <<Line(w)>>
+                                                [] from = "intent" -> <<ResumeLine(w), Line(w)>>
+                                                [] restart -> <<ResumeLine(w), NoticeLine(w)>>
+                                                [] OTHER -> <<ResumeLine(w)>>)
                /\ runs' = IF rerun THEN runs + 1 ELSE runs
-               \* turn_start, or turn_resume, then tool_start for a rerun, or
-               \* tool_end for a call answered as possibly run
-               /\ ui' = ui \o Writes(w, CASE from = "start" -> <<Line(w)>>
-                                          [] from = "intent" -> <<ResumeLine(w), Line(w)>>
-                                          [] OTHER -> <<ResumeLine(w)>>)
                \* a call answered as possibly run is the turn's next record
                /\ IF from = "intent" /\ ~rerun /\ Heads(w)
                      THEN /\ progress' = "result"
@@ -592,7 +638,10 @@ Commit(w) ==
     /\ ~frozen[w]
     /\ IF Heads(w)
           THEN /\ progress' = "done"
-               /\ Ends(w, "end_turn")
+               \* A cancel that came while this record was on its way only
+               \* shows in w's turn_end without EndDecides (Cancel).
+               /\ how' = "end_turn"
+               /\ endHow' = [endHow EXCEPT ![w] = IF endHow[w] = "cancelled" THEN "cancelled" ELSE "end_turn"]
                /\ pc' = [pc EXCEPT ![w] = "ending"]
                /\ owed' = [owed EXCEPT ![w] =
                               IF pc[w] = "closing" THEN owed[w]
@@ -627,6 +676,20 @@ EndLine(w) ==
                /\ UNCHANGED <<lease, chain, lapse>>
     /\ UNCHANGED <<epoch, frozen, progress, runs, ids, freezes, froze, cutoffs, seen, ending>>
     /\ act' = [name |-> "EndLine", w |-> w]
+
+\* The user cancels the turn while w's record that ends it is on its way to
+\* the log, after the record that saved its answer. With EndDecides the
+\* turn ends as that record says: the cancel stops nothing, and w's engine
+\* still shows the rest of the answer. Without it, as libfx had it, the
+\* engine answers the cancel, and w's turn_end says the turn was cancelled.
+Cancel(w) ==
+    /\ LateCancel
+    /\ pc[w] \in {"closing", "delivering"}
+    /\ ~frozen[w]
+    /\ endHow[w] = "none"
+    /\ endHow' = [endHow EXCEPT ![w] = IF EndDecides THEN "none" ELSE "cancelled"]
+    /\ UNCHANGED <<pc, epoch, frozen, lease, progress, runs, ids, ui, freezes, froze, chain, cutoffs, seen, lapse, how, owed>>
+    /\ act' = [name |-> "Cancel", w |-> w]
 
 \* w freezes while it waits; its lease no longer counts as alive. With
 \* QueueHeld, the queue gives up on its delivery and will hand its message on.
@@ -708,7 +771,7 @@ Expire(w) ==
 Next ==
     \E w \in Workers :
         \/ Start(w) \/ Claim(w) \/ Announce(w) \/ Model1(w) \/ Intent(w) \/ ToolEnd(w) \/ Model2(w)
-        \/ Commit(w) \/ EndLine(w) \/ Freeze(w) \/ Wake(w) \/ Deadline(w) \/ Expire(w)
+        \/ Commit(w) \/ EndLine(w) \/ Freeze(w) \/ Wake(w) \/ Deadline(w) \/ Expire(w) \/ Cancel(w)
 
 Spec == Init /\ [][Next]_vars
 
@@ -775,11 +838,15 @@ EndSaysHow == \A i \in ShownAt(ui) : ui[i].end => ui[i].how = how
 \* RecordsReply, that worker shows none of the answer, which a crash cut
 \* short (Witness-NoReplyRepair), and without ResumeFills neither does one
 \* that ends a turn with its saved answer (Witness-NoResumeFill).
+\* With Restarts, the answer is the one after the last notice that it
+\* restarted: the lines before that notice hold the answer it restarted.
 ReplyShownOnce ==
     how = "end_turn" =>
         \A i \in ShownAt(ui) :
             (ui[i].end /\ ui[i].legit) =>
-                LET run == TailOf({j \in ShownAt(ui) : j < i /\ ui[j].legit}, TRUE)
+                LET tail == TailOf({j \in ShownAt(ui) : j < i /\ ui[j].legit}, TRUE)
+                    notices == {j \in tail : Notice \in ui[j].text}
+                    run == {j \in tail : notices = {} \/ j > Max(notices)}
                 IN \A p \in Parts : Cardinality({j \in run : p \in ui[j].text}) = 1
 
 \* ReplyShownOnce, unless a replaced worker's text line shows. The leased

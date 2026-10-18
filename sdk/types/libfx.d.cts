@@ -603,7 +603,7 @@ export interface FxEngineTurn {
   /** The turn's id. */
   readonly id: string | null;
   readonly result: Promise<FxEngineTurnResult>;
-  /** Stops the turn. `{ reason: "handoff" }` stores nothing more, so the next agent continues it; it needs persistence. */
+  /** Stops the turn. `{ reason: "handoff" }` stores nothing more, so the next agent continues it; it needs persistence. A turn whose end is on its way to the store has ended, and this stops nothing. */
   cancel(options?: { reason?: "handoff" }): void;
   /** Appends guidance at the next safe model boundary. */
   steer(input: FxSteeringInput, id?: string): FxSteer;
@@ -906,7 +906,7 @@ export interface FxSession {
    * join a turn: the running one ends at its next safe point and the steer runs next.
    */
   steer(input: FxSessionPromptInput, options?: FxSteerOptions): Promise<FxSteered>;
-  /** Cancels the running turn. */
+  /** Cancels the running turn. A turn whose end is already being saved has ended, as that end says, and this stops nothing. */
   cancel(): Promise<void>;
   /** The session's history as opaque bytes, read without changing the session. */
   checkpoint(): Promise<Uint8Array>;

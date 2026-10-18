@@ -593,25 +593,31 @@ function endLineOf(messageId, ending) {
 // A worker that resumes a turn whose reply was saved before its end was
 // stored ends the turn with that reply and streams none of it, so the
 // reply's start is the text before its turn_resume line, and its rest may
-// follow that line. So the text is read across turn_resume lines first, and
-// text that is no start of the reply read that way, as when the worker that
-// resumed asked the model again, is read from the last turn_resume line
-// (`tests/tla/sdk/DurableSession.tla` Unshown).
+// follow that line. So the text is read across turn_resume lines. Text
+// before the reply can end there too: an answer the turn restarted, and the
+// notice fx shows as a text line when it restarts one, which the reply never
+// holds. The reply starts a line of its own, so its shown start is the text
+// from one of those lines on (`tests/tla/sdk/DurableSession.tla` Unshown).
 async function unshownReply(log, messageId, reply) {
   if (reply === undefined) return "";
-  let across = "";
-  let since = "";
+  // The text lines the turn's shown lines end with, read across its
+  // turn_resume lines.
+  let tail = [];
   await eachShownLine(log, await log.ui.length(), (event) => {
-    if (event.messageId !== messageId || event.type === "reasoning_delta") return;
-    if (event.type === "turn_resume") {
-      since = "";
-      return;
-    }
-    const text = event.type === "text_delta" ? String(event.delta ?? "") : null;
-    across = text === null ? "" : across + text;
-    since = text === null ? "" : since + text;
+    if (event.messageId !== messageId || event.type === "reasoning_delta" || event.type === "turn_resume") return;
+    if (event.type === "text_delta") tail.push(String(event.delta ?? ""));
+    else tail = [];
   });
-  for (const shown of [across, since]) if (reply.startsWith(shown)) return reply.slice(shown.length);
+  // The reply begins a line of its own. The part of it shown is the text of
+  // those lines from the first one on which that text is the reply's start;
+  // the lines before it hold text from before the reply, such as a restarted
+  // answer and the notice that it restarted, and none of them is the reply
+  // (DUR-38; `tests/tla/sdk/DurableSession.tla` Unshown, with Restarts).
+  let shown = tail.join("");
+  for (const line of tail) {
+    if (reply.startsWith(shown)) return reply.slice(shown.length);
+    shown = shown.slice(line.length);
+  }
   return reply;
 }
 
@@ -2345,8 +2351,11 @@ class SessionWorker {
         // with a reply the turn's last worker streamed, as one that delivers
         // the reply saved before the turn's end was stored does: its viewers
         // get the rest of that reply first (`tests/tla/sdk/DurableSession.tla`
-        // Commit, with ResumeFills).
-        if (!fresh && !failed && !outcome.streamedText) await showRest(messageId, this.fold(await log.read()).endingOf(messageId)?.reply);
+        // Commit, with ResumeFills). So do the viewers of a turn a cancel
+        // reached too late to stop, whose engine may have dropped the end of
+        // its reply after the cancel.
+        if (!failed && outcome.reply !== undefined) await showRest(messageId, outcome.reply);
+        else if (!fresh && !failed && !outcome.streamedText) await showRest(messageId, this.fold(await log.read()).endingOf(messageId)?.reply);
         // The turn's records have landed, so its viewers hear it ended now;
         // the log is read after, for what comes next.
         ui.push({ type: "turn_end", messageId, stopReason: result.stopReason, usage: result.usage ?? {}, ...(result.error ? { error: result.error } : {}), ...(endedBySteer ? { endedBySteer } : {}) });
@@ -2398,8 +2407,10 @@ class SessionWorker {
   // `{ stopped }` when its harness stopped under it, or `{ result }` for a
   // turn that ended, whose end the caller writes, with `endedBySteer`, the id
   // of the steer it ended the turn for, when it cancelled the turn for nothing
-  // else. `resumed` says the turn continues one an earlier worker ran, and
-  // `cancelledFirst` that the worker cancelled it before it drove it.
+  // else, and `reply`, the reply its end in the log holds, when a cancel came
+  // too late to stop it. `resumed` says the turn continues one an earlier
+  // worker ran, and `cancelledFirst` that the worker cancelled it before it
+  // drove it.
   async drive(log, harness, turn, messageId, state, ui, resumed = false, cancelledFirst = false) {
     // The inputs `state` was folded from are placed already: the fold gave
     // each a turn, joined it to one, or spent it. The poll applies only the
@@ -2535,16 +2546,24 @@ class SessionWorker {
       if (isFenced(error)) return "fenced";
       throw error;
     }
-    // A turn the deadline cut off once its end was on its way to the log
-    // ended, as that end says: its engine answers only once the end is
-    // stored, and the next delivery finds the turn ended (DUR-20;
-    // `tests/tla/sdk/DurableSteer.tla` Handoff from `ending`).
-    if (this.stopping && result.stopReason === "cancelled") {
+    // A turn that a cancel or the deadline reached once its end was on its
+    // way to the log ended, as that end says: its engine answers only once
+    // the end is stored, and the next delivery finds the turn ended. When
+    // that end says the cancel stopped nothing, the turn ended with its
+    // reply, and the caller shows what of it the engine dropped after the
+    // cancel (DUR-20, DUR-64; `tests/tla/sdk/DurableSteer.tla` Handoff from
+    // `ending`, `tests/tla/sdk/DurableSession.tla` LateCancel).
+    if ((this.stopping || cancelled) && result.stopReason === "cancelled") {
       const landed = this.fold(await log.read());
       if (landed.openTurn?.id !== messageId && landed.consumed.has(messageId)) {
         const ending = landed.endingOf(messageId);
         result = { stopReason: ending?.stopReason ?? "unknown", usage: result.usage, ...(ending?.error ? { error: ending.error } : {}) };
-        return { result, streamedText, ...(ending?.endedBySteer ? { endedBySteer: ending.endedBySteer } : {}) };
+        return {
+          result,
+          streamedText,
+          ...(ending?.endedBySteer ? { endedBySteer: ending.endedBySteer } : {}),
+          ...(result.stopReason !== "cancelled" && typeof ending?.reply === "string" ? { reply: ending.reply } : {}),
+        };
       }
     }
     // Any other turn handed back at the deadline continues in the next

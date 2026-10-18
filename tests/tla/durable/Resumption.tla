@@ -19,7 +19,10 @@
 (*                                                                         *)
 (* The record that ends the turn says how the turn ended: it goes out    *)
 (* only once the turn's stop reason is decided, so a reader of the store *)
-(* and the host agree on it (EndSaysHow). An input the turn accepted and *)
+(* and the host agree on it (EndSaysHow). Once that end is on its way,  *)
+(* the turn ended as it says: a cancel then stops nothing, and the host's *)
+(* `turn.result` says what the end says (ResultSaysHow). An input the     *)
+(* turn accepted and *)
 (* never placed waits for the model: the turn ends with its reply only   *)
 (* when none waits, its end hands back one that came after the reply,    *)
 (* and a resume that finds one asks the model with it instead of         *)
@@ -54,11 +57,14 @@ VARIABLES
     waiting,        \* durable: an input the open turn accepted and never placed
     unanswered,     \* history: an input placed in a turn the model never saw it in
     sentHow,        \* how the turn's end on its way says the turn ended
-    endHow          \* durable: how the turn's end says it ended, "none" until it lands
+    endHow,         \* durable: how the turn's end says it ended, "none" until it lands
+    lateCancel,     \* the user cancelled the turn while its end was on its way
+    resultHow       \* how the host's turn.result says the turn ended, "none" until it resolves
 
 vars == <<proc, turn, turns, crashesInTurn, autoResumes, asked, notices,
           delivered, badResume, crashes, reply, ending, resolved, replySaved,
-          askedAgain, earlyResult, waiting, unanswered, sentHow, endHow>>
+          askedAgain, earlyResult, waiting, unanswered, sentHow, endHow,
+          lateCancel, resultHow>>
 
 How == {"none", "end_turn", "cancelled", "unknown"}
 
@@ -83,6 +89,8 @@ TypeOK ==
     /\ unanswered \in BOOLEAN
     /\ sentHow \in How
     /\ endHow \in How
+    /\ lateCancel \in BOOLEAN
+    /\ resultHow \in How
 
 Init ==
     /\ proc = "running"
@@ -105,6 +113,8 @@ Init ==
     /\ unanswered = FALSE
     /\ sentHow = "none"
     /\ endHow = "none"
+    /\ lateCancel = FALSE
+    /\ resultHow = "none"
 
 StartTurn ==
     /\ proc = "running"
@@ -124,6 +134,8 @@ StartTurn ==
     /\ waiting' = FALSE
     /\ sentHow' = "none"
     /\ endHow' = "none"
+    /\ lateCancel' = FALSE
+    /\ resultHow' = "none"
     /\ UNCHANGED <<proc, badResume, crashes, askedAgain, earlyResult, unanswered>>
 
 \* A model request for the open turn, which carries the inputs it accepted
@@ -139,6 +151,7 @@ Request ==
     /\ UNCHANGED <<proc, turn, turns, crashesInTurn, autoResumes, asked,
                    notices, delivered, badResume, crashes, reply, ending,
                    resolved, replySaved, earlyResult, unanswered, sentHow, endHow>>
+    /\ UNCHANGED <<lateCancel, resultHow>>
 
 \* The turn accepts an input, such as a steer, which it stores before it
 \* places it in a model request.
@@ -152,6 +165,7 @@ Accept ==
                    notices, delivered, badResume, crashes, reply, ending,
                    resolved, replySaved, askedAgain, earlyResult, unanswered,
                    sentHow, endHow>>
+    /\ UNCHANGED <<lateCancel, resultHow>>
 
 \* The final reply finished, and the progress saved after it holds it. An
 \* input waiting would go on with the turn instead.
@@ -166,6 +180,7 @@ FinishReply ==
     /\ UNCHANGED <<proc, turn, turns, crashesInTurn, autoResumes, asked,
                    notices, delivered, badResume, crashes, ending, resolved,
                    askedAgain, earlyResult, waiting, unanswered, sentHow, endHow>>
+    /\ UNCHANGED <<lateCancel, resultHow>>
 
 \* The turn's end goes to the store, which has not made it durable yet. It
 \* goes once the turn's stop reason is decided, saying it, and hands back
@@ -181,6 +196,7 @@ SendEnd ==
     /\ UNCHANGED <<proc, turn, turns, crashesInTurn, autoResumes, asked,
                    notices, delivered, badResume, crashes, reply, resolved,
                    replySaved, askedAgain, earlyResult, unanswered, endHow>>
+    /\ UNCHANGED <<lateCancel, resultHow>>
 
 \* The store makes the turn's end durable.
 EndLands ==
@@ -192,8 +208,22 @@ EndLands ==
     /\ UNCHANGED <<proc, turns, crashesInTurn, autoResumes, asked, notices,
                    delivered, badResume, crashes, reply, resolved, replySaved,
                    askedAgain, earlyResult, waiting, unanswered, sentHow>>
+    /\ UNCHANGED <<lateCancel, resultHow>>
 
-\* The host's turn.result resolves.
+\* The user cancels the turn while its end is on its way to the store.
+\* The turn ended as that end says: the cancel stops nothing.
+CancelWhileEnding ==
+    /\ proc = "running"
+    /\ turn = "open"
+    /\ ending
+    /\ ~lateCancel
+    /\ lateCancel' = TRUE
+    /\ UNCHANGED <<proc, turn, turns, crashesInTurn, autoResumes, asked,
+                   notices, delivered, badResume, crashes, reply, ending,
+                   resolved, replySaved, askedAgain, earlyResult, waiting,
+                   unanswered, sentHow, endHow, resultHow>>
+
+\* The host's turn.result resolves, from the turn's durable end.
 ResolveResult ==
     /\ proc = "running"
     /\ ~resolved
@@ -201,9 +231,11 @@ ResolveResult ==
     /\ turn = "committed"
     /\ resolved' = TRUE
     /\ earlyResult' = (earlyResult \/ turn # "committed")
+    /\ resultHow' = endHow
     /\ UNCHANGED <<proc, turn, turns, crashesInTurn, autoResumes, asked,
                    notices, delivered, badResume, crashes, reply, ending,
                    replySaved, askedAgain, waiting, unanswered, sentHow, endHow>>
+    /\ UNCHANGED lateCancel
 
 \* The user cancels the turn (Esc, Ctrl+C, turn.cancel()); recorded durably,
 \* saying so, and handing back an input it never placed.
@@ -217,9 +249,10 @@ UserStop ==
     /\ UNCHANGED <<proc, turns, crashesInTurn, autoResumes, asked, notices,
                    delivered, badResume, crashes, reply, ending, resolved,
                    replySaved, askedAgain, earlyResult, unanswered, sentHow>>
+    /\ UNCHANGED <<lateCancel, resultHow>>
 
 \* Laptop crash, kill -9, function timeout. An end still being stored is
-\* lost; the saved reply is not.
+\* lost; the saved reply is not. A cancel dies with its process.
 Crash ==
     /\ proc = "running"
     /\ crashes < MaxCrashes
@@ -230,6 +263,8 @@ Crash ==
     /\ UNCHANGED <<turn, turns, autoResumes, asked, notices, delivered,
                    badResume, reply, resolved, replySaved, askedAgain,
                    earlyResult, waiting, unanswered, sentHow, endHow>>
+    /\ lateCancel' = FALSE
+    /\ UNCHANGED resultHow
 
 \* A clean exit only happens between turns.
 CleanExit ==
@@ -240,6 +275,7 @@ CleanExit ==
                    delivered, badResume, crashes, reply, ending, resolved,
                    replySaved, askedAgain, earlyResult, waiting, unanswered,
                    sentHow, endHow>>
+    /\ UNCHANGED <<lateCancel, resultHow>>
 
 \* agent.resume(), the queue waking a function, or fx -c. A turn with a
 \* saved reply and no input waiting is delivered and asks the model nothing;
@@ -266,6 +302,7 @@ Reopen ==
     /\ badResume' = (badResume \/ (autoResumes' > autoResumes /\ turn # "open"))
     /\ UNCHANGED <<turn, turns, crashesInTurn, crashes, ending,
                    resolved, askedAgain, earlyResult, sentHow, endHow>>
+    /\ UNCHANGED <<lateCancel, resultHow>>
 
 Next ==
     \/ StartTurn
@@ -274,6 +311,7 @@ Next ==
     \/ FinishReply
     \/ SendEnd
     \/ EndLands
+    \/ CancelWhileEnding
     \/ ResolveResult
     \/ UserStop
     \/ Crash
@@ -317,6 +355,15 @@ EndSaysHow == turn \in {"committed", "user_stopped"} => endHow \in {"end_turn", 
 
 \* The host's turn.result resolves only after the turn's end is durable.
 ResultOnlyAfterDurableEnd == ~earlyResult
+
+\* The host's turn.result says how the turn's durable end says it ended,
+\* also when the user cancelled the turn while that end was on its way
+\* (DUR-20, DUR-64).
+ResultSaysHow == resolved => resultHow = endHow
+
+\* Witness only: no cancel comes while a turn's end is on its way.
+\* mutants.py adds it to the .cfg and requires TLC to violate it.
+NoLateCancel == ~lateCancel
 
 \* Witness only: no resumption ever delivers a saved reply. mutants.py
 \* adds it to the .cfg and requires TLC to violate it.
