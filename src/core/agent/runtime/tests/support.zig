@@ -340,7 +340,7 @@ pub const FakeGateway = struct {
             errdefer if (failure_schema) |value| alloc.free(value);
             const failure_request_shape = if (completion.failure_request_shape) |value| try alloc.dupe(u8, value) else null;
             return .{ .failed = .{
-                .kind = failureKind(completion.status),
+                .kind = gateway_client.httpFailureKind(alloc, failureKind(completion.status), err_body),
                 .detail = err_body,
                 .retry_after_seconds = completion.retry_after_seconds,
                 .diagnostics = .{

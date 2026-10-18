@@ -202,7 +202,7 @@ fn post(alloc: Allocator, definition: *const definitions.Definition, request: st
             detail = redacted;
         }
 
-        return .{ .failed = .{ .kind = failure_kind(response.head.status), .detail = detail, .retry_after_seconds = retry_after, .ownership = .owned } };
+        return .{ .failed = .{ .kind = client_mod.httpFailureKind(alloc, failure_kind(response.head.status), detail), .detail = detail, .retry_after_seconds = retry_after, .ownership = .owned } };
     }
     var result = consume(alloc, reader, request, watch.progress()) catch |err| return watch.failure(err);
     if (watch.finish()) |err| {

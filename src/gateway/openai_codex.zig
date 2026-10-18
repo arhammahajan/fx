@@ -332,7 +332,7 @@ pub fn streamPrepared(
             else => return err,
         };
         return .{ .failed = .{
-            .kind = failureKind(response.head.status),
+            .kind = gateway_client.httpFailureKind(alloc, failureKind(response.head.status), body),
             .detail = body,
             .ownership = .owned,
         } };

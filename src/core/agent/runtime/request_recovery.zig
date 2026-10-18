@@ -82,9 +82,8 @@ pub const RequestRecovery = struct {
     ticker_enabled: bool = !builtin.is_test,
 
     // Only the turn loop's thread touches these.
-    /// The `Repeating` failure that ended the latest send, null when it ended
-    /// some other way, and how many sends in a row unclear failures ended.
-    repeating: ?Repeating = null,
+    /// How many sends in a row `Repeating` failures ended, 0 when the latest
+    /// send ended some other way.
     repeat_sends: u8 = 0,
     /// Response bytes the latest of them streamed.
     repeat_progress_bytes: usize = 0,
@@ -242,26 +241,25 @@ pub const RequestRecovery = struct {
     /// failure and null for any other, and the response bytes the send
     /// streamed. Returns true when unclear failures, of any `Repeating` class,
     /// have now ended `repeat_stop_sends` sends in a row, all sent the same
-    /// way, with no new response progress, and the module would send the same
-    /// way again, so fx stops the request. When the module would change the
-    /// send, as it drops Fast after a run of gateway errors, the request gets
-    /// those sends first: the count starts over with the first send that goes
-    /// out differently. A send whose ending never reaches this, such as an
-    /// HTTP error or a success, breaks the run at the next `beginSend`.
+    /// way, with no new response progress, and the module would keep sending
+    /// the same way if `failure` kept ending them, so fx stops the request.
+    /// When the module would change the send, as it drops Fast after a run of
+    /// gateway errors, the request gets those sends first: the count starts
+    /// over with the first send that goes out differently. A send whose ending
+    /// never reaches this, such as an HTTP error or a success, breaks the run
+    /// at the next `beginSend`.
     pub fn repeatedFailure(self: *RequestRecovery, failure: Failure, class: ?Repeating, progress_bytes: usize) bool {
         const repeating = class orelse {
-            self.repeating = null;
+            self.repeat_sends = 0;
             return false;
         };
         self.repeat_noted = true;
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        const same = self.repeating != null and
+        const same = self.repeat_sends > 0 and
             self.repeat_progress_bytes == progress_bytes and
             self.repeat_send == self.send;
-        // The latest class names the run in the stop's trace.
-        self.repeating = repeating;
         if (same) {
             self.repeat_sends +|= 1;
         } else {
@@ -274,6 +272,7 @@ pub const RequestRecovery = struct {
             if (next != self.send) return false;
         }
         self.repeat_stopped = true;
+        // The trace names the class that ended the last send.
         debug_trace.eventf("recovery", "repeated_failure_stop", self.trace_ctx, "failure={s} sends={d} progress_bytes={d} no_fast={}", .{
             @tagName(repeating),
             self.repeat_sends,
@@ -288,15 +287,24 @@ pub const RequestRecovery = struct {
         return self.repeat_stopped;
     }
 
-    /// How the module would send after `failure`, asked of a copy of its
-    /// state: `step` is pure, so stepping a copy changes nothing. The tick
-    /// lands past any wait the module schedules. Null when it would not send
-    /// again on its own.
+    /// How the module would send if `failure` kept ending its sends, asked of
+    /// a copy of its state: `step` is pure, so stepping a copy changes
+    /// nothing. The copy hears `failure` up to `repeat_stop_sends` times, each
+    /// followed by a tick past any wait it schedules, so a change the module
+    /// makes only after a run of failures, such as dropping Fast, is seen even
+    /// when unclear failures of other kinds started fx's count. Returns the
+    /// first send that differs from the current one, the current one when
+    /// none does, and null when the module would not send again on its own.
     fn nextSendLocked(self: *RequestRecovery, failure: Failure) ?Send {
         var probe = self.state;
-        const now_ms = self.nowMs();
-        _ = recovery.step(&probe, .{ .failed = failure }, now_ms);
-        return recovery.step(&probe, .tick, now_ms +| probe_horizon_ms).send;
+        var now_ms = self.nowMs();
+        for (0..repeat_stop_sends) |_| {
+            _ = recovery.step(&probe, .{ .failed = failure }, now_ms);
+            now_ms +|= probe_horizon_ms;
+            const next = recovery.step(&probe, .tick, now_ms).send orelse return null;
+            if (next != self.send) return next;
+        }
+        return self.send;
     }
 
     fn clearShownLocked(self: *RequestRecovery) void {
@@ -347,7 +355,7 @@ pub const RequestRecovery = struct {
     /// cooperative pulse on the turn loop's own thread instead.
     pub fn beginSend(self: *RequestRecovery) void {
         // The previous send ended some other way than a `Repeating` failure.
-        if (!self.repeat_noted) self.repeating = null;
+        if (!self.repeat_noted) self.repeat_sends = 0;
         self.repeat_noted = false;
         if (comptime builtin.single_threaded) {
             self.next_beat_ms = self.nowMs() +| tick_ms;
@@ -732,32 +740,33 @@ test "the same repeating failure on three sends in a row stops the request" {
 }
 
 test "unclear failures of different classes in a row still stop the request" {
-    var fake = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
-    defer fake.deinit();
-    const deps = fake.deps();
-    var cancel_flag = std.atomic.Value(bool).init(false);
-    var request = RequestRecovery.init(&deps, &cancel_flag, .{});
-    defer request.deinit();
-
-    try request.start(false);
     const Ending = struct { Failure.Kind, Repeating };
-    const endings = [_]Ending{
-        .{ .dropped, .tls_setup },
-        .{ .server, .uncoded_error },
-        .{ .dropped, .missing_finish },
-        .{ .server, .unexplained_error_finish },
+    // Between them the two runs end sends with every `Repeating` class.
+    const runs = [_][repeat_stop_sends]Ending{
+        .{ .{ .dropped, .tls_setup }, .{ .server, .uncoded_error }, .{ .dropped, .missing_finish } },
+        .{ .{ .server, .unexplained_error_finish }, .{ .dropped, .missing_finish }, .{ .server, .uncoded_error } },
     };
-    for (endings[0 .. endings.len - 1], 0..) |ending, index| {
-        request.beginSend();
-        request.endSend();
-        const stops = request.repeatedFailure(.{ .kind = ending[0] }, ending[1], 0);
-        // The third unclear ending in a row stops it, whatever its class.
-        try std.testing.expectEqual(index == repeat_stop_sends - 1, stops);
-        if (stops) break;
-        try request.failed(.{ .kind = ending[0] });
-        _ = (try request.waitForSend()).?;
+    for (runs) |endings| {
+        var fake = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
+        defer fake.deinit();
+        const deps = fake.deps();
+        var cancel_flag = std.atomic.Value(bool).init(false);
+        var request = RequestRecovery.init(&deps, &cancel_flag, .{});
+        defer request.deinit();
+
+        try request.start(false);
+        for (endings, 0..) |ending, index| {
+            request.beginSend();
+            request.endSend();
+            const stops = request.repeatedFailure(.{ .kind = ending[0] }, ending[1], 0);
+            // The third unclear ending in a row stops it, whatever its class.
+            try std.testing.expectEqual(index == endings.len - 1, stops);
+            if (stops) break;
+            try request.failed(.{ .kind = ending[0] });
+            _ = (try request.waitForSend()).?;
+        }
+        try std.testing.expect(request.stoppedRepeating());
     }
-    try std.testing.expect(request.stoppedRepeating());
 }
 
 test "a request gets its sends without Fast before a repeating failure stops it" {

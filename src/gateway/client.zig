@@ -3408,8 +3408,10 @@ fn providerFailureCause(root: std.json.Value) ?types.ProviderFailureCause {
     return null;
 }
 
-/// Error codes a resend can outlive: server errors and overload. The gateway
-/// fixtures pair `provider_error` and `no_available_providers` with HTTP 503.
+/// Error codes a resend can outlive: server errors, overload, and upstream
+/// timeouts. The gateway fixtures pair `provider_error` and
+/// `no_available_providers` with HTTP 503, and Anthropic documents
+/// `timeout_error` as a 504.
 const transient_provider_error_codes = [_][]const u8{
     "server_error",
     "internal_server_error",
@@ -3422,6 +3424,8 @@ const transient_provider_error_codes = [_][]const u8{
     "bad_gateway",
     "overloaded",
     "overloaded_error",
+    "timeout_error",
+    "gateway_timeout",
 };
 
 const rate_limit_error_codes = [_][]const u8{
@@ -3448,6 +3452,21 @@ const non_retryable_error_codes = [_][]const u8{
     "no_providers_available",
 };
 
+/// Error codes for a used-up quota or spend cap. Providers send them with
+/// HTTP 429, but waiting does not restore the quota, so they end the turn like
+/// any other code a resend cannot fix.
+const quota_error_codes = [_][]const u8{
+    "insufficient_quota",
+};
+
+/// `type` values that name a kind of error rather than the error: the generic
+/// wrapper a provider body nests its real error under, and the AI SDK's error
+/// class names. They count as no code.
+const error_type_names = [_][]const u8{
+    "error",
+    "AI_APICallError",
+};
+
 /// What an SSE `error` event says about the request: fx classifies what has a
 /// code and bounds what is unclear. This differs from the Responses protocol
 /// (`responses_protocol.zig` `accept_failure`), which ends the turn for
@@ -3471,9 +3490,9 @@ const ErrorEventClass = enum {
     non_retryable,
 
     /// Whether `next` replaces `current` as the stream's class: only when it
-    /// says more. A code beats no code, a stream timeout beats a transient
-    /// code, and a classified code beats both. Between two classified codes
-    /// the first wins.
+    /// says more. A code or a usable HTTP status beats an event with neither,
+    /// a stream timeout beats a transient class, and a classified one beats
+    /// both. Between two classified events the first wins.
     fn decides(current: ?ErrorEventClass, next: ErrorEventClass) bool {
         const held = current orelse return true;
         return next.rank() > held.rank();
@@ -3505,10 +3524,36 @@ fn recognizedCodeClass(code: []const u8) ?ErrorEventClass {
     for (rate_limit_error_codes) |rate_limit| {
         if (std.mem.eql(u8, code, rate_limit)) return .rate_limited;
     }
-    for (non_retryable_error_codes) |non_retryable| {
+    for (non_retryable_error_codes ++ quota_error_codes) |non_retryable| {
         if (std.mem.eql(u8, code, non_retryable)) return .non_retryable;
     }
     return null;
+}
+
+/// The failure kind of an HTTP error response: `kind`, the provider's reading
+/// of its status, except that a 429 whose body names a used-up quota or spend
+/// cap is `quota_exhausted`, so the turn ends instead of waiting for a quota
+/// that does not come back. Every provider's HTTP failure path calls this.
+pub fn httpFailureKind(
+    alloc: std.mem.Allocator,
+    kind: agent_stream_provider.FailureKind,
+    body: ?[]const u8,
+) agent_stream_provider.FailureKind {
+    if (kind != .rate_limited) return kind;
+    const text = body orelse return kind;
+    return if (errorBodyNamesQuota(alloc, text)) .quota_exhausted else kind;
+}
+
+/// Whether an HTTP error body names a used-up quota or spend cap, read as
+/// `providerErrorEventCode` reads an error event.
+fn errorBodyNamesQuota(alloc: std.mem.Allocator, body: []const u8) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return false;
+    defer parsed.deinit();
+    const code = providerErrorEventCode(parsed.value) orelse return false;
+    for (quota_error_codes) |quota| {
+        if (std.mem.eql(u8, code, quota)) return true;
+    }
+    return false;
 }
 
 /// An HTTP status an event carries in place of a code: 5xx (529 included) is
@@ -3524,12 +3569,14 @@ fn httpStatusClass(status: u16) ?ErrorEventClass {
 /// finish, and whether the finish named a gateway stream timeout. Null is a
 /// transient provider error or no failure.
 ///
-/// A content filter finish decides on its own. Error events decide an error
-/// finish or a missing one, and a classified code there beats a timeout. A
-/// finish that names a gateway stream timeout is one whatever else it says,
-/// as it always was; any other normal finish decides on its own. A provider
-/// error with nothing to classify it is unclear: fx resends it, but
-/// `request_recovery.zig` `Repeating` bounds it.
+/// A content filter finish decides on its own, even when the stream names a
+/// gateway stream timeout. Otherwise a timeout named by the finish or by an
+/// error event makes the stream one, as it always did, unless the finish is
+/// an error or missing and an error event carried a classified code, which
+/// beats it. Error events decide an error finish or a missing one; any other
+/// normal finish decides on its own. A provider error with nothing to
+/// classify it is unclear: fx resends it, but `request_recovery.zig`
+/// `Repeating` bounds it.
 fn streamFailureCause(
     class: ?ErrorEventClass,
     finish: ?types.ProviderFinishReason,
@@ -3539,7 +3586,7 @@ fn streamFailureCause(
     const error_or_missing = finish == null or finish == .provider_error;
     const classified = error_or_missing and
         (class == .non_retryable or class == .rate_limited);
-    if (finish_timeout and !classified) return .gateway_stream_timeout;
+    if (!classified and (finish_timeout or class == .stream_timeout)) return .gateway_stream_timeout;
     if (!error_or_missing) return null;
     const error_finish = finish != null;
     const event = class orelse return if (error_finish) .unexplained_error_finish else null;
@@ -3590,25 +3637,42 @@ fn providerErrorEventCode(root: std.json.Value) ?[]const u8 {
     return null;
 }
 
-/// A provider's own error body nests the real code one level down, under a
-/// `type` of "error", as `{"type":"error","error":{"type":"overloaded_error"}}`.
+/// An error object's `code`, else its `type` when that is a code. A
+/// provider's own error body nests the real error one level down, as
+/// `{"type":"error","error":{"type":"overloaded_error"}}`, so an object with
+/// neither reads its nested `error` the same way.
 fn errorObjectCode(object: std.json.ObjectMap) ?[]const u8 {
     if (object.get("code")) |value| {
         if (jsonValueString(value)) |code| return code;
     }
-    const kind = if (object.get("type")) |value| jsonValueString(value) else null;
-    if (kind) |code| {
-        if (!std.mem.eql(u8, code, "error")) return code;
+    if (errorObjectType(object)) |code| return code;
+    const nested = nestedErrorObject(object) orelse return null;
+    if (nested.get("code")) |value| {
+        if (jsonValueString(value)) |code| return code;
     }
-    if (object.get("error")) |nested| {
-        if (nested == .object) {
-            if (nested.object.get("code")) |value| {
-                if (jsonValueString(value)) |code| return code;
-            }
-            if (nested.object.get("type")) |value| return jsonValueString(value);
-        }
+    return errorObjectType(nested);
+}
+
+/// The object's `type`, unless it is one of `error_type_names`.
+fn errorObjectType(object: std.json.ObjectMap) ?[]const u8 {
+    const value = object.get("type") orelse return null;
+    const kind = jsonValueString(value) orelse return null;
+    for (error_type_names) |name| {
+        if (std.mem.eql(u8, kind, name)) return null;
     }
-    return null;
+    return kind;
+}
+
+/// The error object nested under a provider's wrapper, `{"type":"error",
+/// "error":{...}}`: only when the wrapper has no `code` and no `type` of its
+/// own that is a code.
+fn nestedErrorObject(object: std.json.ObjectMap) ?std.json.ObjectMap {
+    if (object.get("code")) |value| {
+        if (jsonValueString(value) != null) return null;
+    }
+    if (errorObjectType(object) != null) return null;
+    const nested = object.get("error") orelse return null;
+    return if (nested == .object) nested.object else null;
 }
 
 fn captureProviderFailureObject(
@@ -3617,12 +3681,14 @@ fn captureProviderFailureObject(
     object: std.json.ObjectMap,
     include_type: bool,
 ) !bool {
-    const code = if (object.get("code")) |value|
-        jsonValueString(value)
-    else if (include_type)
-        if (object.get("type")) |value| jsonValueString(value) else null
-    else
-        null;
+    if (include_type) {
+        // A provider's wrapper, `{"type":"error","error":{...}}`, names
+        // nothing itself: its nested error does, as `errorObjectCode` reads it.
+        if (nestedErrorObject(object)) |nested| {
+            if (try captureProviderFailureObject(alloc, current, nested, true)) return true;
+        }
+    }
+    const code = detailCode(object, include_type);
     const message = if (object.get("message")) |value| jsonValueString(value) else null;
     if (code) |code_text| {
         if (message) |message_text| {
@@ -3647,6 +3713,18 @@ fn captureProviderFailureObject(
         return true;
     }
     return false;
+}
+
+/// The code a detail names: the object's `code`, else, when `include_type`
+/// is set, its `type`. The detail keeps an SDK error name such as
+/// `AI_APICallError`, which the context-overflow and prefill checks read, but
+/// not a wrapper's generic "error".
+fn detailCode(object: std.json.ObjectMap, include_type: bool) ?[]const u8 {
+    if (object.get("code")) |value| return jsonValueString(value);
+    if (!include_type) return null;
+    const value = object.get("type") orelse return null;
+    const kind = jsonValueString(value) orelse return null;
+    return if (std.mem.eql(u8, kind, "error")) null else kind;
 }
 
 fn captureProviderFailureDetail(alloc: std.mem.Allocator, current: *?[]u8, root: std.json.Value) !void {
@@ -4420,9 +4498,11 @@ fn consumeSseStreamTraced(
         completion.provider_state_json = try replay.finish(completion.content orelse "", completion.tool_calls);
     }
 
-    // The code wins: an error event whose code classifies the failure makes
-    // the stream a provider error even when no finish followed it. A stream
-    // timeout keeps its own path, and no code says nothing.
+    // The code wins: an error event whose code, or HTTP status in place of
+    // one, classifies the failure makes the stream a provider error even when
+    // no finish followed it. A stream timeout keeps its own path, and an
+    // event with neither a code nor a usable status says nothing, so the
+    // stream stays one that ended early.
     if (finish_reason_holder == null) {
         if (error_event_class) |class| {
             switch (class) {
@@ -4852,7 +4932,36 @@ test "providerFailureCause ignores matching prose without the structured code" {
     try std.testing.expectEqual(@as(?types.ProviderFailureCause, null), providerFailureCause(parsed.value));
 }
 
-test "errorEventClass retries only server errors and overload" {
+test "errorBodyNamesQuota reads a quota code from an HTTP error body" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(errorBodyNamesQuota(alloc, "{\"error\":{\"message\":\"You exceeded your current quota\",\"type\":\"insufficient_quota\",\"code\":\"insufficient_quota\"}}"));
+    try std.testing.expect(errorBodyNamesQuota(alloc, "{\"type\":\"error\",\"error\":{\"type\":\"error\",\"error\":{\"type\":\"insufficient_quota\",\"message\":\"quota used up\"}}}"));
+    try std.testing.expect(!errorBodyNamesQuota(alloc, "{\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"slow down\"}}"));
+    try std.testing.expect(!errorBodyNamesQuota(alloc, "{\"error\":{\"message\":\"insufficient_quota\"}}"));
+    try std.testing.expect(!errorBodyNamesQuota(alloc, "insufficient_quota"));
+    try std.testing.expect(!errorBodyNamesQuota(alloc, ""));
+}
+
+test "httpFailureKind ends the turn only for a 429 that names a used-up quota" {
+    const alloc = std.testing.allocator;
+    const Kind = agent_stream_provider.FailureKind;
+    const quota_body = "{\"error\":{\"message\":\"You exceeded your current quota\",\"type\":\"insufficient_quota\",\"code\":\"insufficient_quota\"}}";
+    const cases = [_]struct { kind: Kind, body: ?[]const u8, expected: Kind }{
+        .{ .kind = .rate_limited, .body = quota_body, .expected = .quota_exhausted },
+        .{ .kind = .rate_limited, .body = "{\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"slow down\"}}", .expected = .rate_limited },
+        .{ .kind = .rate_limited, .body = "Too Many Requests", .expected = .rate_limited },
+        .{ .kind = .rate_limited, .body = null, .expected = .rate_limited },
+        // Only a 429 changes kind.
+        .{ .kind = .forbidden, .body = quota_body, .expected = .forbidden },
+        .{ .kind = .server_error, .body = quota_body, .expected = .server_error },
+        .{ .kind = .invalid_request, .body = quota_body, .expected = .invalid_request },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.expected, httpFailureKind(alloc, case.kind, case.body));
+    }
+}
+
+test "errorEventClass retries only server errors, overload, and upstream timeouts" {
     const alloc = std.testing.allocator;
     const cases = [_]struct { event: []const u8, class: ErrorEventClass }{
         .{ .event = "{\"type\":\"error\",\"error\":{\"code\":\"server_error\",\"message\":\"retry\"}}", .class = .transient },
@@ -4889,7 +4998,23 @@ test "errorEventClass retries only server errors and overload" {
         .{ .event = "{\"type\":\"error\",\"error\":{\"code\":\"provider_error\",\"message\":\"route failed\",\"statusCode\":400}}", .class = .transient },
         .{ .event = "{\"type\":\"error\",\"error\":{\"code\":\"invalid_request_error\",\"message\":\"bad input\",\"statusCode\":503}}", .class = .non_retryable },
         .{ .event = "{\"type\":\"error\",\"error\":{\"code\":\"something_new\",\"message\":\"rejected\",\"statusCode\":400}}", .class = .non_retryable },
-        .{ .event = "{\"type\":\"error\",\"error\":{\"message\":\"Bad Request\",\"type\":\"AI_APICallError\"}}", .class = .non_retryable },
+        // A quota code ends the turn even as a 429: waiting does not restore
+        // the quota.
+        .{ .event = "{\"type\":\"error\",\"error\":{\"code\":\"insufficient_quota\",\"message\":\"quota used up\",\"statusCode\":429}}", .class = .non_retryable },
+        .{ .event = "{\"type\":\"error\",\"error\":{\"type\":\"insufficient_quota\",\"message\":\"quota used up\",\"param\":{\"statusCode\":429}}}", .class = .non_retryable },
+        // Upstream timeouts are transient, including Anthropic's
+        // `timeout_error` nested under a provider's wrapper.
+        .{ .event = "{\"type\":\"error\",\"error\":{\"type\":\"error\",\"error\":{\"type\":\"timeout_error\",\"message\":\"Request timed out\"}}}", .class = .transient },
+        .{ .event = "{\"type\":\"error\",\"error\":{\"code\":\"gateway_timeout\",\"message\":\"upstream timed out\"}}", .class = .transient },
+        // A type that names a kind of error, an SDK error name or the
+        // wrapper's "error", is no code: its status decides, and with none
+        // the event is unclear.
+        .{ .event = "{\"type\":\"error\",\"error\":{\"message\":\"Bad Request\",\"type\":\"AI_APICallError\"}}", .class = .uncoded },
+        .{ .event = "{\"type\":\"error\",\"error\":{\"message\":\"Bad Request\",\"type\":\"AI_APICallError\",\"param\":{\"statusCode\":400}}}", .class = .non_retryable },
+        .{ .event = "{\"type\":\"error\",\"error\":{\"type\":\"error\",\"message\":\"route unavailable\"}}", .class = .uncoded },
+        .{ .event = "{\"type\":\"error\",\"error\":{\"type\":\"error\",\"error\":{\"type\":\"error\",\"message\":\"route unavailable\"}}}", .class = .uncoded },
+        .{ .event = "{\"type\":\"error\",\"error\":{\"type\":\"error\",\"message\":\"route unavailable\",\"statusCode\":503}}", .class = .transient },
+        .{ .event = "{\"type\":\"error\",\"error\":{\"type\":\"error\",\"error\":{\"type\":\"AI_APICallError\",\"message\":\"Bad Request\"}}}", .class = .uncoded },
         // A status that is not an error, is not a number, or sits in a field
         // nothing in this repository uses says nothing.
         .{ .event = "{\"type\":\"error\",\"error\":{\"message\":\"odd\",\"statusCode\":200}}", .class = .uncoded },
@@ -4905,8 +5030,9 @@ test "errorEventClass retries only server errors and overload" {
             return err;
         };
     }
-    // A code beats no code, a stream timeout beats a transient code, a
-    // classified code beats both, and the first classified code wins.
+    // A code or a usable status beats neither, a stream timeout beats a
+    // transient class, a classified one beats both, and the first classified
+    // one wins.
     try std.testing.expect(ErrorEventClass.decides(null, .uncoded));
     try std.testing.expect(ErrorEventClass.decides(.uncoded, .transient));
     try std.testing.expect(ErrorEventClass.decides(.transient, .stream_timeout));
@@ -4916,15 +5042,35 @@ test "errorEventClass retries only server errors and overload" {
     try std.testing.expect(!ErrorEventClass.decides(.transient, .uncoded));
 }
 
-test "consumeSseStream reads a gateway stream timeout named on any finish" {
+test "consumeSseStream reads a gateway stream timeout named by the finish or an error event" {
+    const timeout_event = "data: {\"type\":\"error\",\"error\":{\"code\":\"gateway_stream_timeout\",\"message\":\"stream ran too long\"}}\n\n";
     const Case = struct { payload: []const u8, cause: ?types.ProviderFailureCause };
     const cases = [_]Case{
         // A normal finish that names the timeout is one, as it always was.
         .{ .payload = "data: {\"type\":\"text-delta\",\"id\":\"t\",\"delta\":\"answer\"}\n\n" ++
             "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"},\"code\":\"gateway_stream_timeout\"}\n\n", .cause = .gateway_stream_timeout },
         .{ .payload = "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"error\",\"raw\":\"gateway_stream_timeout\"}}\n\n", .cause = .gateway_stream_timeout },
-        // A content filter still decides on its own.
+        // So is a normal finish after an error event that names it.
+        .{ .payload = "data: {\"type\":\"text-delta\",\"id\":\"t\",\"delta\":\"answer\"}\n\n" ++ timeout_event ++
+            "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"}}\n\n", .cause = .gateway_stream_timeout },
+        .{ .payload = timeout_event ++ "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"error\"}}\n\n", .cause = .gateway_stream_timeout },
+        .{ .payload = timeout_event, .cause = .gateway_stream_timeout },
+    };
+    for (cases) |case| {
+        var completion = try testStreamOutcome(case.payload);
+        defer deinitGatewayCompletion(std.testing.allocator, &completion);
+        errdefer std.debug.print("payload: {s}\n", .{case.payload});
+        try std.testing.expectEqual(case.cause, completion.provider_failure_cause);
+    }
+}
+
+test "consumeSseStream lets a content filter or a classified code outrank a named gateway stream timeout" {
+    const Case = struct { payload: []const u8, cause: ?types.ProviderFailureCause };
+    const cases = [_]Case{
+        // A content filter finish decides on its own.
         .{ .payload = "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"content-filter\"},\"code\":\"gateway_stream_timeout\"}\n\n", .cause = null },
+        .{ .payload = "data: {\"type\":\"error\",\"error\":{\"code\":\"gateway_stream_timeout\",\"message\":\"stream ran too long\"}}\n\n" ++
+            "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"content-filter\"}}\n\n", .cause = null },
         // A classified code on an error finish beats the timeout.
         .{ .payload = "data: {\"type\":\"error\",\"error\":{\"code\":\"invalid_request_error\",\"message\":\"bad input\"}}\n\n" ++
             "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"error\",\"raw\":\"gateway_stream_timeout\"}}\n\n", .cause = .non_retryable },
@@ -5019,7 +5165,44 @@ fn testStreamOutcome(payload: []const u8) !types.ModelCompletion {
     return consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancel_flag);
 }
 
-test "consumeSseStream marks a provider error without a code unclear" {
+test "consumeSseStream names the error a provider's wrapper nests in the notice detail" {
+    const error_finish = "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"error\"}}\n\n";
+    const Case = struct {
+        payload: []const u8,
+        detail: []const u8,
+        cause: ?types.ProviderFailureCause,
+    };
+    const cases = [_]Case{
+        // Anthropic's documented 504 body, as the Gateway passes it through.
+        .{
+            .payload = "data: {\"type\":\"error\",\"error\":{\"type\":\"error\",\"error\":{\"type\":\"timeout_error\",\"message\":\"Request timed out\"}}}\n\n" ++ error_finish,
+            .detail = "timeout_error: Request timed out",
+            .cause = null,
+        },
+        // The wrapper's generic "error" is no code.
+        .{
+            .payload = "data: {\"type\":\"error\",\"error\":{\"type\":\"error\",\"message\":\"route unavailable\"}}\n\n" ++ error_finish,
+            .detail = "provider_error: route unavailable",
+            .cause = .uncoded_error,
+        },
+        // An SDK error name stays in the detail, which the context-overflow
+        // and prefill checks read, but is no code to classify by.
+        .{
+            .payload = "data: {\"type\":\"error\",\"error\":{\"type\":\"AI_APICallError\",\"message\":\"input is too long\"}}\n\n" ++ error_finish,
+            .detail = "AI_APICallError: input is too long",
+            .cause = .uncoded_error,
+        },
+    };
+    for (cases) |case| {
+        var completion = try testStreamOutcome(case.payload);
+        defer deinitGatewayCompletion(std.testing.allocator, &completion);
+        errdefer std.debug.print("payload: {s}\n", .{case.payload});
+        try std.testing.expectEqualStrings(case.detail, completion.provider_failure_detail.?);
+        try std.testing.expectEqual(case.cause, completion.provider_failure_cause);
+    }
+}
+
+test "consumeSseStream marks a provider error with neither a code nor a status unclear" {
     const error_finish = "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"error\"}}\n\n";
     const Case = struct {
         payload: []const u8,
@@ -5027,14 +5210,15 @@ test "consumeSseStream marks a provider error without a code unclear" {
         cause: ?types.ProviderFailureCause,
     };
     const cases = [_]Case{
-        // An error event with no code, then the error finish.
+        // An error event with neither a code nor a status, then the error
+        // finish.
         .{ .payload = "data: {\"type\":\"error\",\"error\":{\"message\":\"wafer route unavailable\"}}\n\n" ++ error_finish, .finish = .provider_error, .cause = .uncoded_error },
         // An error finish that no error event explained.
         .{ .payload = error_finish, .finish = .provider_error, .cause = .unexplained_error_finish },
         // A later coded event replaces the uncoded one.
         .{ .payload = "data: {\"type\":\"error\",\"error\":{\"message\":\"first\"}}\n\n" ++
             "data: {\"type\":\"error\",\"error\":{\"code\":\"server_error\",\"message\":\"second\"}}\n\n" ++ error_finish, .finish = .provider_error, .cause = null },
-        // With no code and no finish, the stream simply ended early.
+        // With neither, and no finish, the stream simply ended early.
         .{ .payload = "data: {\"type\":\"error\",\"error\":{\"message\":\"cut off\"}}\n\n", .finish = null, .cause = null },
     };
     for (cases) |case| {
@@ -5057,6 +5241,7 @@ test "consumeSseStream lets a classified code decide a stream without a finish" 
         .{ .payload = "data: {\"type\":\"text-delta\",\"id\":\"a\",\"delta\":\"partial\"}\n\n" ++
             "data: {\"type\":\"error\",\"error\":{\"code\":\"invalid_request_error\",\"message\":\"bad input\"}}\n\n", .finish = .provider_error, .cause = .non_retryable },
         .{ .payload = "data: {\"type\":\"error\",\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"slow down\"}}\n\n", .finish = .provider_error, .cause = .rate_limited },
+        .{ .payload = "data: {\"type\":\"error\",\"error\":{\"code\":\"insufficient_quota\",\"message\":\"quota used up\",\"statusCode\":429}}\n\n", .finish = .provider_error, .cause = .non_retryable },
         .{ .payload = "data: {\"type\":\"error\",\"error\":{\"code\":\"server_error\",\"message\":\"retry\"}}\n\n", .finish = .provider_error, .cause = null },
         // A gateway stream timeout keeps its own path.
         .{ .payload = "data: {\"type\":\"error\",\"error\":{\"code\":\"gateway_stream_timeout\",\"message\":\"too long\"}}\n\n", .finish = null, .cause = .gateway_stream_timeout },

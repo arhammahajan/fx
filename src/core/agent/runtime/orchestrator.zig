@@ -4309,7 +4309,7 @@ fn failureHttpStatus(kind: agent_stream_provider.FailureKind) std.http.Status {
         .unauthorized => .unauthorized,
         .forbidden => .forbidden,
         .request_too_large => .payload_too_large,
-        .rate_limited => .too_many_requests,
+        .rate_limited, .quota_exhausted => .too_many_requests,
         .server_error => .internal_server_error,
         .bad_gateway => .bad_gateway,
         .unavailable => .service_unavailable,
