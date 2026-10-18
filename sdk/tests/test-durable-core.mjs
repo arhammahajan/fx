@@ -47,7 +47,13 @@ const endsLate = new Set(["late"]);
 // Inputs whose end records say only that the turn ended, not how, as an
 // earlier libfx wrote them. Every other end mark says how (DUR-20).
 const unsaidEnds = new Set();
-const endMarks = (input, stopReason) => [unsaidEnds.has(input) ? { end: true } : { end: true, stopReason }];
+// Inputs whose turn's last step streams a reply, these events, before the
+// record that ends the turn, whose end mark carries the reply's text, as
+// fx's does.
+const answers = new Map();
+const replyOf = (input) => answers.get(input).filter((event) => event.type === "text_delta").map((event) => event.delta).join("");
+const endMarks = (input, stopReason) => [unsaidEnds.has(input) ? { end: true }
+  : { end: true, stopReason, ...(answers.has(input) && stopReason === "end_turn" ? { reply: replyOf(input) } : {}) }];
 // How many engines the scripted harness opened, and how long each takes to
 // close.
 const opened = { count: 0 };
@@ -119,6 +125,11 @@ function scriptedHarness({ steps = 3 } = {}) {
           if (signal.aborted) throw new Error("aborted");
           ran.push(`${turnId}:${step}`);
           const last = step === steps - 1;
+          if (last && answers.has(input)) {
+            for (const event of answers.get(input)) push(event);
+            await append({ turnId, step, word, end: true }, endMarks(input, "end_turn"));
+            continue;
+          }
           if (last && endsLate.delete(input)) {
             // The end record is still on its way when the engine stops.
             const write = sleep(150).then(() => append({ turnId, step, word, end: true }, endMarks(input, "end_turn")));
@@ -223,6 +234,8 @@ function chain(before, next) {
 }
 
 const createAgent = createDurableAgentFactory({ harness: scriptedHarness(), defaultDurability: async () => memory(), name: "createScriptedAgent" });
+// Agents whose turns are one step: the reply of an input in `answers`.
+const createAnsweringAgent = createDurableAgentFactory({ harness: scriptedHarness({ steps: 1 }), defaultDurability: async () => memory(), name: "createScriptedAgent" });
 
 // Agents that record which of them opened each session's engine, by `tag`.
 const openedBy = [];
@@ -1682,12 +1695,17 @@ if (durabilityKind === "memory") {
 }
 
 // memory(), with a worker that dies right after the record that ends its
-// turn while `dies.now` is set: its turn_end lines never land and it never
-// lets the session go.
+// turn while `dies.now` is set: its turn_end lines never land, nor any line
+// `dies.lost(line)` names, and it never lets the session go.
 function dyingAfterEnd(base, dies) {
   let wrapped = null;
   const isEnd = (line) => {
-    try { return JSON.parse(line).type === "turn_end"; } catch { return false; }
+    try {
+      const event = JSON.parse(line);
+      return event.type === "turn_end" || dies.lost?.(event) === true;
+    } catch {
+      return false;
+    }
   };
   return {
     ...base,
@@ -1755,6 +1773,49 @@ if (durabilityKind === "memory") {
     assert.equal((await first.result).stopReason, "unknown");
     await agent.close();
   });
+
+  // DUR-20, DUR-38, DUR-64: the record that ends a turn carries its reply,
+  // so the worker that writes the end a crashed holder left missing first
+  // shows the part of the reply that holder's lines never did, once, and
+  // nothing a reader already has (`tests/tla/sdk/DurableSession.tla`
+  // ReplyShownOnce).
+  for (const [shown, lost, rest] of [
+    ["part of its reply", (event) => event.type === "text_delta" && event.delta !== "one ", "two three "],
+    ["none of its reply", (event) => event.type === "text_delta", "one two three "],
+    ["its whole reply", () => false, null],
+  ]) {
+    test(`a turn whose worker died after its end, having shown ${shown}, shows the rest of the reply once before its end`, async () => {
+      answers.set("answer", [{ type: "reasoning_delta", delta: "hm" }, { type: "text_delta", delta: "one " }, { type: "text_delta", delta: "two " }, { type: "text_delta", delta: "three " }]);
+      const dies = { now: true, lost };
+      const durability = dyingAfterEnd(memory(), dies);
+      const agent = createAnsweringAgent({ durability });
+      const session = agent.session();
+      const first = session.prompt("answer", { messageId: "turn-answer" });
+      const { sessionId } = await first.accepted;
+      const log = await durability.create().session(sessionId);
+      while (foldSessionLog(await log.read()).lastTurnId !== "turn-answer") await sleep(10);
+      await sleep(landMs);
+      dies.now = false;
+      let timer;
+      const retried = await Promise.race([
+        session.prompt("answer", { messageId: "turn-answer" }).result,
+        new Promise((_resolve, reject) => { timer = setTimeout(() => reject(new Error("the retry waited for an end nobody writes")), 5000); }),
+      ]).finally(() => clearTimeout(timer));
+      assert.equal(retried.stopReason, "end_turn");
+      const lines = (await readLines(session.stream(0), 100)).filter((line) => line.messageId === "turn-answer");
+      const dead = lines.filter((line) => line.epoch === 1).map((line) => [line.type, line.delta ?? null]);
+      assert.deepEqual(lines.filter((line) => line.epoch !== 1).map((line) => [line.type, line.delta ?? null]), [
+        ...(rest === null ? [] : [["text_delta", rest]]),
+        ["turn_end", null],
+      ], `after the dead worker's ${JSON.stringify(dead)}`);
+      const text = lines.filter((line) => line.type === "text_delta").map((line) => line.delta).join("");
+      assert.equal(text, "one two three ", "the reply once and whole");
+      // The first prompt's view follows the stream, so it reads that too.
+      assert.equal((await textOf(first)).text, "one two three");
+      answers.delete("answer");
+      await agent.close();
+    });
+  }
 }
 
 // memory(), with a worker that dies right after the first entry that ends a
@@ -2283,6 +2344,20 @@ if (durabilityKind === "memory") {
     const restored = fold([{ k: "checkpoint", through: "9", data: "saved", lastTurnId: "t1", lastTurnEnd: { stopReason: "end_turn" } }]);
     assert.equal(restored.lastTurnId, "t1");
     assert.deepEqual(restored.endingOf("t1"), { stopReason: "end_turn" });
+    // An end also keeps the turn's reply, which recovery shows before the
+    // end it writes (DUR-20, DUR-38), and the steer with images the turn
+    // ended for, which that end names; so does a checkpoint of it, and an
+    // `ended` entry keeps its steer.
+    const said = fold([
+      input("t4"), record(null, [{ start: "t4" }]), record("2", [{ end: true, stopReason: "cancelled", endedBySteer: "s4", reply: "so far" }]),
+      input("t5"), { k: "ended", messageId: "t5", stopReason: "cancelled", endedBySteer: "s5" },
+    ]);
+    assert.deepEqual(said.endingOf("t4"), { stopReason: "cancelled", endedBySteer: "s4", reply: "so far" });
+    assert.deepEqual(said.endingOf("t5"), { stopReason: "cancelled", endedBySteer: "s5" });
+    const kept = fold([{ k: "checkpoint", through: "9", data: "saved", lastTurnId: "t4", lastTurnEnd: said.endingOf("t4") }]);
+    assert.deepEqual(kept.endingOf("t4"), { stopReason: "cancelled", endedBySteer: "s4", reply: "so far" });
+    // Neither is anything but a string, and a steer's is an id.
+    assert.deepEqual(fold([input("t6"), record(null, [{ start: "t6" }]), record("2", [{ end: true, stopReason: "end_turn", endedBySteer: "not an id!", reply: 7 }])]).endingOf("t6"), { stopReason: "end_turn" });
   });
 }
 

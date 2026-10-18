@@ -100,6 +100,8 @@ function framesFor(prompt) {
   // An answer the model's output limit cuts short, so its turn ends
   // max_output_tokens.
   if (text === "cut short") return [{ type: "text-delta", id: "answer", delta: "cut" }, finish("length")];
+  // An answer that streams as three deltas.
+  if (text === "several words") return [...["one ", "two ", "three "].map((delta) => ({ type: "text-delta", id: "answer", delta })), finish("stop")];
   // A prompt as long as a frame holds is answered with its length.
   if (text.startsWith("long ")) return answer(`long: ${text.length}`);
   if (text === "slow reply") return slowReply;
@@ -2991,12 +2993,17 @@ test("a session too short to have saved a checkpoint still hears that it continu
 
 if (durabilityKind === "memory") {
   // memory(), with a worker that dies right after the record that ends its
-  // turn while `dies.now` is set: its turn_end lines never land, and it never
-  // lets the session go.
+  // turn while `dies.now` is set: its turn_end lines never land, nor any line
+  // `dies.lost(line)` names, and it never lets the session go.
   const dyingAfterEnd = (base, dies) => {
     let wrapped = null;
     const isEnd = (line) => {
-      try { return JSON.parse(line).type === "turn_end"; } catch { return false; }
+      try {
+        const event = JSON.parse(line);
+        return event.type === "turn_end" || dies.lost?.(event) === true;
+      } catch {
+        return false;
+      }
     };
     return {
       ...base,
@@ -3046,10 +3053,174 @@ if (durabilityKind === "memory") {
       assert.equal(requests.length, asked, "no model request once the turn's end was stored");
       const lines = await readLines(session.stream(0), 32);
       assert.deepEqual(lines.filter((line) => line.type === "turn_end").map((line) => line.stopReason), [stopReason]);
-      assert.deepEqual(foldSessionLog(await log.read()).endingOf(messageId), { stopReason }, "the log holds how the turn ended");
+      assert.deepEqual(foldSessionLog(await log.read()).endingOf(messageId)?.stopReason, stopReason, "the log holds how the turn ended");
       await agent.close();
     });
   }
+
+  // The reply the journal holds for turn `messageId`: its turn_committed's,
+  // read from every record the log holds, a checkpoint's included.
+  const journalReply = async (log, messageId) => {
+    let turn = null;
+    for (const { entry } of await log.readSince("0")) {
+      if (entry?.k !== "record") continue;
+      for (const event of JSON.parse(Buffer.from(entry.data, "base64").toString("utf8")).events) {
+        if (event.type === "turn_progress" && typeof event.turnId === "string") turn = event.turnId;
+        else if (event.type === "turn_committed" && turn === messageId) return event.data.assistant;
+      }
+    }
+    return null;
+  };
+  const withinSeconds = (promise, what, seconds = 10) => {
+    let timer;
+    return Promise.race([
+      promise,
+      new Promise((_resolve, reject) => { timer = setTimeout(() => reject(new Error(what)), seconds * 1000 * timeScale); }),
+    ]).finally(() => clearTimeout(timer));
+  };
+
+  // DUR-20, DUR-38, DUR-64: the record that ends a turn carries its reply,
+  // so the worker that writes the end of a turn whose holder died after that
+  // record first shows the part of the reply the holder's lines never did,
+  // once, and nothing a reader already has (`tests/tla/sdk/DurableSession.tla`
+  // ReplyShownOnce): the end of a reply whose start was shown, a reply after
+  // a tool call's lines, and one the checkpoint the turn's end saved keeps.
+  for (const [input, lost, label] of [
+    ["several words", (event) => event.type === "text_delta" && event.delta !== "one ", "with the start of its reply shown"],
+    ["use lookup", (event) => event.type === "text_delta", "after a tool call, with none of its reply shown"],
+    [bulky, (event) => event.type === "text_delta", "whose end saved a checkpoint, with none of its reply shown"],
+  ]) {
+    test(`a turn whose worker died after the record that ended it, ${label}, shows the rest of its reply once before its end`, async () => {
+      const dies = { now: true, lost };
+      const durability = dyingAfterEnd(memory(), dies);
+      const agent = createFxAgent(agentOptions(durability));
+      const session = agent.session();
+      const messageId = `reply-${requests.length}`;
+      const first = session.prompt(input, { messageId });
+      const { sessionId } = await first.accepted;
+      const log = await durability.create().session(sessionId);
+      await until(async () => {
+        const state = foldSessionLog(await log.read());
+        return state.lastTurnId === messageId && (input !== bulky || state.checkpoint?.through != null);
+      }, "the record that ends the turn");
+      // A dead worker never lets the session go: it stays dead until its run is over.
+      await until(() => agent[Symbol.for("libfx.durableInternals")].liveWorkers() === 0, "the dead worker's run to end");
+      dies.now = false;
+      const asked = requests.length;
+      const retried = await withinSeconds(session.prompt(input, { messageId }).result, "the retry waited for an end nobody writes");
+      assert.equal(retried.stopReason, "end_turn");
+      assert.equal(requests.length, asked, "no model request once the turn's end was stored");
+      const reply = await journalReply(log, messageId);
+      assert.ok(typeof reply === "string" && reply.length > 0, "the journal holds the reply");
+      assert.equal(foldSessionLog(await log.read()).endingOf(messageId)?.reply, reply, "the turn's end, or the checkpoint after it, holds the reply");
+      const lines = (await readLines(session.stream(0), 64)).filter((line) => line.messageId === messageId);
+      const dead = lines.filter((line) => line.epoch === 1);
+      const shown = dead.filter((line) => line.type === "text_delta").map((line) => line.delta).join("");
+      assert.equal(shown, input === "several words" ? "one " : "", "the dead worker's lines");
+      // The worker that wrote the end showed the rest of the reply first.
+      assert.deepEqual(lines.filter((line) => line.epoch !== 1).map((line) => [line.type, line.delta]), [["text_delta", reply.slice(shown.length)], ["turn_end", undefined]]);
+      // So the turn's text after its last line of another kind is the reply,
+      // once and whole, for a reader now and for the first prompt's view.
+      const tail = (events) => {
+        let text = "";
+        for (const event of events) text = event.type === "text_delta" ? text + event.delta : event.type === "reasoning_delta" ? text : "";
+        return text;
+      };
+      assert.equal(tail(lines.filter((line) => line.type !== "turn_end")), reply);
+      const viewed = [];
+      for await (const event of first) viewed.push(event);
+      assert.equal(tail(viewed), reply);
+      await agent.close();
+    });
+  }
+
+  // The reply an end mark carries is for libfx's own sessions: a store that
+  // set `marks: true` gets the marks its type lists.
+  test("a store that asks for marks hears how a turn ended, and not its reply", async () => {
+    const marks = [];
+    let cursor = 0;
+    const persistence = {
+      marks: true,
+      load: async () => ({ journal: [] }),
+      append: async (input) => {
+        marks.push(...(input.marks ?? []));
+        return { cursor: String((cursor += 1)) };
+      },
+    };
+    const engine = await catalogEngine(new Map(), { persistence });
+    try {
+      assert.equal((await engine.prompt("several words").result).stopReason, "end_turn");
+    } finally {
+      await engine.close();
+    }
+    assert.deepEqual(marks.filter((mark) => mark.end === true), [{ end: true, stopReason: "end_turn" }]);
+  });
+
+  // memory(), with a worker that dies right after the first record that ends
+  // a turn while `dies.armed` is set: from then until the test sets
+  // `dies.dead` back, no write but a sender's input lands, and no line
+  // reaches the stream.
+  const deadAfterEnd = (base, dies) => {
+    let wrapped = null;
+    const endsTurn = (entry) => entry?.k === "record" && (entry.marks ?? []).some((mark) => mark.end === true);
+    return {
+      ...base,
+      create() {
+        const backend = base.create();
+        wrapped ??= Object.assign(Object.create(backend), {
+          async session(id) {
+            const log = await backend.session(id);
+            return {
+              ...log,
+              ui: { ...log.ui, write: (lines) => log.ui.write(dies.dead ? [] : lines) },
+              async append(entry) {
+                if (dies.dead && entry?.k !== "input") throw new Error("the process died");
+                const appended = await log.append(entry);
+                if (dies.armed && endsTurn(entry)) {
+                  dies.armed = false;
+                  dies.dead = true;
+                }
+                return appended;
+              },
+            };
+          },
+        });
+        return wrapped;
+      },
+    };
+  };
+
+  // I3, DUR-20, DUR-64: the end of a turn a steer with images ended names the
+  // steer in the record that ends it, so the end recovery writes for it, after
+  // its worker died between that record and its turn_end line, names it too,
+  // and so does a retry, which resolves from the log.
+  test("a turn a steer with an image ended, whose worker died before its turn_end line, names the steer for its viewers and a retry", async () => {
+    const dies = { armed: true, dead: false };
+    const durability = deadAfterEnd(memory(), dies);
+    const agent = createFxAgent(agentOptions(durability));
+    const session = agent.session();
+    const before = slow.length;
+    const turn = session.prompt("slow reply", { messageId: "m-cut" });
+    const { sessionId } = await turn.accepted;
+    await until(() => slow.length > before && slow.at(-1).sent > 0, "the reply to stream");
+    await session.steer([{ type: "text", text: "match this" }, { type: "image", data: onePixelPng, mimeType: "image/png" }], { messageId: "m-cut-image" });
+    await until(() => dies.dead, "the record that ends the turn");
+    // A dead worker never lets the session go: it stays dead until its run is over.
+    await until(() => agent[Symbol.for("libfx.durableInternals")].liveWorkers() === 0, "the dead worker's run to end");
+    dies.dead = false;
+    const retried = await withinSeconds(session.prompt("slow reply", { messageId: "m-cut" }).result, "the retry waited for an end nobody writes");
+    assert.deepEqual([retried.stopReason, retried.endedBySteer], ["cancelled", "m-cut-image"]);
+    const first = await turn.result;
+    assert.deepEqual([first.stopReason, first.endedBySteer], ["cancelled", "m-cut-image"]);
+    const lines = await linesUntil(session, (line) => line.type === "turn_end" && line.messageId === "m-cut-image", "the image's turn");
+    assert.deepEqual(lines.filter((line) => line.type === "turn_end").map((line) => [line.messageId, line.stopReason, line.endedBySteer]), [
+      ["m-cut", "cancelled", "m-cut-image"],
+      ["m-cut-image", "end_turn", undefined],
+    ]);
+    const log = await durability.create().session(sessionId);
+    assert.equal(foldSessionLog(await log.read()).endingOf("m-cut")?.endedBySteer, "m-cut-image", "the log names the steer");
+    await agent.close();
+  });
 }
 
 // The agent is the long-lived instance: it fetches the model catalog once

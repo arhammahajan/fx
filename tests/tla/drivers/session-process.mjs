@@ -19,6 +19,7 @@ globalThis[Symbol.for("libfx.liveHolders")] = sharedSet(liveBuffer);
 const announced = sharedSet(announcedBuffer);
 
 const { createFxAgent } = await import("../../../sdk/node.js");
+const { foldSessionLog } = await import("../../../sdk/durable.js");
 // On the refuse graph, an fx agent whose prompt() stores a prompt fx refuses,
 // as an earlier libfx's did: its harness has no checkPrompt, so the worker
 // refuses the prompt only when its turn runs.
@@ -106,31 +107,56 @@ function withoutBackstops(durability) {
   };
 }
 
-// Holds each write to the session stream that carries a turn_end line its
-// worker writes while it heads the session's chain, until the driver lets it
-// go, so a walk can stop a worker between the record that ends its turn and
-// that line (`tests/tla/sdk/DurableSession.tla` EndLine). A replaced
-// worker's late line goes out at once, as the model's MaybeLine has it.
-// Lines before a held one in the same write go out at once.
+// Holds each write to the session stream that carries a turn_end line, or a
+// text_delta line of the answer, that its worker writes while it heads the
+// session's chain, until the driver lets it go, so a walk can stop a worker
+// between the record that ends its turn and those lines
+// (`tests/tla/sdk/DurableSession.tla` Model2, EndLine). Each held line goes
+// out by itself, in order: `releaseText(k)` lets the first k text lines go,
+// as Model2 lands the record with them, and `release()` every line until
+// the worker's turn_end, as EndLine. A replaced worker's late lines go out
+// at once, as the model's Model2 and MaybeLine have it.
 function holdEndLines(durability, heads, changed) {
   const waiting = [];
+  // Set by release(): every held line goes out until a turn_end has.
+  let draining = false;
   const decoder = new TextDecoder();
-  const isEnd = (chunk) => {
+  const kindOf = (chunk) => {
     try {
-      return JSON.parse(typeof chunk === "string" ? chunk : decoder.decode(chunk)).type === "turn_end";
+      const type = JSON.parse(typeof chunk === "string" ? chunk : decoder.decode(chunk)).type;
+      return type === "turn_end" ? "end" : type === "text_delta" ? "text" : null;
     } catch {
-      return false;
+      return null;
     }
   };
-  const hold = () => new Promise((go) => {
-    waiting.push(go);
+  const hold = (kind) => (draining ? Promise.resolve() : new Promise((go) => {
+    waiting.push({ kind, go });
     changed();
-  });
+  }));
+  const went = (kind) => {
+    if (kind === "end") draining = false;
+  };
   const ends = {
-    get held() { return waiting.length; },
+    get held() { return waiting.filter((entry) => entry.kind === "end").length; },
+    get texts() { return waiting.filter((entry) => entry.kind === "text").length; },
     release() {
-      for (const go of waiting.splice(0)) go();
+      draining = true;
+      for (const { go } of waiting.splice(0)) go();
       changed();
+    },
+    // Each text line is written only once the one before it is, so the next
+    // one is waited for.
+    async releaseText(count) {
+      for (let released = 0; released < count; released += 1) {
+        const started = Date.now();
+        while (!waiting.some((entry) => entry.kind === "text")) {
+          if (Date.now() - started > 2000) return;
+          await sleep(5);
+        }
+        const [entry] = waiting.splice(waiting.findIndex((item) => item.kind === "text"), 1);
+        entry.go();
+        changed();
+      }
     },
   };
   const bound = (target, key) => {
@@ -145,17 +171,23 @@ function holdEndLines(durability, heads, changed) {
         get(target, key) {
           if (key === "write") {
             return async (runId, name, chunk) => {
-              if (isEnd(chunk) && (await heads(runId))) await hold();
-              return target.write(runId, name, chunk);
+              const kind = kindOf(chunk);
+              if (kind === null || !(await heads(runId))) return target.write(runId, name, chunk);
+              await hold(kind);
+              const written = await target.write(runId, name, chunk);
+              went(kind);
+              return written;
             };
           }
           if (key === "writeMulti") {
             return async (runId, name, chunks) => {
-              const at = chunks.findIndex(isEnd);
-              if (at < 0 || !(await heads(runId))) return target.writeMulti(runId, name, chunks);
-              if (at > 0) await target.writeMulti(runId, name, chunks.slice(0, at));
-              await hold();
-              return target.writeMulti(runId, name, chunks.slice(at));
+              if (!chunks.some((chunk) => kindOf(chunk) !== null) || !(await heads(runId))) return target.writeMulti(runId, name, chunks);
+              for (const chunk of chunks) {
+                const kind = kindOf(chunk);
+                if (kind !== null) await hold(kind);
+                await target.writeMulti(runId, name, [chunk]);
+                if (kind !== null) went(kind);
+              }
             };
           }
           return bound(target, key);
@@ -187,9 +219,9 @@ const methods = {
     const stored = leasedWorld ? leasedWorld(dir) : durabilityKind === "world" ? await appWorldAt(dir) : durabilityKind === "vercel" ? vercelStorage({ dir }) : queueWorld ? queueWorld.durability : local({ dir });
     // What the driver reads of the held writes: their kind, a lease's
     // holder, and whether one is a frozen worker's renewal.
-    // And how many turn_end lines it holds.
+    // And how many turn_end and answer text lines it holds.
     const postHeld = () => {
-      if (walk === state) post(state, { type: "held", held: state.writes.held.map((entry) => ({ k: entry.k, holder: entry.holder ?? null, renewal: renewals.has(entry) })), ends: state.ends.held });
+      if (walk === state) post(state, { type: "held", held: state.writes.held.map((entry) => ({ k: entry.k, holder: entry.holder ?? null, renewal: renewals.has(entry) })), ends: state.ends.held, texts: state.ends.texts });
     };
     // Whether the chain's latest lease is one this worker claimed.
     const heads = async (sessionId) => claims.has((await state.agent[durableInternals].lastLease(sessionId))?.holder);
@@ -298,10 +330,21 @@ const methods = {
     await settled;
     walk.postHeld();
   },
-  // The turn_end lines held now go out (`tests/tla/sdk/DurableSession.tla`
-  // EndLine).
+  // The lines held now go out, and so does each this worker writes until
+  // its turn_end (`tests/tla/sdk/DurableSession.tla` EndLine).
   releaseEnds() {
     walk.ends.release();
+  },
+  // The first `count` held text lines of the answer go out
+  // (`tests/tla/sdk/DurableSession.tla` Model2).
+  async releaseText({ count }) {
+    await walk.ends.releaseText(count);
+  },
+  // Whether the log holds the end of the session's turn.
+  async turnEnded({ sessionId }) {
+    const log = await walk.agent[durableInternals].openLog(sessionId);
+    const state = foldSessionLog(await log.read());
+    return state.openTurn === null && state.lastTurnId !== null;
   },
   // A claim lands: the holder of the last held lease, and the live holders
   // just before it goes out.

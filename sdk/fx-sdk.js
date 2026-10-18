@@ -558,8 +558,12 @@ const isJournalEnd = (event) => event?.type === "turn_committed" || event?.type 
 // What a record's events say about turns, in order, for a store that tracks
 // them without reading records: a turn started, ended, and how, or yielded,
 // an input was accepted or handed back unplaced, or the step the open turn is
-// at, as its tool steps finished and the state of its calls.
-function journalMarks(events) {
+// at, as its tool steps finished and the state of its calls. With `replies`,
+// as libfx's durable sessions ask, the end that commits a turn also carries
+// its reply, the text its last step streamed, so a worker that writes the end
+// of a turn whose own worker died first shows what of it no reader has
+// (DUR-20, DUR-38).
+function journalMarks(events, replies = false) {
   const marks = [];
   for (const event of events) {
     if (event?.type === "turn_progress") {
@@ -571,7 +575,8 @@ function journalMarks(events) {
       if (Number.isSafeInteger(steps)) marks.push({ step: `${steps}:${String(event.data?.tool_state ?? "none")}` });
     } else if (isJournalEnd(event)) {
       const stopReason = journalEndReason(event);
-      marks.push(stopReason === null ? { end: true } : { end: true, stopReason });
+      const reply = replies && event.type === "turn_committed" && typeof event.data?.assistant === "string" && event.data.assistant.length > 0 ? event.data.assistant : null;
+      marks.push({ end: true, ...(stopReason === null ? {} : { stopReason }), ...(reply === null ? {} : { reply }) });
     } else if (event?.type === "turn_yielded") marks.push({ yield: true });
     else if (event?.type === "input_accepted" && typeof event.data?.id === "string") marks.push({ accepted: event.data.id });
     else if (event?.type === "input_withdrawn" && typeof event.data?.id === "string") marks.push({ withdrawn: event.data.id });
@@ -2552,6 +2557,7 @@ export async function createFxEngine(options = {}) {
   const imageStorage = persistence?.[persistenceImages] ?? null;
   const imageStore = imageStorage !== null;
   const wantsMarks = persistence?.marks === true || persistence?.[journalMarksWanted] === true;
+  const wantsReplies = persistence?.[journalMarksWanted] === true;
   const checkpointAfterBytes = options.checkpointAfterBytes ?? defaultCheckpointAfterBytes;
   // The store's last cursor, and the last seq its records hold.
   let journalHead = null;
@@ -2568,7 +2574,7 @@ export async function createFxEngine(options = {}) {
       const data = encodeJournalRecord(events);
       const lastSeq = events.at(-1)?.seq;
       // A store that tracks turns without reading records asks for marks.
-      const marks = wantsMarks ? { marks: journalMarks(events) } : {};
+      const marks = wantsMarks ? { marks: journalMarks(events, wantsReplies) } : {};
       const appended = appendTail.then(async () => {
         const result = await persistence.append({ expected: journalHead, idempotencyKey: `${writerId}:${events[0]?.seq}`, data, barrier, ...marks });
         if (!validCursor(result?.cursor)) throw new TypeError("persistence.append() must resolve to { cursor }");

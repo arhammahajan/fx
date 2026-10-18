@@ -72,11 +72,15 @@ done
 # how, as before libfx recorded it, the worker that writes a crashed
 # holder's missing turn_end can only say unknown. NoRefusedHow breaks it
 # the same way for a refused turn's `ended` entry.
+# NoReplyRepair breaks ReplyShownOnce: when the record that ends a turn does
+# not hold its reply, as before libfx put it there, a holder that crashed
+# while its answer's last text lines were on their way leaves the reply cut
+# short, and the worker that writes its missing turn_end cannot finish it.
 for pair in UiInOrder:UiInOrder NoStaleShown:NoStaleShown NotTwoActive:NotTwoActive \
     NoSelfStop:TwoActiveNeedsFreeze NoClaimFence:EffectsAtMostOnce NoCutoffBound:HandoffsBounded \
     LeasedTwoActive:NotTwoActive LookupRunsAhead:EveryCallAfterIntent LookupNewId:IdsAtMostOne \
     WriteRunsAhead:OneExecutionId NoEndRepair:EndRecoverable NoRefusedRepair:EndRecoverable \
-    NoEndHow:EndSaysHow NoRefusedHow:EndSaysHow; do
+    NoEndHow:EndSaysHow NoRefusedHow:EndSaysHow NoReplyRepair:ReplyShownOnce; do
     witness="${pair%%:*}" invariant="${pair#*:}"
     if "$java" -cp "$jar" tlc2.TLC -deadlock -workers auto -cleanup -metadir "$work/w-$witness" \
         -config "Witness-$witness.cfg" DurableSession.tla 2>&1 | grep -q -E "Invariant $invariant is violated"; then

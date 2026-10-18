@@ -382,6 +382,12 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
                 lastTurnId = openTurn.id;
                 const ending = endingOf(mark);
                 if (ending) endings.set(openTurn.id, ending);
+              } else {
+                // A turn that ended by clearing its progress is then
+                // committed, and that end carries its reply.
+                const ended = lastTurnId === null ? null : endings.get(lastTurnId);
+                const reply = endingOf(mark)?.reply;
+                if (ended && ended.reply === undefined && reply !== undefined) endings.set(lastTurnId, { ...ended, reply });
               }
               openTurn = null;
               yielded = false;
@@ -545,11 +551,18 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
 
 // How an entry that ends a turn says the turn ended: a record's end mark,
 // an `ended` entry, or a checkpoint's last turn. Null when it does not say,
-// as one an earlier libfx wrote.
+// as one an earlier libfx wrote. With it, the steer with images the turn
+// ended for, which its end line names, and the text of its reply, which the
+// end that recovery writes shows first.
 function endingOf(entry) {
   if (typeof entry?.stopReason !== "string" || entry.stopReason.length === 0) return null;
   const error = entry.error && typeof entry.error === "object" ? { name: String(entry.error.name ?? "Error"), message: String(entry.error.message ?? "") } : null;
-  return { stopReason: entry.stopReason, ...(error ? { error } : {}) };
+  return {
+    stopReason: entry.stopReason,
+    ...(error ? { error } : {}),
+    ...(validId(entry.endedBySteer) ? { endedBySteer: entry.endedBySteer } : {}),
+    ...(typeof entry.reply === "string" && entry.reply.length > 0 ? { reply: entry.reply } : {}),
+  };
 }
 
 // A turn's end line as `ending` says the turn ended: the line of a turn
@@ -557,7 +570,33 @@ function endingOf(entry) {
 // the one recovery writes for a turn whose end the log holds. "unknown" only
 // for an end an earlier libfx wrote, which does not say (DUR-20).
 function endLineOf(messageId, ending) {
-  return { type: "turn_end", messageId, stopReason: ending?.stopReason ?? "unknown", usage: {}, ...(ending?.error ? { error: ending.error } : {}) };
+  return {
+    type: "turn_end",
+    messageId,
+    stopReason: ending?.stopReason ?? "unknown",
+    usage: {},
+    ...(ending?.error ? { error: ending.error } : {}),
+    ...(ending?.endedBySteer ? { endedBySteer: ending.endedBySteer } : {}),
+  };
+}
+
+// What a turn's reply, the `reply` its end holds, still owes its readers:
+// the rest of it after the text the turn's shown lines end with. A worker's
+// lines land in the order it wrote them, so the stream holds the start of
+// what the turn's last worker wrote; the reply's text is the last of that,
+// after every other line of the turn but reasoning, so the text the turn's
+// lines end with is the start of the reply, or, when it is not, text from
+// before the reply, which then shows none of it. A model request whose
+// stream fails ends its turn, so no line shows a reply twice (DUR-20,
+// DUR-38; `tests/tla/sdk/DurableSession.tla` ReplyShownOnce).
+async function unshownReply(log, messageId, reply) {
+  if (reply === undefined) return "";
+  let shown = "";
+  await eachShownLine(log, await log.ui.length(), (event) => {
+    if (event.messageId !== messageId || event.type === "reasoning_delta") return;
+    shown = event.type === "text_delta" ? shown + String(event.delta ?? "") : "";
+  });
+  return reply.startsWith(shown) ? reply.slice(shown.length) : reply;
 }
 
 // The `ended` entry of a turn that ends without a record of its own, saying
@@ -1931,10 +1970,29 @@ class SessionWorker {
       cut = state.cut;
     }
     const ui = uiWriter(log, (error) => agent.emit("ui.error", { sessionId: this.sessionId, error: error?.name ?? "Error" }), lease.epoch);
+    // Writes the end of turn `messageId`, which the log holds, as `ending`
+    // says, after the part of the turn's reply no reader has yet: what its
+    // worker's lines never showed before it stopped (DUR-20, DUR-38, DUR-64).
+    const endFromLog = async (messageId, ending) => {
+      await ui.settle();
+      const rest = await unshownReply(log, messageId, ending?.reply);
+      if (rest.length > 0) ui.push({ type: "text_delta", delta: rest, messageId });
+      ui.push(endLineOf(messageId, ending));
+      await ui.settle();
+    };
     // When the lease runs out, as this worker last renewed it.
     let leaseExpiresAt = lease.expiresAt;
     // An image read that threw while the engine opened.
     let imageReadFailed = null;
+    // The record that ends a turn this worker cancelled for a steer with
+    // images names that steer in its end, as the turn's end line does, so the
+    // end recovery writes for it and a retry that reads the log do too.
+    const steerEnds = (marks) => {
+      const cut = (mark) => mark?.end === true && mark.stopReason === "cancelled";
+      if (!Array.isArray(marks) || !marks.some(cut)) return marks;
+      const steer = this.endedFor?.() ?? null;
+      return steer === null ? marks : marks.map((mark) => (cut(mark) ? { ...mark, endedBySteer: steer } : mark));
+    };
     const store = {
       load: async () => ({
         ...(state.checkpoint?.data ? { checkpoint: { through: state.checkpoint.through ?? "0", data: fromBase64(state.checkpoint.data) } } : {}),
@@ -1942,7 +2000,7 @@ class SessionWorker {
         // Until the claim lands, the chain where the worker read it.
         head: head ?? state.head,
       }),
-      append: ({ idempotencyKey, data, marks }) => chained({ k: "record", key: idempotencyKey, data: toBase64(data), marks }).then((cursor) => ({ cursor })),
+      append: ({ idempotencyKey, data, marks }) => chained({ k: "record", key: idempotencyKey, data: toBase64(data), marks: steerEnds(marks) }).then((cursor) => ({ cursor })),
       // The engine stores each prompt image before it sends it; a prompt
       // from the log names images already here.
       [persistenceImages]: {
@@ -2049,11 +2107,11 @@ class SessionWorker {
       if (missingEnd !== null && state.openTurn === null && state.lastTurnId === missingEnd) {
         // The session's last turn ended without a turn_end line, its holder
         // gone: its viewers hear it ended now, under this worker's lease,
-        // whose epoch outranks a late line from that holder, and how, as
-        // the entry that ended it says (`tests/tla/sdk/DurableSession.tla`
-        // EndLine, with Repair; EndSaysHow). No engine starts.
-        ui.push(endLineOf(missingEnd, state.endingOf(missingEnd)));
-        await ui.settle();
+        // whose epoch outranks a late line from that holder, how, as the
+        // entry that ended it says, and with the rest of its reply
+        // (`tests/tla/sdk/DurableSession.tla` EndLine, with Repair;
+        // EndSaysHow, ReplyShownOnce). No engine starts.
+        await endFromLog(missingEnd, state.endingOf(missingEnd));
         if (!state.hasWork) return "done";
       }
       try {
@@ -2092,6 +2150,9 @@ class SessionWorker {
         let messageId = null;
         let fresh = false;
         let spent = false;
+        // No turn has ended for a steer until drive() says one did: an end
+        // the turn's engine stores before then names none (steerEnds).
+        this.endedFor = null;
         if (open?.id) {
           // A call left running reruns only when running it twice is safe.
           // Any other call is never run again: the model is told it may have
@@ -2180,7 +2241,7 @@ class SessionWorker {
         }
         // A new turn takes the steers sent while it waited to start.
         const joining = fresh ? { ...state, steers: state.pending[0]?.joiners ?? [], endOpen: state.pending[0]?.ends ?? null } : state;
-        const outcome = await this.drive(log, harness, turn, messageId, joining, ui, !fresh);
+        const outcome = await this.drive(log, harness, turn, messageId, joining, ui, !fresh, cancelledFirst);
         turnNow = null;
         if (outcome === "fenced") return "fenced";
         if (outcome === "yielded") {
@@ -2208,14 +2269,16 @@ class SessionWorker {
           if (state.openTurn?.id !== messageId && state.consumed.has(messageId)) {
             // Its end landed before its engine stopped, so it ended, as that
             // end says.
-            ui.push(endLineOf(messageId, state.endingOf(messageId)));
-            await ui.settle();
+            await endFromLog(messageId, state.endingOf(messageId));
           } else {
             await log.append({ k: "stopped", messageId });
           }
           return unusable(outcome.stopped);
         }
         const { result } = outcome;
+        // A turn a steer with images ended names it, so an app tells it from
+        // a cancel.
+        const endedBySteer = result.stopReason === "cancelled" ? outcome.endedBySteer : undefined;
         if (fresh && !failed && !started.has(messageId)) {
           // A turn that ended before writing a record, such as a prompt the
           // harness refused or one a cancel stopped first, is done too. The
@@ -2223,13 +2286,11 @@ class SessionWorker {
           // retry that reads the log finds it ended.
           state = this.fold(await log.read());
           if (!state.consumed.has(messageId)) {
-            await log.append(endedEntry(messageId, { stopReason: result.stopReason, ...(result.error ? { error: result.error } : {}) }));
+            await log.append(endedEntry(messageId, { stopReason: result.stopReason, ...(result.error ? { error: result.error } : {}), ...(endedBySteer ? { endedBySteer } : {}) }));
           }
         }
         // The turn's records have landed, so its viewers hear it ended now;
-        // the log is read after, for what comes next. A turn a steer with
-        // images ended names it, so an app tells it from a cancel.
-        const endedBySteer = !cancelledFirst && result.stopReason === "cancelled" ? outcome.endedBySteer : undefined;
+        // the log is read after, for what comes next.
         ui.push({ type: "turn_end", messageId, stopReason: result.stopReason, usage: result.usage ?? {}, ...(result.error ? { error: result.error } : {}), ...(endedBySteer ? { endedBySteer } : {}) });
         await ui.settle();
         state = this.fold(await log.read());
@@ -2279,8 +2340,9 @@ class SessionWorker {
   // `{ stopped }` when its harness stopped under it, or `{ result }` for a
   // turn that ended, whose end the caller writes, with `endedBySteer`, the id
   // of the steer it ended the turn for, when it cancelled the turn for nothing
-  // else. `resumed` says the turn continues one an earlier worker ran.
-  async drive(log, harness, turn, messageId, state, ui, resumed = false) {
+  // else. `resumed` says the turn continues one an earlier worker ran, and
+  // `cancelledFirst` that the worker cancelled it before it drove it.
+  async drive(log, harness, turn, messageId, state, ui, resumed = false, cancelledFirst = false) {
     // The inputs `state` was folded from are placed already: the fold gave
     // each a turn, joined it to one, or spent it. The poll applies only the
     // inputs stored after them. After an early start, that includes this
@@ -2295,11 +2357,17 @@ class SessionWorker {
     // steers after that one join its turn. `ending` is that steer's id, which
     // the turn's end names unless the turn was cancelled too.
     let ending = null;
-    let cancelled = false;
+    let cancelled = cancelledFirst;
     const cancel = () => {
       cancelled = true;
       turn.cancel();
     };
+    // The steer the turn ended for, decided once the record that ends it is
+    // stored, which names it, so the turn's end line and that record agree
+    // whatever comes after (DUR-64).
+    let endedFor;
+    const steerNow = () => (ending !== null && !cancelled ? ending : null);
+    this.endedFor = () => (endedFor === undefined ? (endedFor = steerNow()) : endedFor);
     const endTurn = (steerId) => {
       if (ending !== null) return;
       ending = steerId;
@@ -2410,7 +2478,8 @@ class SessionWorker {
       await ui.settle();
       return "yielded";
     }
-    return { result, ...(ending !== null && !cancelled ? { endedBySteer: ending } : {}) };
+    const endedBySteer = endedFor === undefined ? steerNow() : endedFor;
+    return { result, ...(endedBySteer === null ? {} : { endedBySteer }) };
   }
 }
 
@@ -2691,9 +2760,15 @@ function turnView({ messageId, resumeRequest = null, start }) {
  *   `saveCheckpoint({ through, data })` stores what the records through
  *   `through` add up to. Each record's `marks` tell the core where turns
  *   start (`{ start: turnId }`), yield (`{ yield: true }`) and end
- *   (`{ end: true }`), which inputs a turn took (`{ accepted: id }`), when
- *   its model request first carries one (`{ placed: id }`), and which it
- *   ended without placing (`{ withdrawn: id }`), which wait for a turn again.
+ *   (`{ end: true, stopReason?, reply? }`), which inputs a turn took
+ *   (`{ accepted: id }`), when its model request first carries one
+ *   (`{ placed: id }`), and which it ended without placing
+ *   (`{ withdrawn: id }`), which wait for a turn again. An end says how the
+ *   turn ended, and `reply` is the text of the `text_delta` events the turn
+ *   ends with, after its last event of another kind but `reasoning_delta`:
+ *   the end the core writes for a turn whose worker died after that record
+ *   shows what of it no reader has. An end mark that comes after its turn's
+ *   own, with no turn started between, adds only its reply.
  *   A write another worker's write fenced out rejects with a `FX_FENCED`
  *   code. `ready`, when given, resolves true once the worker's claim on the
  *   session lands and false when it failed: the core may start a turn
