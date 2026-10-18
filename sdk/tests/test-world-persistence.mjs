@@ -235,7 +235,8 @@ test("a second process on the session fences the first, and its late write is no
   const second = await createAgent(worldPersistence(world, { runId: store.runId }));
   await run(second, "two");
   await second.close();
-  const fenced = (error) => error.code === "FX_JOURNAL_APPEND_FAILED" && error.cause instanceof FxFencedError;
+  // A fenced turn rejects with the store's own fence (DUR-30).
+  const fenced = (error) => error instanceof FxFencedError && error.code === "FX_FENCED";
   await assert.rejects(run(first, "three"), fenced);
   await first.close();
 

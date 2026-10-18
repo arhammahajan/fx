@@ -23,6 +23,8 @@ let requests = 0;
 let toolCalls = 0;
 let largestBody = 0;
 const imagesSent = [];
+// Whether each request names an image it left out, with a note.
+const withheldNotes = [];
 let agent;
 const timer = setTimeout(() => assert.fail("native image framing timed out"), 60_000);
 const sse = (...events) => new Response(
@@ -53,10 +55,12 @@ try {
       }
       requests += 1;
       largestBody = Math.max(largestBody, init.body.length);
-      imagesSent.push(JSON.parse(Buffer.from(init.body).toString("utf8")).prompt
+      const sent = Buffer.from(init.body).toString("utf8");
+      imagesSent.push(JSON.parse(sent).prompt
         .filter((message) => message.role === "user" && Array.isArray(message.content))
         .flatMap((message) => message.content)
         .filter((part) => part.type === "file").length);
+      withheldNotes.push(sent.includes("not sent to keep the request under the provider's size limit"));
       // Each prompt calls the tool once, then answers with its images.
       if (requests % 2 === 1) return sse(
         { type: "tool-call", toolCallId: `images${requests}`, toolName: "screenshots", input: {} },
@@ -96,6 +100,10 @@ try {
   assert.ok(largestBody <= requestBudget, `every request fits the core's budget: ${largestBody} bytes`);
   assert.equal(imagesSent[7], 8, "the fourth turn's answer carries all eight images");
   assert.ok(imagesSent[9] < 10 && imagesSent[11] < 12, `later requests leave the oldest images out: ${imagesSent}`);
+  // Each image left out leaves a note in its place, instead of the request
+  // failing; a request that carries every image has none.
+  assert.equal(withheldNotes[7], false);
+  assert.ok(withheldNotes[9] && withheldNotes[11], `a request that leaves images out names them: ${withheldNotes}`);
 
   // Text is never left out of a request. The native transport limit, 32 MiB,
   // carries one over the core's budget, and one whose text alone is over the
