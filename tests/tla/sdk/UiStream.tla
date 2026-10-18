@@ -50,6 +50,18 @@
 (*   describes memory() and Vercel's World, whose store places a chunk as  *)
 (*   it arrives (UiStream-takeover); a Name there is nothing the worker    *)
 (*   does.                                                                 *)
+(*                                                                         *)
+(* With Fills, A's lines are the parts of a reply A had saved when it      *)
+(* froze, and B is the worker that resumes the turn and ends it with that  *)
+(* reply, which its engine does not stream. B's first line is its          *)
+(* turn_resume; once that line is visible B reads which of A's parts       *)
+(* readers show and writes the rest as its second line                     *)
+(* (DurableSession.tla Commit, with ResumeFills; sdk/durable.js            *)
+(* unshownReply). Readers then show each part once (FillShowsOnce) where a *)
+(* late chunk lands after B's lines, so readers hide it: UiStream-fill.    *)
+(* Where its place is fixed when its write starts, A's late chunk shows    *)
+(* ahead of B's lines after B read the stream without it, and its part     *)
+(* shows twice (UiStreamWitness-FillTwice).                                *)
 (***************************************************************************)
 EXTENDS Naturals, Sequences, FiniteSets
 
@@ -59,17 +71,19 @@ CONSTANTS
     WorldKeepsOrder, \* the World makes a batch's chunks visible in order
     Takeover,        \* A can freeze with a write on its way, and B take over
     TakeoverLines,   \* how many lines B writes
-    Placement        \* when a chunk's place is fixed: "start", "mint" or "land"
+    Placement,       \* when a chunk's place is fixed: "start", "mint" or "land"
+    Fills            \* A's lines are a saved reply's parts, whose rest B writes
 
 ASSUME Lines \in Nat /\ TakeoverLines \in Nat
 ASSUME OneByOne \in BOOLEAN /\ WorldKeepsOrder \in BOOLEAN
 ASSUME Takeover \in BOOLEAN /\ Placement \in {"start", "mint", "land"}
+ASSUME Fills \in BOOLEAN /\ (Fills => Takeover /\ TakeoverLines = 2)
 
 Writers == IF Takeover THEN {"A", "B"} ELSE {"A"}
 Count(w) == IF w = "A" THEN Lines ELSE TakeoverLines
 \* A chunk: writer w's line n.
 Chunks == {[w |-> w, n |-> n] : w \in {"A", "B"}, n \in 1..Lines + TakeoverLines}
-Acts == {"Init", "Push", "Write", "Name", "Land", "Take", "Freeze", "Wake"}
+Acts == {"Init", "Push", "Write", "Name", "Land", "Take", "Freeze", "Wake", "Read"}
 
 VARIABLES
     pushed,    \* lines 1..pushed[w] of each worker are pushed
@@ -81,9 +95,11 @@ VARIABLES
     lands,     \* every visible chunk, in the order it became visible
     frozen,    \* "no", "frozen" while A is frozen, "woke" once it woke
     live,      \* the chunks the live reader took, in the order it took them
+    read,      \* with Fills, B read the stream once its first line was visible
+    found,     \* the parts of A's lines B then found readers show
     act        \* the step that led here: its name, then its writer and line
 
-vars == <<pushed, sent, inflight, starts, named, minted, lands, frozen, live, act>>
+vars == <<pushed, sent, inflight, starts, named, minted, lands, frozen, live, read, found, act>>
 
 Range(s) == {s[i] : i \in DOMAIN s}
 IndexOf(s, x) == CHOOSE i \in DOMAIN s : s[i] = x
@@ -103,6 +119,7 @@ TypeOK ==
     /\ starts \in Seq(Chunks) /\ lands \in Seq(Chunks) /\ live \in Seq(Chunks)
     /\ named \in [{"A", "B"} -> [1..Lines + TakeoverLines -> Nat]] /\ minted \in Nat
     /\ frozen \in {"no", "frozen", "woke"}
+    /\ read \in BOOLEAN /\ found \in SUBSET (1..Lines)
     /\ act[1] \in Acts
 
 Init ==
@@ -113,6 +130,7 @@ Init ==
     /\ named = [w \in {"A", "B"} |-> [n \in 1..Lines + TakeoverLines |-> 0]] /\ minted = 0
     /\ frozen = "no"
     /\ live = <<>>
+    /\ read = FALSE /\ found = {}
     /\ act = <<"Init">>
 
 \* Whether w runs: A until it freezes, and B once A froze.
@@ -124,8 +142,11 @@ Goes(w) == w \in Writers /\ ~(w = "A" /\ frozen = "frozen")
 Push(w) ==
     /\ Runs(w)
     /\ pushed[w] < Count(w)
+    \* With Fills, B's second line is the rest of the reply, which it knows
+    \* only once it read the stream.
+    /\ (Fills /\ w = "B" /\ pushed[w] = 1) => read
     /\ pushed' = [pushed EXCEPT ![w] = pushed[w] + 1]
-    /\ UNCHANGED <<sent, inflight, starts, named, minted, lands, frozen, live>>
+    /\ UNCHANGED <<sent, inflight, starts, named, minted, lands, frozen, live, read, found>>
     /\ act' = <<"Push", w>>
 
 \* No write of w's is in flight, so the lines it pushed since its last one
@@ -139,7 +160,7 @@ Write(w) ==
        IN /\ inflight' = [inflight EXCEPT ![w] = Range(batch)]
           /\ starts' = starts \o batch
           /\ sent' = [sent EXCEPT ![w] = last]
-    /\ UNCHANGED <<pushed, named, minted, lands, frozen, live>>
+    /\ UNCHANGED <<pushed, named, minted, lands, frozen, live, read, found>>
     /\ act' = <<"Write", w>>
 
 \* w names a chunk of its write in flight, just before it lands it: with
@@ -153,7 +174,7 @@ Name(w) ==
           /\ named' = [named EXCEPT ![c.w][c.n] = IF Placement = "mint" THEN minted + 1 ELSE Len(lands) + 1]
           /\ minted' = IF Placement = "mint" THEN minted + 1 ELSE minted
           /\ act' = <<"Name", w, c.n>>
-    /\ UNCHANGED <<pushed, sent, inflight, starts, lands, frozen, live>>
+    /\ UNCHANGED <<pushed, sent, inflight, starts, lands, frozen, live, read, found>>
 
 \* One chunk of w's write in flight becomes visible: any of them when the
 \* World writes them in parallel, the first when it keeps their order. A
@@ -169,7 +190,7 @@ Land(w) ==
           /\ inflight' = [inflight EXCEPT ![w] = inflight[w] \ {c}]
           /\ lands' = Append(lands, c)
           /\ act' = <<"Land", w, c.n>>
-    /\ UNCHANGED <<pushed, sent, starts, named, minted, frozen, live>>
+    /\ UNCHANGED <<pushed, sent, starts, named, minted, frozen, live, read, found>>
 
 \* A freezes with a write on its way, and B takes the session over.
 Freeze ==
@@ -177,14 +198,14 @@ Freeze ==
     /\ frozen = "no"
     /\ inflight["A"] # {}
     /\ frozen' = "frozen"
-    /\ UNCHANGED <<pushed, sent, inflight, starts, named, minted, lands, live>>
+    /\ UNCHANGED <<pushed, sent, inflight, starts, named, minted, lands, live, read, found>>
     /\ act' = <<"Freeze">>
 
 \* A wakes; its write on its way can land again.
 Wake ==
     /\ frozen = "frozen"
     /\ frozen' = "woke"
-    /\ UNCHANGED <<pushed, sent, inflight, starts, named, minted, lands, live>>
+    /\ UNCHANGED <<pushed, sent, inflight, starts, named, minted, lands, live, read, found>>
     /\ act' = <<"Wake">>
 
 \* The live reader takes the visible chunk with the lowest place it has not
@@ -192,10 +213,33 @@ Wake ==
 Take ==
     /\ Range(lands) \ Range(live) # {}
     /\ live' = Append(live, MinPlace(Range(lands) \ Range(live)))
-    /\ UNCHANGED <<pushed, sent, inflight, starts, named, minted, lands, frozen>>
+    /\ UNCHANGED <<pushed, sent, inflight, starts, named, minted, lands, frozen, read, found>>
     /\ act' = <<"Take">>
 
-Next == (\E w \in Writers : Push(w) \/ Write(w) \/ Name(w) \/ Land(w)) \/ Freeze \/ Wake \/ Take
+\* Whether readers show visible chunk c: one of A's is hidden behind any of
+\* B's placed before it, as readers hide a line whose epoch is below one
+\* before it.
+Shown(c) == ~(c.w = "A" /\ \E d \in Range(lands) : d.w = "B" /\ Place(d) < Place(c))
+IsStart(parts) == \E k \in 0..Lines : parts = 1..k
+\* The parts B's second line carries: those after the ones it found, or all
+\* of them when those are not the reply's start.
+Rest == IF IsStart(found) THEN (1..Lines) \ found ELSE 1..Lines
+\* The parts chunk c carries: A's line n is part n, and B's second line the
+\* rest; B's turn_resume carries none.
+Carries(c) == IF c.w = "A" THEN {c.n} ELSE IF c.n = 2 THEN Rest ELSE {}
+
+\* With Fills, B reads the stream once its turn_resume is visible: which of
+\* A's parts readers show.
+Read ==
+    /\ Fills
+    /\ ~read
+    /\ [w |-> "B", n |-> 1] \in Range(lands)
+    /\ read' = TRUE
+    /\ found' = {c.n : c \in {d \in Range(lands) : d.w = "A" /\ Shown(d)}}
+    /\ UNCHANGED <<pushed, sent, inflight, starts, named, minted, lands, frozen, live>>
+    /\ act' = <<"Read">>
+
+Next == (\E w \in Writers : Push(w) \/ Write(w) \/ Name(w) \/ Land(w)) \/ Freeze \/ Wake \/ Take \/ Read
 
 Spec == Init /\ [][Next]_vars
 
@@ -206,5 +250,14 @@ Spec == Init /\ [][Next]_vars
 \* reader's line i is that replay's line i, now and after every later
 \* landing: no line the reader already has changes its cursor.
 LiveIsReplay == \A i \in 1..Len(live) : i <= Len(Replay) /\ live[i] = Replay[i]
+
+\* With Fills, readers show each part of the reply at most once, and once B's
+\* second line is visible and A has nothing on its way, exactly once.
+FillShowsOnce ==
+    Fills =>
+        \A p \in 1..Lines :
+            LET k == Cardinality({c \in Range(lands) : Shown(c) /\ p \in Carries(c)})
+            IN /\ k <= 1
+               /\ ([w |-> "B", n |-> 2] \in Range(lands) /\ inflight["A"] = {}) => k = 1
 
 =============================================================================

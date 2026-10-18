@@ -139,6 +139,14 @@ pub const TurnAuthority = struct {
 /// `RecoveryCheckpoint.resumed`.
 pub const crash_resume_notice = "Resuming from unexpected session interruption.";
 
+/// What `RecoveryCheckpoint.resumed` added after a turn's own steering for
+/// one resume: the crash notice, then the inputs the turn accepted and never
+/// placed.
+pub const ResumeAdditions = struct {
+    notice: bool = false,
+    inputs: usize = 0,
+};
+
 pub const RecoveryCheckpoint = struct {
     version: u8 = 2,
     disposition: enum { continuable, history_only } = .continuable,
@@ -157,6 +165,22 @@ pub const RecoveryCheckpoint = struct {
     max_provider_attempts: usize,
     consumed_provider_attempts: usize,
     outstanding_reservation: bool = false,
+    /// What the resume this copy is for added to `execution.steering`
+    /// (`resumed`). Never persisted: a checkpoint saved later in the turn
+    /// keeps those entries as steering the turn took.
+    resume_added: ResumeAdditions = .{},
+
+    /// Whether resuming this checkpoint ends its turn with the reply saved
+    /// just before the turn ended, asking the model nothing
+    /// (`tests/tla/durable/Resumption.tla` SavedAnswerNotRequested). Inputs
+    /// the resume added never reached that reply, so the turn goes on to ask
+    /// the model with them.
+    pub fn deliversSavedResponse(self: RecoveryCheckpoint) bool {
+        return self.action == .delivering_response and
+            self.tool_state == .none and
+            self.resume_added.inputs == 0 and
+            std.mem.trim(u8, self.assistant_source, " \t\r\n").len > 0;
+    }
 
     /// Borrows the checkpoint's exact user and uncommitted response suffix.
     pub fn interruptedTurn(self: RecoveryCheckpoint) types.HistoryTurn {
@@ -171,7 +195,9 @@ pub const RecoveryCheckpoint = struct {
     /// An owned copy that continues after the steps the turn already took.
     /// When `crashed`, the model is told the process crashed and the turn is
     /// resuming (`crash_resume_notice`); then it sees `inputs`, texts the
-    /// turn accepted and never placed, in order.
+    /// turn accepted and never placed, in order. `resume_added` says what
+    /// was added, so a turn that delivers its saved reply instead of asking
+    /// the model keeps none of it.
     pub fn resumed(self: RecoveryCheckpoint, alloc: Allocator, crashed: bool, inputs: []const []const u8) !RecoveryCheckpoint {
         const old = self.execution.steering;
         const notices: usize = @intFromBool(crashed);
@@ -186,6 +212,7 @@ pub const RecoveryCheckpoint = struct {
         // `dupe` copies the steering, so this view only borrows it.
         var view = self;
         view.execution.steering = steering;
+        view.resume_added = .{ .notice = crashed, .inputs = inputs.len };
         return view.dupe(alloc);
     }
 
@@ -223,6 +250,7 @@ pub const RecoveryCheckpoint = struct {
             .max_provider_attempts = self.max_provider_attempts,
             .consumed_provider_attempts = self.consumed_provider_attempts,
             .outstanding_reservation = self.outstanding_reservation,
+            .resume_added = self.resume_added,
         };
     }
 };
@@ -5902,6 +5930,8 @@ test "a resumed checkpoint tells the model after its steps that the crashed turn
         try std.testing.expectEqualStrings("fix the build", resumed.user.text);
         try std.testing.expectEqual(steps.len, resumed.execution.tool_steps.len);
         try std.testing.expectEqual(@as(usize, 3), resumed.consumed_provider_attempts);
+        // It says what it added, for this resume only.
+        try std.testing.expectEqual(ResumeAdditions{ .notice = case.crashed, .inputs = case.inputs.len }, resumed.resume_added);
     }
     try std.testing.expectEqual(@as(usize, 1), checkpoint.execution.steering.len);
     try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, struct {
@@ -5910,6 +5940,46 @@ test "a resumed checkpoint tells the model after its steps that the crashed turn
             resumed.deinit(failing);
         }
     }.run, .{checkpoint});
+}
+
+test "a saved reply is delivered on resume unless the resume restored inputs it never saw" {
+    const alloc = std.testing.allocator;
+    var steering = [_]types.PersistedSteering{.{ .text = @constCast("use file B"), .after_tool_step_count = 0 }};
+    const saved = RecoveryCheckpoint{
+        .turn_id = 7,
+        .user = .{ .text = @constCast("fix the build") },
+        .assistant_source = @constCast("Fixed it."),
+        .execution = .{ .steering = &steering },
+        .cause = .network_interrupted,
+        .action = .delivering_response,
+        .authority = .{ .provider = .gateway, .model = @constCast("openai/gpt-test") },
+        .requested_fast_mode = false,
+        .fast_mode = false,
+        .max_provider_attempts = 10,
+        .consumed_provider_attempts = 1,
+    };
+    try std.testing.expect(saved.deliversSavedResponse());
+    // After a crash the notice is added, and the reply is still delivered.
+    var crashed = try saved.resumed(alloc, true, &.{});
+    defer crashed.deinit(alloc);
+    try std.testing.expect(crashed.deliversSavedResponse());
+    // A steer the turn accepted after its reply was saved goes to the model.
+    var steered = try saved.resumed(alloc, true, &.{"and B2"});
+    defer steered.deinit(alloc);
+    try std.testing.expect(!steered.deliversSavedResponse());
+    // A reply that is blank, or a response that left a call uncertain, is
+    // never delivered.
+    var blank = saved;
+    blank.assistant_source = @constCast(" \n");
+    try std.testing.expect(!blank.deliversSavedResponse());
+    var uncertain = saved;
+    uncertain.tool_state = .uncertain;
+    try std.testing.expect(!uncertain.deliversSavedResponse());
+    // What a resume added is not saved with the checkpoint.
+    var encoded: std.Io.Writer.Allocating = .init(alloc);
+    defer encoded.deinit();
+    try writeRecoveryCheckpoint(&encoded.writer, steered);
+    try std.testing.expect(std.mem.find(u8, encoded.written(), "resume_added") == null);
 }
 
 test "recovery checkpoint accepts the exact composer byte limit" {

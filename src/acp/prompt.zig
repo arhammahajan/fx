@@ -1230,7 +1230,9 @@ pub fn handlePrompt(
         .grants = session.session_grants,
         .context_snapshot = context_snapshot,
         .recovery_checkpoint = recovery_checkpoint,
-        .recovery_source_already_presented = recovery_checkpoint != null,
+        // An ACP client keeps what the turn sent before it stopped; an engine
+        // in a new process says it holds none of it.
+        .recovery_source_already_presented = recovery_checkpoint != null and !prompt_input.fresh_output,
     };
 
     // A turn whose completions report no tokens sends no `usage_update`.
@@ -1638,6 +1640,9 @@ const max_host_time_ms: i64 = (1 << 53) - 1;
 const ParsedPromptInput = struct {
     text: []u8,
     continue_recovery: bool = false,
+    /// A resume whose host holds none of the turn's earlier output, such as
+    /// an engine in a new process: the turn sends its saved reply again.
+    fresh_output: bool = false,
     /// The follow-up this prompt runs, which its first progress places.
     input_id: ?[]u8 = null,
     /// The host's id for the turn this prompt starts.
@@ -1850,6 +1855,7 @@ fn parsePromptInputWithFirstImageId(
     if (parsed.value != .object) return .{ .text = try alloc.dupe(u8, "") };
 
     const continue_recovery = acp_types.fxMetaBool(parsed.value.object, "continueRecovery") orelse false;
+    const fresh_output = acp_types.fxMetaBool(parsed.value.object, "freshOutput") orelse false;
     const input_id: ?[]const u8 = if (acp_types.fxMetaField(parsed.value.object, "inputId")) |value|
         if (value == .string and libfx_steering.validInputId(value.string)) value.string else null
     else
@@ -1867,8 +1873,8 @@ fn parsePromptInputWithFirstImageId(
         null;
 
     const prompt_arr = parsed.value.object.get("prompt") orelse
-        return .{ .text = try alloc.dupe(u8, ""), .continue_recovery = continue_recovery };
-    if (prompt_arr != .array) return .{ .text = try alloc.dupe(u8, ""), .continue_recovery = continue_recovery };
+        return .{ .text = try alloc.dupe(u8, ""), .continue_recovery = continue_recovery, .fresh_output = fresh_output };
+    if (prompt_arr != .array) return .{ .text = try alloc.dupe(u8, ""), .continue_recovery = continue_recovery, .fresh_output = fresh_output };
 
     var text_buf: std.ArrayList(u8) = .empty;
     defer text_buf.deinit(alloc);
@@ -2005,6 +2011,7 @@ fn parsePromptInputWithFirstImageId(
     var result = ParsedPromptInput{
         .text = try alloc.dupe(u8, text_buf.items),
         .continue_recovery = continue_recovery,
+        .fresh_output = fresh_output,
         .input_accepted = input_accepted,
         .yield_at_ms = yield_at_ms,
     };
@@ -4354,7 +4361,18 @@ test "parsePromptInput accepts explicit recovery continuation metadata" {
     defer result.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), result.text.len);
     try std.testing.expect(result.continue_recovery);
+    try std.testing.expect(!result.fresh_output);
     try std.testing.expectEqual(@as(usize, 0), result.rerun_call_ids.len);
+}
+
+test "parsePromptInput reads whether a resume's host holds the turn's earlier output" {
+    const alloc = std.testing.allocator;
+    const params =
+        "{\"sessionId\":\"s1\",\"prompt\":[],\"_meta\":{\"fx\":{\"continueRecovery\":true,\"freshOutput\":true}}}";
+    var result = try parsePromptInput(alloc, params);
+    defer result.deinit(alloc);
+    try std.testing.expect(result.continue_recovery);
+    try std.testing.expect(result.fresh_output);
 }
 
 test "parsePromptInput keeps the call ids a resume runs again and drops the rest" {

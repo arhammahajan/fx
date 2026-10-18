@@ -589,14 +589,30 @@ function endLineOf(messageId, ending) {
 // before the reply, which then shows none of it. A model request whose
 // stream fails ends its turn, so no line shows a reply twice (DUR-20,
 // DUR-38; `tests/tla/sdk/DurableSession.tla` ReplyShownOnce).
+//
+// A worker that resumes a turn whose reply was saved before its end was
+// stored ends the turn with that reply and streams none of it, so the
+// reply's start is the text before its turn_resume line, and its rest may
+// follow that line. So the text is read across turn_resume lines first, and
+// text that is no start of the reply read that way, as when the worker that
+// resumed asked the model again, is read from the last turn_resume line
+// (`tests/tla/sdk/DurableSession.tla` Unshown).
 async function unshownReply(log, messageId, reply) {
   if (reply === undefined) return "";
-  let shown = "";
+  let across = "";
+  let since = "";
   await eachShownLine(log, await log.ui.length(), (event) => {
     if (event.messageId !== messageId || event.type === "reasoning_delta") return;
-    shown = event.type === "text_delta" ? shown + String(event.delta ?? "") : "";
+    if (event.type === "turn_resume") {
+      since = "";
+      return;
+    }
+    const text = event.type === "text_delta" ? String(event.delta ?? "") : null;
+    across = text === null ? "" : across + text;
+    since = text === null ? "" : since + text;
   });
-  return reply.startsWith(shown) ? reply.slice(shown.length) : reply;
+  for (const shown of [across, since]) if (reply.startsWith(shown)) return reply.slice(shown.length);
+  return reply;
 }
 
 // The `ended` entry of a turn that ends without a record of its own, saying
@@ -1971,13 +1987,19 @@ class SessionWorker {
       cut = state.cut;
     }
     const ui = uiWriter(log, (error) => agent.emit("ui.error", { sessionId: this.sessionId, error: error?.name ?? "Error" }), lease.epoch);
-    // Writes the end of turn `messageId`, which the log holds, as `ending`
-    // says, after the part of the turn's reply no reader has yet: what its
-    // worker's lines never showed before it stopped (DUR-20, DUR-38, DUR-64).
-    const endFromLog = async (messageId, ending) => {
+    // Shows the part of turn `messageId`'s reply, which its end in the log
+    // holds, that no reader has yet: what the lines of the worker that
+    // streamed it never showed before that worker stopped. For an end this
+    // worker writes for a reply it did not stream (DUR-20, DUR-38, DUR-64).
+    const showRest = async (messageId, reply) => {
       await ui.settle();
-      const rest = await unshownReply(log, messageId, ending?.reply);
+      const rest = await unshownReply(log, messageId, reply);
       if (rest.length > 0) ui.push({ type: "text_delta", delta: rest, messageId });
+    };
+    // Writes the end of turn `messageId`, which the log holds, as `ending`
+    // says, after the rest of its reply.
+    const endFromLog = async (messageId, ending) => {
+      await showRest(messageId, ending?.reply);
       ui.push(endLineOf(messageId, ending));
       await ui.settle();
     };
@@ -2319,6 +2341,12 @@ class SessionWorker {
             await log.append(endedEntry(messageId, { stopReason: result.stopReason, ...(result.error ? { error: result.error } : {}), ...(endedBySteer ? { endedBySteer } : {}) }));
           }
         }
+        // A turn this worker resumed and whose engine streamed no text ended
+        // with a reply the turn's last worker streamed, as one that delivers
+        // the reply saved before the turn's end was stored does: its viewers
+        // get the rest of that reply first (`tests/tla/sdk/DurableSession.tla`
+        // Commit, with ResumeFills).
+        if (!fresh && !failed && !outcome.streamedText) await showRest(messageId, this.fold(await log.read()).endingOf(messageId)?.reply);
         // The turn's records have landed, so its viewers hear it ended now;
         // the log is read after, for what comes next.
         ui.push({ type: "turn_end", messageId, stopReason: result.stopReason, usage: result.usage ?? {}, ...(result.error ? { error: result.error } : {}), ...(endedBySteer ? { endedBySteer } : {}) });
@@ -2478,8 +2506,14 @@ class SessionWorker {
       return true;
     };
     let result;
+    // Whether the turn's engine streamed any of its text here.
+    let streamedText = false;
     try {
-      for await (const event of turn) if (await showsOnce(event)) ui.push({ ...event, messageId });
+      for await (const event of turn) {
+        if (!(await showsOnce(event))) continue;
+        if (event.type === "text_delta") streamedText = true;
+        ui.push({ ...event, messageId });
+      }
       result = await turn.result;
     } catch (error) {
       if (isFenced(error)) return "fenced";
@@ -2501,15 +2535,27 @@ class SessionWorker {
       if (isFenced(error)) return "fenced";
       throw error;
     }
-    // A turn handed back at the deadline continues in the next delivery,
-    // like one that yielded.
+    // A turn the deadline cut off once its end was on its way to the log
+    // ended, as that end says: its engine answers only once the end is
+    // stored, and the next delivery finds the turn ended (DUR-20;
+    // `tests/tla/sdk/DurableSteer.tla` Handoff from `ending`).
+    if (this.stopping && result.stopReason === "cancelled") {
+      const landed = this.fold(await log.read());
+      if (landed.openTurn?.id !== messageId && landed.consumed.has(messageId)) {
+        const ending = landed.endingOf(messageId);
+        result = { stopReason: ending?.stopReason ?? "unknown", usage: result.usage, ...(ending?.error ? { error: ending.error } : {}) };
+        return { result, streamedText, ...(ending?.endedBySteer ? { endedBySteer: ending.endedBySteer } : {}) };
+      }
+    }
+    // Any other turn handed back at the deadline continues in the next
+    // delivery, like one that yielded.
     if (result.stopReason === "yielded" || (this.stopping && result.stopReason === "cancelled")) {
       ui.push({ type: "turn_yield", messageId });
       await ui.settle();
       return "yielded";
     }
     const endedBySteer = endedFor === undefined ? steerNow() : endedFor;
-    return { result, ...(endedBySteer === null ? {} : { endedBySteer }) };
+    return { result, streamedText, ...(endedBySteer === null ? {} : { endedBySteer }) };
   }
 }
 

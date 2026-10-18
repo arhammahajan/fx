@@ -48,6 +48,18 @@ for tool in send lookup write cutoff leased queue refuse; do
     fi
     grep -E 'distinct states|depth of' "$work/$tool.log"
 done
+# The send graph with SavesReply: a turn's answer is saved before its end, so
+# a crash between them leaves the turn open with its answer, and the worker
+# that resumes it ends it with that answer, asking the model nothing. No
+# driver walks it: a driver would have to hold the record that ends a turn
+# apart from the one that saved its answer, which the engine may send as one.
+echo "== DurableSession (saved)"
+if ! "$java" -XX:+UseParallelGC -cp "$jar" tlc2.TLC -deadlock -workers auto -cleanup \
+    -metadir "$work/saved" -config DurableSession-saved.cfg DurableSession.tla > "$work/saved.log" 2>&1; then
+    cat "$work/saved.log"; status=1
+else
+    grep -E 'distinct states|depth of' "$work/saved.log"
+fi
 # Each witness must break the invariant named after it: it shows the model
 # reaches that state. NoSelfStop breaks TwoActiveNeedsFreeze: without the
 # self-stop, two workers are active at once with no freeze at all.
@@ -82,12 +94,16 @@ done
 # its own lands, as before libfx waited for one, more of a replaced worker's
 # late lines show between its successor's claim and first line than the one
 # it had on its way when it froze.
+# NoResumeFill breaks ReplyShownOnceUnlessLate, which the saved graph checks:
+# when the worker that ends a resumed turn with its saved answer shows only
+# its turn_end, as the engine streams none of that answer, the answer stays
+# as cut short as the crashed holder's lines left it.
 for pair in UiInOrder:UiInOrder NoStaleShown:NoStaleShown NotTwoActive:NotTwoActive \
     NoSelfStop:TwoActiveNeedsFreeze NoClaimFence:EffectsAtMostOnce NoCutoffBound:HandoffsBounded \
     LeasedTwoActive:NotTwoActive LookupRunsAhead:EveryCallAfterIntent LookupNewId:IdsAtMostOne \
     WriteRunsAhead:OneExecutionId NoEndRepair:EndRecoverable NoRefusedRepair:EndRecoverable \
     NoEndHow:EndSaysHow NoRefusedHow:EndSaysHow NoReplyRepair:ReplyShownOnce \
-    LeasedStaleShown:StaleShownPerFreeze; do
+    LeasedStaleShown:StaleShownPerFreeze NoResumeFill:ReplyShownOnceUnlessLate; do
     witness="${pair%%:*}" invariant="${pair#*:}"
     if "$java" -cp "$jar" tlc2.TLC -deadlock -workers auto -cleanup -metadir "$work/w-$witness" \
         -config "Witness-$witness.cfg" DurableSession.tla 2>&1 | grep -q -E "Invariant $invariant is violated"; then
@@ -147,8 +163,14 @@ done
 # a chunk where its write started, as world-local 5.1.1 does: the late chunk
 # goes ahead of lines a reader already has. The StaleName witness names a
 # chunk just before it lands but lands it there even when another chunk
-# landed since, as a writer frozen between the two would.
-for config in local vercel takeover local-takeover; do
+# landed since, as a writer frozen between the two would. The fill config is
+# the local-takeover one where the second worker ends the turn with the
+# reply the first one saved: it reads the stream once its turn_resume is
+# visible and writes the parts readers lack, and readers show each part
+# once. The FillTwice witness does that where a chunk's place is fixed when
+# its write starts: the first worker's late part shows ahead of the second's
+# lines, after the second read the stream without it, so it shows twice.
+for config in local vercel takeover local-takeover fill; do
     echo "== UiStream ($config)"
     dump=""
     [ "$config" = local-takeover ] && dump="-dump dot,actionlabels graphs/ui-local-takeover"
@@ -159,9 +181,10 @@ for config in local vercel takeover local-takeover; do
     fi
     grep -E 'distinct states|depth of' "$work/ui-$config.log"
 done
-for witness in Batched LateLine StaleName; do
+for pair in Batched:LiveIsReplay LateLine:LiveIsReplay StaleName:LiveIsReplay FillTwice:FillShowsOnce; do
+    witness="${pair%%:*}" invariant="${pair#*:}"
     if "$java" -cp "$jar" tlc2.TLC -deadlock -workers auto -cleanup -metadir "$work/uw-$witness" \
-        -config "UiStreamWitness-$witness.cfg" UiStream.tla 2>&1 | grep -q -E "Invariant LiveIsReplay is violated"; then
+        -config "UiStreamWitness-$witness.cfg" UiStream.tla 2>&1 | grep -q -E "Invariant $invariant is violated"; then
         echo "== ui witness $witness reached"
     else
         echo "== ui witness $witness NOT reached" >&2; status=1

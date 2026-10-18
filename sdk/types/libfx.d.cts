@@ -526,7 +526,7 @@ export interface Persistence {
   load(): Promise<PersistenceLoadResult>;
   /**
    * Stores one record and resolves to its cursor. Reject with an `FxFencedError` when `expected` is not the last stored record's cursor.
-   * `barrier` is true when libfx waits for the record before it goes on, such as before a tool call with effects. A store may resolve a record with `barrier: false` before it is durable, if it keeps records in order and resolves one with `barrier: true` only once it and every record before it are durable.
+   * `barrier` is true when libfx waits for the record before it goes on, such as before a tool call with effects, or for the record that ends a turn, which the turn's `result` waits for. A store may resolve a record with `barrier: false` before it is durable, if it keeps records in order and resolves one with `barrier: true` only once it and every record before it are durable.
    */
   append(input: { expected: string | null; idempotencyKey: string; data: Uint8Array; barrier: boolean; marks?: FxJournalMark[] }): Promise<{ cursor: string }>;
   /** Stores a checkpoint covering the records through `through`. */

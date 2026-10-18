@@ -103,6 +103,19 @@
 (* claim lands. Without it, as before, it writes only turn_end, and the    *)
 (* reply stays cut short (Witness-NoReplyRepair).                          *)
 (*                                                                         *)
+(* With SavesReply, as fx saves a finished reply before the turn's end, the *)
+(* model's answer lands first a record that saves the reply, and the       *)
+(* record that ends the turn follows it, in the same record or one of its  *)
+(* own (Commit). A holder that crashes between the two leaves the turn     *)
+(* open with its reply saved: the worker that resumes it writes            *)
+(* turn_resume, asks the model nothing, and its engine streams none of the *)
+(* reply, since the stream holds it. With ResumeFills that worker shows    *)
+(* the part of the reply the stream does not, before its turn_end, as one  *)
+(* that writes a crashed holder's missing end does; without it the reply   *)
+(* stays cut short (Witness-NoResumeFill). Both read the turn's text       *)
+(* across turn_resume lines (Unshown), since the resumed worker's own text *)
+(* adds to the reply the text before its turn_resume line.                 *)
+(*                                                                         *)
 (* `act` names each step and its worker, so a driver can replay any path   *)
 (* of the state graph against the real code and compare every state:       *)
 (* tests/tla/drivers/drive.mjs.                                            *)
@@ -130,8 +143,12 @@ CONSTANTS
     RecordsHow,  \* whether the entry that ends the turn says how it ended
     RecordsReply, \* whether the record that ends the turn holds its reply
     ReplyParts,  \* how many text lines the model's answer streams as
-    StalledWait  \* whether a worker whose renewed lease ran out by its own
+    StalledWait, \* whether a worker whose renewed lease ran out by its own
                  \* clock shows nothing until a renewal of its own lands
+    SavesReply,  \* whether the answer saves the reply in a record before
+                 \* the record that ends the turn
+    ResumeFills  \* whether a worker that ends a resumed turn with its saved
+                 \* reply first shows what of it the stream does not
 
 ASSUME Tool \in {"lookup", "write", "send"}
 ASSUME WritesWait \in BOOLEAN
@@ -147,22 +164,30 @@ ASSUME RecordsHow \in BOOLEAN
 ASSUME RecordsReply \in BOOLEAN
 ASSUME ReplyParts \in Nat /\ ReplyParts >= 1
 ASSUME StalledWait \in BOOLEAN
+ASSUME SavesReply \in BOOLEAN
+ASSUME ResumeFills \in BOOLEAN
 ASSUME ~(QueueHeld /\ Heartbeat)
 
 None == "none"
 \* The parts of the model's answer, in the order it streams them.
 Parts == 1..ReplyParts
 Max(S) == CHOOSE m \in S : \A n \in S : n <= m
-\* How a turn ended, as a turn_end line says it: "none" on any other line.
+\* How a turn ended, as a turn_end line says it: "none" on any other line,
+\* but "resume" on a turn_resume line the answer's text reads across
+\* (ResumeLine).
 How == {"none", "end_turn", "cancelled", "error", "unknown"}
 \* "ahead": a call that ran ahead runs while its intent is on its way.
+\* "closing": the record that saves the answer is in the chain and the one
+\* that ends the turn is on its way. "delivering": a worker continues a turn
+\* whose answer was saved, and its record that ends the turn is on its way.
 \* "ending": the turn's end is in the chain and its turn_end line is not
 \* written yet.
-Waiting == {"announce", "model1", "ahead", "tool", "model2", "ending"}
+Waiting == {"announce", "model1", "ahead", "tool", "model2", "closing", "delivering", "ending"}
 \* A deadline while a call waits for its intent writes behind that intent,
 \* in the log's order, so it is Intent and then Deadline.
 Busy == {"model1", "tool", "model2"}
-Progress == {"start", "intent", "result", "done"}
+\* "saved": the answer is saved, and the turn is still open.
+Progress == {"start", "intent", "result", "saved", "done"}
 
 \* A cut-off call of this tool runs again.
 Idempotent == Tool \in {"lookup", "write"}
@@ -180,8 +205,8 @@ VARIABLES
                \* that starts a call names a new one, and a rerun keeps it
     ui,        \* each line in the UI stream: its writer's epoch, whether
                \* that writer still headed the chain when it wrote, whether
-               \* it is the turn's turn_end, and the parts of the answer's
-               \* text it carries
+               \* it is the turn's turn_end, what it says (How), and the
+               \* parts of the answer's text it carries
     freezes,   \* freezes so far
     froze,     \* whether a worker froze since it last claimed the session
     chain,     \* how many counted writes the chain holds
@@ -200,14 +225,14 @@ vars == <<pc, epoch, frozen, lease, progress, runs, ids, ui, freezes, froze, cha
 ending == <<how, endHow>>
 
 TypeOK ==
-    /\ pc \in [Workers -> {"none", "early", "announce", "model1", "ahead", "tool", "model2", "ending", "done", "stopped"}]
+    /\ pc \in [Workers -> {"none", "early", "announce", "model1", "ahead", "tool", "model2", "closing", "delivering", "ending", "done", "stopped"}]
     /\ epoch \in [Workers -> 0..MaxEpoch]
     /\ frozen \in [Workers -> BOOLEAN]
     /\ lease \in [holder: Workers \cup {None}, epoch: 0..MaxEpoch, live: BOOLEAN]
     /\ progress \in Progress
     /\ runs \in 0..(MaxEpoch + 1)
     /\ ids \in 0..(MaxEpoch + 1)
-    /\ ui \in Seq([e: 0..MaxEpoch, legit: BOOLEAN, end: BOOLEAN, how: How, text: SUBSET Parts])
+    /\ ui \in Seq([e: 0..MaxEpoch, legit: BOOLEAN, end: BOOLEAN, how: How \cup {"resume"}, text: SUBSET Parts])
     /\ freezes \in 0..MaxFreezes
     /\ froze \in [Workers -> BOOLEAN]
     /\ chain \in Nat
@@ -218,7 +243,7 @@ TypeOK ==
     /\ endHow \in [Workers -> How]
     /\ owed \in [Workers -> Seq(SUBSET Parts)]
     /\ act \in [name: {"Init", "Start", "Claim", "Announce", "Model1", "Intent", "ToolEnd", "Model2",
-                       "EndLine", "Freeze", "Wake", "Deadline", "Expire"},
+                       "Commit", "EndLine", "Freeze", "Wake", "Deadline", "Expire"},
                 w: Workers \cup {None}]
 
 Init ==
@@ -248,6 +273,11 @@ Heads(w) == lease.holder = w /\ lease.epoch = epoch[w]
 \* how the turn ended as w knows it.
 Line(w) == [e |-> epoch[w], legit |-> Heads(w), end |-> FALSE, how |-> "none", text |-> {}]
 EndOf(w) == [e |-> epoch[w], legit |-> Heads(w), end |-> TRUE, how |-> endHow[w], text |-> {}]
+\* The turn_resume line w writes when it continues the turn. Only with
+\* SavesReply can the answer's text come before it, so only then does it say
+\* "resume", the text reading across it; elsewhere it is like any other line,
+\* and every graph a driver walks is as before.
+ResumeLine(w) == [Line(w) EXCEPT !.how = IF SavesReply THEN "resume" ELSE "none"]
 \* The text lines w writes now, each carrying the parts `lines` gives it.
 TextLines(w, lines) == [k \in 1..Len(lines) |-> [Line(w) EXCEPT !.text = lines[k]]]
 \* The answer's parts from..to as its worker streams them, one line each.
@@ -296,18 +326,32 @@ Read == [chain |-> chain, progress |-> progress, epoch |-> lease.epoch, cutoffs 
 \* Whether a reader shows the turn's end.
 EndShown == \E i \in ShownAt(ui) : ui[i].end
 
-\* Of the lines at positions `at`, those after the last that has no text.
-TextTail(at) == LET plain == {i \in at : ui[i].text = {}}
-                    last == IF plain = {} THEN 0 ELSE Max(plain)
-                IN {i \in at : i > last}
+\* Of the lines at positions `at`, those after the last that has no text,
+\* where with `across` a turn_resume line that says "resume" is not one.
+TailOf(at, across) == LET plain == {i \in at : ui[i].text = {} /\ ~(across /\ ui[i].how = "resume")}
+                          last == IF plain = {} THEN 0 ELSE Max(plain)
+                      IN {i \in at : i > last}
+TextTail(at) == TailOf(at, FALSE)
+\* The parts the lines at positions `at` carry.
+PartsAt(at) == UNION {ui[i].text : i \in at}
+IsStart(parts) == \E k \in 0..ReplyParts : parts = 1..k
+
+\* What a worker that writes the end of a turn whose answer it did not
+\* stream shows of the answer first, as one line: the parts after those the
+\* text lines the shown lines end with carry, read across turn_resume lines,
+\* or else read from the last of them, or all of them when neither is the
+\* answer's start (sdk/durable.js unshownReply).
+Unshown == LET across == PartsAt(TailOf(ShownAt(ui), TRUE))
+               since == PartsAt(TextTail(ShownAt(ui)))
+               rest == IF IsStart(across) THEN Parts \ across
+                       ELSE IF IsStart(since) THEN Parts \ since
+                       ELSE Parts
+           IN IF rest # {} THEN <<rest>> ELSE <<>>
 
 \* What a worker that writes a crashed holder's missing turn_end shows of the
-\* answer first, as one line: the parts after those the text lines the shown
-\* lines end with carry, or all of them when those are not the answer's
-\* start. Only with RecordsReply does the record it read hold the answer.
-Repaired == LET shown == UNION {ui[i].text : i \in TextTail(ShownAt(ui))}
-                rest == IF \E k \in 0..ReplyParts : shown = 1..k THEN Parts \ shown ELSE Parts
-            IN IF RecordsReply /\ how = "end_turn" /\ rest # {} THEN <<rest>> ELSE <<>>
+\* answer first. Only with RecordsReply does the record it read hold the
+\* answer.
+Repaired == IF RecordsReply /\ how = "end_turn" THEN Unshown ELSE <<>>
 
 \* The work a worker finds when it reads the log: the turn, or, with Repair,
 \* the end of a done turn that no reader shows, its holder never having let
@@ -383,7 +427,8 @@ Claim(w) ==
 \* as possibly run, and a model request cancels the turn, whose end only
 \* the chain's head writes. With Refused, a turn that has recorded nothing
 \* ends at once: its `ended` entry is outside the chain, so it lands whether
-\* or not w still heads it.
+\* or not w still heads it. A turn whose answer was saved goes on to end with
+\* that answer, asking the model nothing (Commit).
 Announce(w) ==
     /\ pc[w] = "announce"
     /\ ~frozen[w]
@@ -404,22 +449,25 @@ Announce(w) ==
                           /\ Ends(w, "cancelled")
                           \* turn_resume; turn_end follows in EndLine
                           /\ pc' = [pc EXCEPT ![w] = "ending"]
-                          /\ ui' = Append(ui, Line(w))
+                          /\ ui' = Append(ui, ResumeLine(w))
                           /\ chain' = chain + 1
                           /\ cutoffs' = 0
                           /\ UNCHANGED <<lease, lapse>>
                      ELSE /\ pc' = [pc EXCEPT ![w] = "stopped"]
-                          /\ ui' = ui \o Writes(w, <<Line(w)>>)
+                          /\ ui' = ui \o Writes(w, <<ResumeLine(w)>>)
                           /\ UNCHANGED <<progress, lease, chain, cutoffs, lapse, ending>>
           ELSE /\ UNCHANGED ending
                /\ pc' = [pc EXCEPT ![w] =
                           CASE from = "start" -> "model1"
                             [] from = "intent" -> IF rerun THEN "tool" ELSE "model2"
-                            [] from \in {"result", "done"} -> "model2"]
+                            [] from \in {"result", "done"} -> "model2"
+                            [] from = "saved" -> "delivering"]
                /\ runs' = IF rerun THEN runs + 1 ELSE runs
-               \* then tool_start for a rerun, or tool_end for a call answered
-               \* as possibly run
-               /\ ui' = ui \o Writes(w, IF from = "intent" THEN <<Line(w), Line(w)>> ELSE <<Line(w)>>)
+               \* turn_start, or turn_resume, then tool_start for a rerun, or
+               \* tool_end for a call answered as possibly run
+               /\ ui' = ui \o Writes(w, CASE from = "start" -> <<Line(w)>>
+                                          [] from = "intent" -> <<ResumeLine(w), Line(w)>>
+                                          [] OTHER -> <<ResumeLine(w)>>)
                \* a call answered as possibly run is the turn's next record
                /\ IF from = "intent" /\ ~rerun /\ Heads(w)
                      THEN /\ progress' = "result"
@@ -508,23 +556,57 @@ ToolEnd(w) ==
 \* ended end_turn, while the answer's text streams: the first `landed` of
 \* its lines have landed, and w still writes the rest. Its turn_end line is
 \* a write of its own, EndLine. A replaced worker's answer still streams,
-\* unless it writes none (Gated).
+\* unless it writes none (Gated). With SavesReply the record that saves the
+\* answer lands first; the one that ends the turn goes in the same record,
+\* or follows it in one of its own (Commit).
 Model2(w) ==
     /\ pc[w] = "model2"
     /\ ~frozen[w]
     /\ \E landed \in 0..ReplyParts :
           /\ ui' = ui \o Writes(w, TextLines(w, PartsFrom(1, landed)))
           /\ IF Heads(w)
-                THEN /\ progress' = "done"
-                     /\ Ends(w, "end_turn")
-                     /\ owed' = [owed EXCEPT ![w] = PartsFrom(landed + 1, ReplyParts)]
-                     /\ pc' = [pc EXCEPT ![w] = "ending"]
+                THEN /\ owed' = [owed EXCEPT ![w] = PartsFrom(landed + 1, ReplyParts)]
+                     /\ \/ /\ progress' = "done"
+                           /\ Ends(w, "end_turn")
+                           /\ pc' = [pc EXCEPT ![w] = "ending"]
+                        \/ /\ SavesReply
+                           /\ progress' = "saved"
+                           /\ pc' = [pc EXCEPT ![w] = "closing"]
+                           /\ UNCHANGED ending
                 ELSE /\ pc' = [pc EXCEPT ![w] = "stopped"]
                      /\ UNCHANGED <<progress, ending, owed>>
     /\ chain' = IF Heads(w) THEN chain + 1 ELSE chain
     /\ cutoffs' = IF Heads(w) THEN 0 ELSE cutoffs
     /\ UNCHANGED <<epoch, frozen, lease, runs, ids, freezes, froze, seen, lapse>>
     /\ act' = [name |-> "Model2", w |-> w]
+
+\* The record that ends the turn lands after the one that saved its answer.
+\* A worker that continued the turn from its saved answer asked the model
+\* nothing and streamed none of the answer: with ResumeFills it first shows
+\* the part of it the stream does not, read once this record lands, as one
+\* that writes a crashed holder's missing turn_end does. A worker another
+\* took the session from learns so at this write and stops; the text it
+\* still had on its way lands, unless it writes none (Gated).
+Commit(w) ==
+    /\ pc[w] \in {"closing", "delivering"}
+    /\ ~frozen[w]
+    /\ IF Heads(w)
+          THEN /\ progress' = "done"
+               /\ Ends(w, "end_turn")
+               /\ pc' = [pc EXCEPT ![w] = "ending"]
+               /\ owed' = [owed EXCEPT ![w] =
+                              IF pc[w] = "closing" THEN owed[w]
+                              ELSE IF RecordsReply /\ ResumeFills THEN Unshown
+                              ELSE <<>>]
+               /\ chain' = chain + 1
+               /\ cutoffs' = 0
+               /\ UNCHANGED ui
+          ELSE /\ pc' = [pc EXCEPT ![w] = "stopped"]
+               /\ \E landing \in Landing(w, TextLines(w, owed[w])) : ui' = ui \o landing
+               /\ owed' = [owed EXCEPT ![w] = <<>>]
+               /\ UNCHANGED <<progress, ending, chain, cutoffs>>
+    /\ UNCHANGED <<epoch, frozen, lease, runs, ids, freezes, froze, seen, lapse>>
+    /\ act' = [name |-> "Commit", w |-> w]
 
 \* w writes the text lines it still owes, then the turn's turn_end line,
 \* then lets the session go. A worker another took the session from still
@@ -626,7 +708,7 @@ Expire(w) ==
 Next ==
     \E w \in Workers :
         \/ Start(w) \/ Claim(w) \/ Announce(w) \/ Model1(w) \/ Intent(w) \/ ToolEnd(w) \/ Model2(w)
-        \/ EndLine(w) \/ Freeze(w) \/ Wake(w) \/ Deadline(w) \/ Expire(w)
+        \/ Commit(w) \/ EndLine(w) \/ Freeze(w) \/ Wake(w) \/ Deadline(w) \/ Expire(w)
 
 Spec == Init /\ [][Next]_vars
 
@@ -684,17 +766,20 @@ EndSaysHow == \A i \in ShownAt(ui) : ui[i].end => ui[i].how = how
 \* Every turn_end a reader shows that its worker wrote while it headed the
 \* chain, of a turn the model answered, follows the whole answer, each part
 \* once: among the shown lines written by a head, the text lines after the
-\* last other one before it (DUR-20, DUR-38, DUR-64). That holds for the end
-\* a worker writes for a crashed holder's turn too: it shows the parts the
-\* holder's lines never did, and none they did. A frozen holder that wakes
-\* may still show its own late lines, which no head wrote: the window
-\* NoStaleShown shows. Without RecordsReply, that worker shows none of the
-\* answer, which a crash cut short (Witness-NoReplyRepair).
+\* last other one before it, read across turn_resume lines (DUR-20, DUR-38,
+\* DUR-64). That holds for the end a worker writes for a crashed holder's
+\* turn too, and for one a worker writes for a turn it ended with the answer
+\* saved before a crash: it shows the parts the holder's lines never did,
+\* and none they did. A frozen holder that wakes may still show its own late
+\* lines, which no head wrote: the window NoStaleShown shows. Without
+\* RecordsReply, that worker shows none of the answer, which a crash cut
+\* short (Witness-NoReplyRepair), and without ResumeFills neither does one
+\* that ends a turn with its saved answer (Witness-NoResumeFill).
 ReplyShownOnce ==
     how = "end_turn" =>
         \A i \in ShownAt(ui) :
             (ui[i].end /\ ui[i].legit) =>
-                LET run == TextTail({j \in ShownAt(ui) : j < i /\ ui[j].legit})
+                LET run == TailOf({j \in ShownAt(ui) : j < i /\ ui[j].legit}, TRUE)
                 IN \A p \in Parts : Cardinality({j \in run : p \in ui[j].text}) = 1
 
 \* ReplyShownOnce, unless a replaced worker's text line shows. The leased
@@ -703,6 +788,9 @@ ReplyShownOnce ==
 \* when that line is a part of the answer it can still land between its
 \* successor's claim and first line: then the reader sees that part twice,
 \* or the successor counts it as shown and the head's own lines lack it.
+\* The saved graph checks it too: a worker that ends a turn with its saved
+\* answer reads the stream once its turn_resume landed, so it counts a late
+\* line that landed before that as shown, as readers do.
 ReplyShownOnceUnlessLate ==
     \/ ReplyShownOnce
     \/ \E i \in ShownAt(ui) : ~ui[i].legit /\ ui[i].text # {}
@@ -710,7 +798,7 @@ ReplyShownOnceUnlessLate ==
 \* A step of w's own work, as opposed to a freeze, a wake or the platform's.
 Works(w) ==
     \/ Start(w) \/ Claim(w) \/ Announce(w) \/ Model1(w) \/ Intent(w) \/ ToolEnd(w) \/ Model2(w)
-    \/ EndLine(w) \/ Deadline(w)
+    \/ Commit(w) \/ EndLine(w) \/ Deadline(w)
 
 \* A done turn whose end no reader shows never leaves the workers that have
 \* not crashed with nothing to do, while claims are left. Every path is

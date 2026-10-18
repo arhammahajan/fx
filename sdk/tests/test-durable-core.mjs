@@ -51,6 +51,11 @@ const unsaidEnds = new Set();
 // record that ends the turn, whose end mark carries the reply's text, as
 // fx's does.
 const answers = new Map();
+// Inputs in `answers` whose reply is saved in a record of its own before the
+// record that ends the turn, as fx saves it: a resume after that record ends
+// the turn with the saved reply, asking no model and streaming none of it,
+// as fx's engine does in a session whose stream already holds it.
+const savesReply = new Set();
 const replyOf = (input) => answers.get(input).filter((event) => event.type === "text_delta").map((event) => event.delta).join("");
 const endMarks = (input, stopReason) => [unsaidEnds.has(input) ? { end: true }
   : { end: true, stopReason, ...(answers.has(input) && stopReason === "end_turn" ? { reply: replyOf(input) } : {}) }];
@@ -107,6 +112,10 @@ function scriptedHarness({ steps = 3 } = {}) {
           if (input === brittle && signal.aborted) throw new Error("aborted");
           throw harnessStopped("the engine exited mid-turn");
         }
+        if (records.some((record) => record.turnId === turnId && record.saved)) {
+          await append({ turnId, end: true }, endMarks(input, "end_turn"));
+          return { stopReason: "end_turn" };
+        }
         let first = true;
         for (let step = turnOf(turnId).length; step < steps; step += 1) {
           if (!first && yieldAt !== undefined && Date.now() >= yieldAt) {
@@ -127,7 +136,12 @@ function scriptedHarness({ steps = 3 } = {}) {
           const last = step === steps - 1;
           if (last && answers.has(input)) {
             for (const event of answers.get(input)) push(event);
-            await append({ turnId, step, word, end: true }, endMarks(input, "end_turn"));
+            if (savesReply.has(input)) {
+              await append({ turnId, step, word, saved: true }, []);
+              await append({ turnId, end: true }, endMarks(input, "end_turn"));
+            } else {
+              await append({ turnId, step, word, end: true }, endMarks(input, "end_turn"));
+            }
             continue;
           }
           if (last && endsLate.delete(input)) {
@@ -1813,6 +1827,144 @@ if (durabilityKind === "memory") {
       // The first prompt's view follows the stream, so it reads that too.
       assert.equal((await textOf(first)).text, "one two three");
       answers.delete("answer");
+      await agent.close();
+    });
+  }
+
+  // memory() over `base`, with a worker that dies right after the record
+  // that saves its turn's reply, before the record that ends the turn, while
+  // `dies.armed` is set: from that record until the test sets `dies.dead`
+  // back no write but a sender's input lands. Its turn_end lines never land,
+  // nor any line `dies.lost(line)` names; its text lines still on their way
+  // when the record landed do.
+  const dyingAfterSave = (base, dies) => {
+    let wrapped = null;
+    const saves = (entry) => entry?.k === "record" && JSON.parse(Buffer.from(entry.data, "base64").toString("utf8")).saved === true;
+    const shown = (line) => {
+      try {
+        const event = JSON.parse(line);
+        return event.type !== "turn_end" && dies.lost?.(event) !== true;
+      } catch {
+        return true;
+      }
+    };
+    return {
+      ...base,
+      create() {
+        const backend = base.create();
+        wrapped ??= Object.assign(Object.create(backend), {
+          async session(id) {
+            const log = await backend.session(id);
+            return {
+              ...log,
+              ui: { ...log.ui, write: (lines) => log.ui.write(dies.armed || dies.dead ? lines.filter(shown) : lines) },
+              async append(entry) {
+                if (dies.dead && entry?.k !== "input") throw new Error("the process died");
+                const appended = await log.append(entry);
+                if (dies.armed && saves(entry)) {
+                  dies.armed = false;
+                  dies.dead = true;
+                }
+                return appended;
+              },
+            };
+          },
+        });
+        return wrapped;
+      },
+    };
+  };
+  const within = (promise, what) => {
+    let timer;
+    return Promise.race([promise, new Promise((_resolve, reject) => { timer = setTimeout(() => reject(new Error(what)), 5000); })]).finally(() => clearTimeout(timer));
+  };
+  const linesOf = async (session, messageId) => (await readLines(session.stream(0), 100)).filter((line) => line.messageId === messageId).map((line) => [line.epoch, line.type, line.delta ?? null]);
+  const replyText = (lines) => lines.filter(([, type]) => type === "text_delta").map(([, , delta]) => delta).join("");
+
+  // DUR-20, DUR-38: a worker that resumes a turn whose reply was saved before
+  // its end was stored ends it with that reply, asking the model nothing, and
+  // streams none of it. So it first shows the part of the reply the dead
+  // worker's lines never did, once (`tests/tla/sdk/DurableSession.tla`
+  // Commit with ResumeFills, ReplyShownOnceUnlessLate).
+  for (const [shown, lost, rest] of [
+    ["part of its reply", (event) => event.type === "text_delta" && event.delta !== "one ", "two three "],
+    ["none of its reply", (event) => event.type === "text_delta", "one two three "],
+    ["its whole reply", () => false, null],
+  ]) {
+    test(`a turn whose worker died after saving its reply, having shown ${shown}, ends with that reply on resume and shows its rest once`, async () => {
+      answers.set("saved", [{ type: "reasoning_delta", delta: "hm" }, { type: "text_delta", delta: "one " }, { type: "text_delta", delta: "two " }, { type: "text_delta", delta: "three " }]);
+      savesReply.add("saved");
+      const dies = { armed: true, dead: false, lost };
+      const durability = dyingAfterSave(memory(), dies);
+      const agent = createAnsweringAgent({ durability });
+      const session = agent.session();
+      const first = session.prompt("saved", { messageId: "turn-saved" });
+      await first.accepted;
+      while (!dies.dead) await sleep(10);
+      // A dead worker never lets the session go: it stays dead until its run is over.
+      while (agent[Symbol.for("libfx.durableInternals")].liveWorkers() > 0) await sleep(10);
+      dies.dead = false;
+      const steps = ran.length;
+      const retried = await within(session.prompt("saved", { messageId: "turn-saved" }).result, "the retry waited for an end nobody writes");
+      assert.equal(retried.stopReason, "end_turn");
+      assert.equal(ran.length, steps, "the resume ran no step: the saved reply ends the turn");
+      const lines = await linesOf(session, "turn-saved");
+      assert.deepEqual(lines.filter(([epoch]) => epoch !== 1).map(([, type, delta]) => [type, delta]), [
+        ["turn_resume", null],
+        ...(rest === null ? [] : [["text_delta", rest]]),
+        ["turn_end", null],
+      ], `after the dead worker's ${JSON.stringify(lines.filter(([epoch]) => epoch === 1))}`);
+      assert.equal(replyText(lines), "one two three ", "the reply once and whole");
+      assert.equal((await textOf(first)).text, "one two three");
+      answers.delete("saved");
+      savesReply.delete("saved");
+      await agent.close();
+    });
+  }
+
+  // The worker that ended such a turn with its saved reply can die before
+  // its turn_end line too. The worker that writes that end reads the turn's
+  // text across the resumed worker's turn_resume line, so it shows only what
+  // neither worker's lines did (`tests/tla/sdk/DurableSession.tla` Unshown).
+  for (const [label, lostAfter, rest] of [
+    ["having shown the rest of the reply", () => false, null],
+    ["before the rest of the reply landed", (event) => event.type === "text_delta", "two three "],
+  ]) {
+    test(`a turn ended with its saved reply whose worker died ${label} shows the reply once when the session is next delivered`, async () => {
+      answers.set("saved twice", [{ type: "text_delta", delta: "one " }, { type: "text_delta", delta: "two " }, { type: "text_delta", delta: "three " }]);
+      savesReply.add("saved twice");
+      const late = { now: false, lost: lostAfter };
+      const dies = { armed: true, dead: false, lost: (event) => event.type === "text_delta" && event.delta !== "one " };
+      const durability = dyingAfterSave(dyingAfterEnd(memory(), late), dies);
+      const agent = createAnsweringAgent({ durability });
+      const internals = agent[Symbol.for("libfx.durableInternals")];
+      const session = agent.session();
+      const first = session.prompt("saved twice", { messageId: "turn-twice" });
+      const { sessionId } = await first.accepted;
+      while (!dies.dead) await sleep(10);
+      while (internals.liveWorkers() > 0) await sleep(10);
+      dies.dead = false;
+      // The resuming worker ends the turn with the saved reply, then dies.
+      late.now = true;
+      void session.prompt("saved twice", { messageId: "turn-twice" }).result.catch(() => {});
+      const log = await durability.create().session(sessionId);
+      while (foldSessionLog(await log.read()).lastTurnId !== "turn-twice") await sleep(10);
+      await sleep(landMs);
+      while (internals.liveWorkers() > 0) await sleep(10);
+      late.now = false;
+      const steps = ran.length;
+      const retried = await within(session.prompt("saved twice", { messageId: "turn-twice" }).result, "the retry waited for an end nobody writes");
+      assert.equal(retried.stopReason, "end_turn");
+      assert.equal(ran.length, steps);
+      const lines = await linesOf(session, "turn-twice");
+      assert.deepEqual(lines.filter(([epoch]) => epoch > 2).map(([, type, delta]) => [type, delta]), [
+        ...(rest === null ? [] : [["text_delta", rest]]),
+        ["turn_end", null],
+      ], `after ${JSON.stringify(lines.filter(([epoch]) => epoch <= 2))}`);
+      assert.equal(replyText(lines), "one two three ", "the reply once and whole");
+      assert.equal(lines.filter(([, type]) => type === "turn_end").length, 1);
+      answers.delete("saved twice");
+      savesReply.delete("saved twice");
       await agent.close();
     });
   }

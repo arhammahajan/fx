@@ -3134,6 +3134,146 @@ if (durabilityKind === "memory") {
     });
   }
 
+  // memory(), with a worker that dies right after the record that saves its
+  // turn's reply, before the one that ends the turn, while `dies.armed` is
+  // set: a record that holds both is stored up to that reply only, and from
+  // then until the test sets `dies.dead` back no write but a sender's input
+  // lands. Its turn_end lines never land, nor any line `dies.lost(line)`
+  // names.
+  const deadAfterSavedReply = (base, dies) => {
+    let wrapped = null;
+    const shown = (line) => {
+      try {
+        const event = JSON.parse(line);
+        return event.type !== "turn_end" && dies.lost?.(event) !== true;
+      } catch {
+        return true;
+      }
+    };
+    return {
+      ...base,
+      create() {
+        const backend = base.create();
+        wrapped ??= Object.assign(Object.create(backend), {
+          async session(id) {
+            const log = await backend.session(id);
+            return {
+              ...log,
+              ui: { ...log.ui, write: (lines) => log.ui.write(dies.armed || dies.dead ? lines.filter(shown) : lines) },
+              async append(entry) {
+                if (dies.dead && entry?.k !== "input") throw new Error("the process died");
+                if (!dies.armed || entry?.k !== "record") return log.append(entry);
+                const record = JSON.parse(Buffer.from(entry.data, "base64").toString("utf8"));
+                const at = record.events.findIndex((event) => event.type === "turn_progress" && event.data?.action === "delivering_response");
+                if (at < 0) return log.append(entry);
+                dies.armed = false;
+                dies.dead = true;
+                const kept = { ...record, events: record.events.slice(0, at + 1) };
+                await log.append({ ...entry, data: Buffer.from(JSON.stringify(kept)).toString("base64"), marks: (entry.marks ?? []).filter((mark) => mark.end !== true) });
+                throw new Error("the process died");
+              },
+            };
+          },
+        });
+        return wrapped;
+      },
+    };
+  };
+
+  // DUR-20, DUR-38: fx saves a turn's finished reply before the turn's end.
+  // A worker that resumes a turn whose holder died between the two ends it
+  // with that reply, asking the model nothing, and its engine streams none of
+  // it, since the session's stream holds what the holder showed. So the
+  // worker first shows the rest of the reply, once (`tests/tla/sdk/
+  // DurableSession.tla` Commit, with ResumeFills).
+  for (const [lost, label] of [
+    [(event) => event.type === "text_delta" && event.delta !== "one ", "with the start of its reply shown"],
+    [(event) => event.type === "text_delta", "with none of its reply shown"],
+  ]) {
+    test(`a turn whose worker died after saving its reply, ${label}, ends with that reply on resume and shows its rest once`, async () => {
+      const dies = { armed: true, dead: false, lost };
+      const durability = deadAfterSavedReply(memory(), dies);
+      const agent = createFxAgent(agentOptions(durability));
+      const session = agent.session();
+      const messageId = `saved-${requests.length}`;
+      const first = session.prompt("several words", { messageId });
+      const { sessionId } = await first.accepted;
+      await until(() => dies.dead, "the record that saves the reply");
+      // A dead worker never lets the session go: it stays dead until its run is over.
+      await until(() => agent[Symbol.for("libfx.durableInternals")].liveWorkers() === 0, "the dead worker's run to end");
+      dies.dead = false;
+      const log = await durability.create().session(sessionId);
+      assert.equal(foldSessionLog(await log.read()).openTurn?.id, messageId, "the turn is open, its reply saved");
+      const asked = requests.length;
+      const retried = await withinSeconds(session.prompt("several words", { messageId }).result, "the retry waited for an end nobody writes");
+      assert.equal(retried.stopReason, "end_turn");
+      assert.equal(requests.length, asked, "the saved reply ends the turn with no model request");
+      const reply = await journalReply(log, messageId);
+      assert.ok(typeof reply === "string" && reply.length > 0, "the journal holds the reply");
+      const lines = (await readLines(session.stream(0), 64)).filter((line) => line.messageId === messageId);
+      const shown = lines.filter((line) => line.epoch === 1 && line.type === "text_delta").map((line) => line.delta).join("");
+      assert.ok(reply.startsWith(shown), "the dead worker showed the reply's start");
+      assert.deepEqual(lines.filter((line) => line.epoch !== 1).map((line) => [line.type, line.delta]), [
+        ["turn_resume", undefined],
+        ["text_delta", reply.slice(shown.length)],
+        ["turn_end", undefined],
+      ]);
+      const tail = (events) => {
+        let text = "";
+        for (const event of events) text = event.type === "text_delta" ? text + event.delta : ["reasoning_delta", "turn_resume"].includes(event.type) ? text : "";
+        return text;
+      };
+      assert.equal(tail(lines.filter((line) => line.type !== "turn_end")), reply, "the reply once and whole");
+      await agent.close();
+    });
+  }
+
+  // DUR-20: a turn's engine answers only once the record that ends the turn
+  // is stored. A deadline that reaches the turn while that record is on its
+  // way hands nothing back: the turn ended, as its end says, and the stream
+  // shows that end (`tests/tla/sdk/DurableSteer.tla` Handoff from `ending`).
+  test("a deadline that reaches a turn while its end is being stored ends the turn as that end says", async () => {
+    const hold = { armed: true, release: null };
+    const base = memory();
+    let wrapped = null;
+    const durability = {
+      ...base,
+      create() {
+        const backend = base.create();
+        wrapped ??= Object.assign(Object.create(backend), {
+          async session(id) {
+            const log = await backend.session(id);
+            return {
+              ...log,
+              async append(entry) {
+                if (hold.armed && entry?.k === "record" && (entry.marks ?? []).some((mark) => mark?.end === true)) {
+                  hold.armed = false;
+                  await new Promise((go) => { hold.release = go; });
+                }
+                return log.append(entry);
+              },
+            };
+          },
+        });
+        return wrapped;
+      },
+    };
+    const agent = createFxAgent(agentOptions(durability));
+    const session = agent.session();
+    const messageId = `deadline-${requests.length}`;
+    const turn = session.prompt("hello there", { messageId });
+    const { sessionId } = await turn.accepted;
+    await until(() => hold.release !== null, "the record that ends the turn");
+    const asked = requests.length;
+    agent[Symbol.for("libfx.durableInternals")].stopAtDeadline(sessionId);
+    hold.release();
+    assert.equal((await withinSeconds(turn.result, "the turn's result never came")).stopReason, "end_turn");
+    const lines = (await readLines(session.stream(0), 16)).filter((line) => line.messageId === messageId);
+    assert.deepEqual(lines.filter((line) => line.type.startsWith("turn_")).map((line) => [line.type, line.stopReason]), [["turn_start", undefined], ["turn_end", "end_turn"]]);
+    assert.equal(requests.length, asked, "nothing asked the model again");
+    await agent.close();
+  });
+
   // The reply an end mark carries is for libfx's own sessions: a store that
   // set `marks: true` gets the marks its type lists.
   test("a store that asks for marks hears how a turn ended, and not its reply", async () => {

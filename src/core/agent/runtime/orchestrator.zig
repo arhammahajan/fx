@@ -4054,6 +4054,44 @@ fn persistRecoveryCheckpoint(
     tool_evidence: model_response_recovery.ToolEvidence,
     trace_ctx: TraceContext,
 ) !void {
+    try persistRecoveryCheckpointWithAction(
+        deps,
+        finalization,
+        job,
+        current_turn_messages,
+        assistant_source,
+        route_model,
+        requested_fast_mode,
+        fast_mode,
+        attempt_limit,
+        consumed_attempts,
+        outstanding_reservation,
+        cause,
+        checkpointAction(strategy),
+        tool_evidence,
+        trace_ctx,
+    );
+}
+
+/// Persists a recovery checkpoint whose action the caller already knows,
+/// such as a finished final reply that recovery must deliver as saved.
+fn persistRecoveryCheckpointWithAction(
+    deps: *const AgentRuntimeDeps,
+    finalization: *const TurnFinalizationGuard,
+    job: QueuedPrompt,
+    current_turn_messages: []const ChatMessage,
+    assistant_source: []const u8,
+    route_model: []const u8,
+    requested_fast_mode: bool,
+    fast_mode: bool,
+    attempt_limit: usize,
+    consumed_attempts: usize,
+    outstanding_reservation: bool,
+    cause: model_response_recovery.FailureCause,
+    action: types.ModelRecoveryAction,
+    tool_evidence: model_response_recovery.ToolEvidence,
+    trace_ctx: TraceContext,
+) !void {
     if (deps.recovery_checkpoint == null and deps.append_turn_piece == null) return;
     // Every sink copies or serializes the borrowed checkpoint synchronously.
     // Retaining these full-history reconstructions in the turn arena is quadratic.
@@ -4075,7 +4113,7 @@ fn persistRecoveryCheckpoint(
         .assistant_source = @constCast(assistant_source),
         .execution = projected,
         .cause = checkpointCause(cause),
-        .action = checkpointAction(strategy),
+        .action = action,
         .tool_state = checkpointToolState(tool_evidence),
         .authority = .{
             .provider = job.provider,
@@ -4107,9 +4145,61 @@ fn persistRecoveryCheckpoint(
             attempt_limit,
             if (outstanding_reservation) "true" else "false",
             @tagName(cause),
-            @tagName(strategy orelse .retry_request),
+            @tagName(action),
         },
     );
+}
+
+/// Saves the reply a turn is about to end with, so a crash before the turn's
+/// end is stored resumes by delivering it instead of asking the model again.
+/// Called only once nothing can go on with the turn: every check of the reply
+/// passed, and no steer, subagent, or stop hook continues it.
+fn persistFinalReplyCheckpoint(
+    deps: *const AgentRuntimeDeps,
+    finalization: *const TurnFinalizationGuard,
+    job: QueuedPrompt,
+    current_turn_messages: []const ChatMessage,
+    reply: []const u8,
+    route_model: []const u8,
+    requested_fast_mode: bool,
+    fast_mode: bool,
+    attempt_limit: usize,
+    consumed_attempts: usize,
+    cause: model_response_recovery.FailureCause,
+    trace_ctx: TraceContext,
+) !void {
+    if (std.mem.trim(u8, reply, " \t\r\n").len == 0) return;
+    try persistRecoveryCheckpointWithAction(
+        deps,
+        finalization,
+        job,
+        current_turn_messages,
+        reply,
+        route_model,
+        requested_fast_mode,
+        fast_mode,
+        attempt_limit,
+        consumed_attempts,
+        false,
+        cause,
+        .delivering_response,
+        .none,
+        trace_ctx,
+    );
+}
+
+/// The restored turn's messages as the reply `checkpoint` saved saw them:
+/// without the crash notice its resume added after them
+/// (`RecoveryCheckpoint.resumed`), which delivering that reply never sends,
+/// so the turn's history holds no notice the model never got
+/// (`tests/tla/durable/Resumption.tla` ModelToldEveryTime). Steering after
+/// the turn's last step comes last, so that notice is the last message.
+fn deliveredTurnMessages(checkpoint: session_codec.RecoveryCheckpoint, messages: []const ChatMessage) []const ChatMessage {
+    if (!checkpoint.resume_added.notice or messages.len == 0) return messages;
+    const last = messages[messages.len - 1];
+    const notice = last.role == .user and last.restored_steering and
+        std.mem.eql(u8, last.content orelse "", session_codec.crash_resume_notice);
+    return if (notice) messages[0 .. messages.len - 1] else messages;
 }
 
 /// The running turn, saved just before automatic compaction sends anything
@@ -7199,12 +7289,49 @@ fn processQueuedPromptLoop(
 
         if (restore_recovery_source) {
             const checkpoint = job.recovery_checkpoint.?;
+            restore_recovery_source = false;
+            // The reply finished before the turn was saved as done: deliver
+            // it as saved. A steer that arrived or that the resume restored,
+            // or a stop hook still to run, means the turn goes on, so those
+            // cases restart as before.
+            if (checkpoint.deliversSavedResponse() and steering_action == .none and
+                (!lifecycle.view.hasStop() or stop_state.dispatched))
+            {
+                debug_trace.eventf(
+                    "agent",
+                    "recovery_delivered_saved_response",
+                    step_ctx,
+                    "bytes={d}",
+                    .{checkpoint.assistant_source.len},
+                );
+                // A host that already holds the reply got its closing newline
+                // too; one that holds none of the turn gets both now.
+                try stream_ctx.restoreRecoverySource(
+                    checkpoint.assistant_source,
+                    job.recovery_source_already_presented,
+                );
+                if (!job.recovery_source_already_presented) try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
+                try finishCommonAssistantTerminal(
+                    deps,
+                    finalization,
+                    arena,
+                    job,
+                    deliveredTurnMessages(checkpoint, within_turn_suffix.items),
+                    &summary_accumulator,
+                    .{ .history = checkpoint.assistant_source },
+                    .completed,
+                    null,
+                    &finish_trace,
+                    "recovered_assistant",
+                    .{ .role = .assistant, .content = checkpoint.assistant_source },
+                );
+                return;
+            }
             try stream_ctx.restoreRecoverySource(
                 checkpoint.assistant_source,
                 job.recovery_source_already_presented,
             );
             try stream_ctx.beginRecoveryAttempt();
-            restore_recovery_source = false;
         }
 
         var advertised_dynamic_tools = try runtime_gateway_step.snapshotDynamicTools(arena, deps, &selected_dynamic_tools);
@@ -9624,6 +9751,20 @@ fn processQueuedPromptLoop(
                 );
                 stop_state.terminal_materializing =
                     stop_state.retained_candidate != null;
+                if (has_content and disposition == .completed) try persistFinalReplyCheckpoint(
+                    deps,
+                    finalization,
+                    job,
+                    within_turn_suffix.items,
+                    persisted_text.history,
+                    gateway_model,
+                    selected_fast_mode,
+                    route_fast_mode,
+                    semantic_limit,
+                    semantic_attempt + 1,
+                    recovery_cause,
+                    step_ctx,
+                );
                 try finishCommonAssistantTerminal(
                     deps,
                     finalization,
@@ -12443,6 +12584,20 @@ fn processQueuedPromptLoop(
                 );
                 stop_state.terminal_materializing =
                     stop_state.retained_candidate != null;
+                try persistFinalReplyCheckpoint(
+                    deps,
+                    finalization,
+                    job,
+                    within_turn_suffix.items,
+                    persisted_text.history,
+                    gateway_model,
+                    selected_fast_mode,
+                    route_fast_mode,
+                    semantic_limit,
+                    semantic_attempt + 1,
+                    recovery_cause,
+                    step_ctx,
+                );
                 try finishCommonAssistantTerminal(
                     deps,
                     finalization,
