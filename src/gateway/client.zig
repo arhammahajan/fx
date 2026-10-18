@@ -3454,7 +3454,9 @@ fn captureProviderFailureObject(
         // A provider's wrapper, `{"type":"error","error":{...}}`, names
         // nothing itself: its nested error does. Read exactly one level down,
         // as `errorObjectCode` does, so the detail and the class come from the
-        // same object and a deep chain of wrappers costs no recursion.
+        // same object. When neither level names anything, the caller renders
+        // the value instead, and `replaceProviderFailureRendered` bounds how
+        // deep a value it renders.
         if (nestedErrorObject(object)) |nested| {
             if (try captureErrorObjectFields(alloc, current, nested, true)) return true;
         }
@@ -3520,9 +3522,7 @@ fn captureProviderFailureDetail(alloc: std.mem.Allocator, current: *?[]u8, root:
         }
         if (value == .object) {
             if (try captureProviderFailureObject(alloc, current, value.object, true)) return;
-            const rendered = try stringifyJsonValueOwned(alloc, value);
-            defer alloc.free(rendered);
-            try replaceProviderFailureDetail(alloc, current, rendered);
+            try replaceProviderFailureRendered(alloc, current, value);
             return;
         }
     }
@@ -3534,10 +3534,62 @@ fn captureProviderFailureDetail(alloc: std.mem.Allocator, current: *?[]u8, root:
         if (value == .object) {
             if (try captureProviderFailureObject(alloc, current, value.object, true)) return;
         }
-        const rendered = try stringifyJsonValueOwned(alloc, value);
-        defer alloc.free(rendered);
-        try replaceProviderFailureDetail(alloc, current, rendered);
+        try replaceProviderFailureRendered(alloc, current, value);
     }
+}
+
+/// The deepest provider value a notice detail renders as JSON. No real error
+/// body nests anywhere near this, and `std.json.Stringify` aborts past 256
+/// levels in safe builds, so a provider's value can never take fx down.
+const max_rendered_detail_depth = 32;
+
+/// Renders a provider error value in which nothing named the failure, or the
+/// fixed `provider_error` label when it nests past `max_rendered_detail_depth`.
+fn replaceProviderFailureRendered(alloc: std.mem.Allocator, current: *?[]u8, value: std.json.Value) !void {
+    if (jsonNestsDeeperThan(value, max_rendered_detail_depth)) {
+        debug_trace.logf("stream", "provider failure detail nests past {d} levels; using the provider_error label", .{max_rendered_detail_depth});
+        try replaceProviderFailureDetail(alloc, current, "provider_error");
+        return;
+    }
+    const rendered = try stringifyJsonValueOwned(alloc, value);
+    defer alloc.free(rendered);
+    try replaceProviderFailureDetail(alloc, current, rendered);
+}
+
+/// Whether `value` nests objects and arrays more than `limit` levels deep,
+/// counting `value` itself. The walk keeps one frame per open level in a
+/// fixed `limit`-frame stack and stops at the first level past it, so it
+/// never recurses or allocates however deep or wide the value is.
+fn jsonNestsDeeperThan(value: std.json.Value, comptime limit: usize) bool {
+    const Frame = struct { items: []const std.json.Value, next: usize = 0 };
+    var stack: [limit]Frame = undefined;
+    const root_items = jsonContainerItems(value) orelse return false;
+    if (limit == 0) return true;
+    stack[0] = .{ .items = root_items };
+    var depth: usize = 1;
+    while (depth > 0) {
+        const top = &stack[depth - 1];
+        if (top.next == top.items.len) {
+            depth -= 1;
+            continue;
+        }
+        const child = top.items[top.next];
+        top.next += 1;
+        const items = jsonContainerItems(child) orelse continue;
+        if (depth == limit) return true;
+        stack[depth] = .{ .items = items };
+        depth += 1;
+    }
+    return false;
+}
+
+/// An object's values or an array's items; null for any other value.
+fn jsonContainerItems(value: std.json.Value) ?[]const std.json.Value {
+    return switch (value) {
+        .object => |object| object.values(),
+        .array => |array| array.items,
+        else => null,
+    };
 }
 
 fn materializeToolCalls(
@@ -4783,6 +4835,12 @@ test "consumeSseStream reads a gateway stream timeout named by the finish or an 
             "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"}}\n\n", .cause = .gateway_stream_timeout },
         .{ .payload = timeout_event ++ "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"error\"}}\n\n", .cause = .gateway_stream_timeout },
         .{ .payload = timeout_event, .cause = .gateway_stream_timeout },
+        // An error finish that names the timeout outranks a transient code and
+        // an event that named nothing.
+        .{ .payload = "data: {\"type\":\"error\",\"error\":{\"code\":\"server_error\",\"message\":\"retry\"}}\n\n" ++
+            "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"error\",\"raw\":\"gateway_stream_timeout\"}}\n\n", .cause = .gateway_stream_timeout },
+        .{ .payload = "data: {\"type\":\"error\",\"error\":{\"message\":\"cut off\"}}\n\n" ++
+            "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"error\",\"raw\":\"gateway_stream_timeout\"}}\n\n", .cause = .gateway_stream_timeout },
     };
     for (cases) |case| {
         var completion = try testStreamOutcome(case.payload);
@@ -4949,6 +5007,110 @@ test "consumeSseStream reads a deep chain of provider wrappers only one level do
     defer deinitGatewayCompletion(alloc, &completion);
     try std.testing.expectEqualStrings("provider_error: first nested", completion.provider_failure_detail.?);
     // The first nested error names no code, so the class is unclear too.
+    try std.testing.expectEqual(@as(?types.ProviderFailureCause, .uncoded_error), completion.provider_failure_cause);
+}
+
+/// `head`, then `open` `depth` times, then `leaf`, then one `}` for each
+/// `open`, then `tail`: a provider value nested `depth` levels below `head`.
+fn testDeepPayload(
+    alloc: std.mem.Allocator,
+    head: []const u8,
+    open: []const u8,
+    leaf: []const u8,
+    depth: usize,
+    tail: []const u8,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try out.writer.writeAll(head);
+    for (0..depth) |_| try out.writer.writeAll(open);
+    try out.writer.writeAll(leaf);
+    for (0..depth) |_| try out.writer.writeByte('}');
+    try out.writer.writeAll(tail);
+    return out.toOwnedSlice();
+}
+
+test "jsonNestsDeeperThan measures nesting up to its limit" {
+    const alloc = std.testing.allocator;
+    const Case = struct { json: []const u8, limit_2: bool, limit_3: bool };
+    const cases = [_]Case{
+        .{ .json = "5", .limit_2 = false, .limit_3 = false },
+        .{ .json = "{}", .limit_2 = false, .limit_3 = false },
+        .{ .json = "[[]]", .limit_2 = false, .limit_3 = false },
+        .{ .json = "[[[]]]", .limit_2 = true, .limit_3 = false },
+        .{ .json = "{\"a\":1,\"b\":[{}],\"c\":\"x\"}", .limit_2 = true, .limit_3 = false },
+        // Width does not add depth, and a deep branch after a shallow one counts.
+        .{ .json = "[1,2,3,[4,5],{\"a\":[6]}]", .limit_2 = true, .limit_3 = false },
+        .{ .json = "[[],[[[]]]]", .limit_2 = true, .limit_3 = true },
+    };
+    for (cases) |case| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, case.json, .{});
+        defer parsed.deinit();
+        errdefer std.debug.print("json: {s}\n", .{case.json});
+        try std.testing.expectEqual(case.limit_2, jsonNestsDeeperThan(parsed.value, 2));
+        try std.testing.expectEqual(case.limit_3, jsonNestsDeeperThan(parsed.value, 3));
+    }
+    // Exactly `max_rendered_detail_depth` levels still renders; one more does not.
+    for ([_]struct { depth: usize, deeper: bool }{
+        .{ .depth = max_rendered_detail_depth, .deeper = false },
+        .{ .depth = max_rendered_detail_depth + 1, .deeper = true },
+        .{ .depth = 20_000, .deeper = true },
+    }) |case| {
+        const json = try testDeepPayload(alloc, "", "[", "[]", case.depth - 1, "");
+        defer alloc.free(json);
+        // `testDeepPayload` closes with `}`; rewrite the closers for arrays.
+        for (json) |*byte| {
+            if (byte.* == '}') byte.* = ']';
+        }
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(case.deeper, jsonNestsDeeperThan(parsed.value, max_rendered_detail_depth));
+    }
+}
+
+test "consumeSseStream labels a provider error value too deep to render" {
+    const alloc = std.testing.allocator;
+    const error_finish = "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"error\"}}\n\n";
+    const event_head = "data: {\"type\":\"error\",\"error\":";
+    const event_tail = "}\n\n" ++ error_finish;
+    const Case = struct {
+        name: []const u8,
+        head: []const u8,
+        open: []const u8,
+        leaf: []const u8,
+        depth: usize,
+        tail: []const u8,
+        cause: types.ProviderFailureCause,
+    };
+    const cases = [_]Case{
+        // Wrappers whose `type` is the generic "error", with no code or message.
+        .{ .name = "d3", .head = event_head, .open = "{\"type\":\"error\",\"error\":", .leaf = "{\"type\":\"error\"}", .depth = 300, .tail = event_tail, .cause = .uncoded_error },
+        .{ .name = "d3 deep", .head = event_head, .open = "{\"type\":\"error\",\"error\":", .leaf = "{\"type\":\"error\"}", .depth = 20_000, .tail = event_tail, .cause = .uncoded_error },
+        // A chain of `error` objects with no type at all.
+        .{ .name = "d4", .head = event_head, .open = "{\"error\":", .leaf = "{}", .depth = 300, .tail = event_tail, .cause = .uncoded_error },
+        // Any other nesting under `error`.
+        .{ .name = "d5", .head = event_head, .open = "{\"a\":", .leaf = "{}", .depth = 300, .tail = event_tail, .cause = .uncoded_error },
+        // An error finish that carries d4's value, with no error event.
+        .{ .name = "f1", .head = "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"error\"},\"error\":", .open = "{\"error\":", .leaf = "{}", .depth = 300, .tail = "}\n\n", .cause = .unexplained_error_finish },
+    };
+    for (cases) |case| {
+        const payload = try testDeepPayload(alloc, case.head, case.open, case.leaf, case.depth, case.tail);
+        defer alloc.free(payload);
+        var completion = try testStreamOutcome(payload);
+        defer deinitGatewayCompletion(alloc, &completion);
+        errdefer std.debug.print("case: {s}\n", .{case.name});
+        try std.testing.expectEqual(@as(?types.ProviderFinishReason, .provider_error), completion.finish_reason);
+        try std.testing.expectEqualStrings("provider_error", completion.provider_failure_detail.?);
+        try std.testing.expectEqual(@as(?types.ProviderFailureCause, case.cause), completion.provider_failure_cause);
+    }
+}
+
+test "consumeSseStream still renders a shallow provider error value that names nothing" {
+    const payload = "data: {\"type\":\"error\",\"error\":{\"type\":\"error\",\"error\":{\"type\":\"error\"}}}\n\n" ++
+        "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"error\"}}\n\n";
+    var completion = try testStreamOutcome(payload);
+    defer deinitGatewayCompletion(std.testing.allocator, &completion);
+    try std.testing.expectEqualStrings("{\"type\":\"error\",\"error\":{\"type\":\"error\"}}", completion.provider_failure_detail.?);
     try std.testing.expectEqual(@as(?types.ProviderFailureCause, .uncoded_error), completion.provider_failure_cause);
 }
 
