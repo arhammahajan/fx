@@ -1079,8 +1079,10 @@ while :; do sleep 1; done
       await session.waitForText(VISIBLE_PARTIAL_CHUNKS.at(-1)!.trim(), TIMEOUT);
       // Drop the live stream so the turn enters recovery, then kill fx before
       // any cleanup can run: the checkpoint and the owner marker both survive.
+      // The checkpoint fx saved when it sent the request resends it, so wait
+      // for the one the dropped stream saves, which restarts the reply.
       gateway.stop();
-      await waitForTrace(tracePath, "recovery_checkpoint_set", TIMEOUT);
+      await waitForTrace(tracePath, "action=continuing_response", TIMEOUT);
       Bun.spawnSync(["kill", "-9", String(session.processPid())]);
       await session.waitForPane(() => session!.paneStatus().dead, TIMEOUT);
 
