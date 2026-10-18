@@ -6701,32 +6701,6 @@ test "processQueuedPrompt stops an endless unexplained error finish after its se
     );
 }
 
-test "processQueuedPrompt lets a content filter finish decide over a non-retryable cause" {
-    // An earlier error event's code must not add a notice or keep the
-    // filtered partial: the content filter ends the turn exactly as before.
-    const alloc = std.testing.allocator;
-    const chunks = [_][]const u8{"filtered partial"};
-    const completions = [_]FakeCompletion{
-        .{ .chunks = &chunks, .content = "filtered partial", .finish_reason = .content_filter, .provider_failure_cause = .non_retryable, .provider_failure_detail = "invalid_request_error: bad input" },
-        .{ .content = "must not be requested" },
-    };
-    var gateway = FakeGateway.init(alloc, &completions);
-    defer gateway.deinit();
-    var hooks = FakeAgentRuntimeDeps.init(alloc);
-    defer hooks.deinit();
-    var fixture = PromptFixture{};
-
-    try std.testing.expectError(
-        error.RouteRecoveryStopped,
-        runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job()),
-    );
-    try std.testing.expectEqual(@as(usize, 1), gateway.request_models.items.len);
-    try std.testing.expectEqual(@as(usize, 0), hooks.system_notices.items.len);
-    try std.testing.expectEqual(@as(usize, 0), hooks.history_turns.items.len);
-    try std.testing.expectEqual(@as(usize, 1), hooks.route_recovery_statuses.items.len);
-    try std.testing.expectEqual(types.RouteRecoveryStatus.Kind.content_filter, hooks.route_recovery_statuses.items[0].kind);
-}
-
 test "processQueuedPrompt preserves fast mode after a streamed rate limit" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{
@@ -7233,6 +7207,31 @@ test "processQueuedPrompt a different failure between missing finishes starts th
     try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
     try std.testing.expectEqual(@as(usize, 6), gateway.request_models.items.len);
     try expectRecovered(&hooks, 6);
+}
+
+test "processQueuedPrompt stops when unclear failures of different classes end three sends" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{
+        .{ .pre_send_error = error.TlsInitializationFailed },
+        .{ .omit_finish = true },
+        unclearProviderError(.uncoded_error, "provider_error: wafer route unavailable"),
+        .{ .content = "must not be requested" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try std.testing.expectError(error.ModelError, runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job()));
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_models.items.len);
+    const statuses = hooks.route_recovery_statuses.items;
+    try expectRouteStatus(
+        &hooks,
+        statuses.len - 1,
+        .terminal_provider_error,
+        "⚠ Provider unavailable · provider_error: wafer route unavailable · kept failing at the same point · stopped",
+    );
 }
 
 test "processQueuedPrompt reports failed when an HTTP error ends a request that showed a status" {

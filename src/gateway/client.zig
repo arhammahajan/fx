@@ -3431,25 +3431,43 @@ const rate_limit_error_codes = [_][]const u8{
     "too_many_requests",
 };
 
+/// Error codes a resend cannot fix, because the request, its credentials, or
+/// the account is the problem: the codes this repository's gateway and
+/// provider fixtures carry, and the providers' standard authentication,
+/// permission, and not-found codes.
+const non_retryable_error_codes = [_][]const u8{
+    "invalid_request_error",
+    "invalid_prompt",
+    "context_length_exceeded",
+    "authentication_error",
+    "permission_error",
+    "model_not_found",
+    "api_key_required",
+    "credit_card_required",
+    "RestrictedProvidersError",
+    "no_providers_available",
+};
+
 /// What an SSE `error` event says about the request: fx classifies what has a
 /// code and bounds what is unclear. This differs from the Responses protocol
 /// (`responses_protocol.zig` `accept_failure`), which ends the turn for
 /// `provider_error` and for a missing code. The AI Gateway names a provider
 /// route failure `provider_error` and pairs it with HTTP 503, and an event
-/// without a code is the same route failure that `captureProviderFailureDetail`
-/// labels `provider_error`, so here both are resent: a coded one as a server
-/// error, an uncoded one bounded by `request_recovery.zig` `Repeating`.
+/// with neither a code nor a usable HTTP status is the same route failure
+/// that `captureProviderFailureDetail` labels `provider_error`, so here both
+/// are resent: a coded one as a server error, an uncoded one bounded by
+/// `request_recovery.zig` `Repeating`.
 const ErrorEventClass = enum {
-    /// Neither a code nor an HTTP status, so fx cannot tell whether a resend
-    /// can succeed.
+    /// Neither a code nor a usable HTTP status, so fx cannot tell whether a
+    /// resend can succeed.
     uncoded,
     /// A server error or overload, which a resend can outlive.
     transient,
     /// The gateway ended a stream that ran too long.
     stream_timeout,
     rate_limited,
-    /// Every other code, including one fx does not know: a resend repeats the
-    /// same request.
+    /// A code a resend cannot fix, or a code fx does not recognize and no
+    /// status to say more: a resend repeats the same request.
     non_retryable,
 
     /// Whether `next` replaces `current` as the stream's class: only when it
@@ -3472,12 +3490,14 @@ const ErrorEventClass = enum {
 };
 
 fn errorEventClass(root: std.json.Value) ErrorEventClass {
-    if (providerErrorEventCode(root)) |code| return errorCodeClass(code);
-    const status = providerErrorEventStatus(root) orelse return .uncoded;
-    return httpStatusClass(status) orelse .uncoded;
+    const status_class = if (providerErrorEventStatus(root)) |status| httpStatusClass(status) else null;
+    const code = providerErrorEventCode(root) orelse return status_class orelse .uncoded;
+    // A code fx recognizes decides. One it does not, such as an SDK error
+    // name in `error.type`, says less than the status that came with it.
+    return recognizedCodeClass(code) orelse status_class orelse .non_retryable;
 }
 
-fn errorCodeClass(code: []const u8) ErrorEventClass {
+fn recognizedCodeClass(code: []const u8) ?ErrorEventClass {
     if (std.mem.eql(u8, code, "gateway_stream_timeout")) return .stream_timeout;
     for (transient_provider_error_codes) |transient| {
         if (std.mem.eql(u8, code, transient)) return .transient;
@@ -3485,7 +3505,10 @@ fn errorCodeClass(code: []const u8) ErrorEventClass {
     for (rate_limit_error_codes) |rate_limit| {
         if (std.mem.eql(u8, code, rate_limit)) return .rate_limited;
     }
-    return .non_retryable;
+    for (non_retryable_error_codes) |non_retryable| {
+        if (std.mem.eql(u8, code, non_retryable)) return .non_retryable;
+    }
+    return null;
 }
 
 /// An HTTP status an event carries in place of a code: 5xx (529 included) is
@@ -3499,64 +3522,54 @@ fn httpStatusClass(status: u16) ?ErrorEventClass {
 
 /// The stream's failure cause from the class its error events decided, its
 /// finish, and whether the finish named a gateway stream timeout. Null is a
-/// transient provider error or no failure. The error events decide only when
-/// the finish is an error or missing: a content filter or a normal finish
-/// decides on its own. A provider error with nothing to classify it is
-/// unclear: fx resends it, but `request_recovery.zig` `Repeating` bounds it.
+/// transient provider error or no failure.
+///
+/// A content filter finish decides on its own. Error events decide an error
+/// finish or a missing one, and a classified code there beats a timeout. A
+/// finish that names a gateway stream timeout is one whatever else it says,
+/// as it always was; any other normal finish decides on its own. A provider
+/// error with nothing to classify it is unclear: fx resends it, but
+/// `request_recovery.zig` `Repeating` bounds it.
 fn streamFailureCause(
     class: ?ErrorEventClass,
     finish: ?types.ProviderFinishReason,
     finish_timeout: bool,
 ) ?types.ProviderFailureCause {
-    if (finish != null and finish != .provider_error) return null;
+    if (finish == .content_filter) return null;
+    const error_or_missing = finish == null or finish == .provider_error;
+    const classified = error_or_missing and
+        (class == .non_retryable or class == .rate_limited);
+    if (finish_timeout and !classified) return .gateway_stream_timeout;
+    if (!error_or_missing) return null;
     const error_finish = finish != null;
-    const event = class orelse {
-        if (finish_timeout) return .gateway_stream_timeout;
-        return if (error_finish) .unexplained_error_finish else null;
-    };
+    const event = class orelse return if (error_finish) .unexplained_error_finish else null;
     return switch (event) {
         .non_retryable => .non_retryable,
         .rate_limited => .rate_limited,
         .stream_timeout => .gateway_stream_timeout,
-        .transient => if (finish_timeout) .gateway_stream_timeout else null,
-        .uncoded => if (finish_timeout)
-            .gateway_stream_timeout
-        else if (error_finish)
-            .uncoded_error
-        else
-            null,
+        .transient => null,
+        .uncoded => if (error_finish) .uncoded_error else null,
     };
 }
 
-/// A numeric HTTP status on the event or its error body, under any of the
-/// names providers use.
+/// The HTTP status an event carries, as `statusCode` on the event, on its
+/// `error` object, or on `error.param`, where the Gateway reports the
+/// upstream status of an `AI_APICallError` (`vercel_failure_diagnostics.zig`).
 fn providerErrorEventStatus(root: std.json.Value) ?u16 {
     if (root != .object) return null;
-    if (httpStatusField(root.object)) |status| return status;
-    inline for (.{ "error", "providerError" }) |key| {
-        if (root.object.get(key)) |value| {
-            if (value == .object) {
-                if (httpStatusField(value.object)) |status| return status;
-                if (value.object.get("error")) |nested| {
-                    if (nested == .object) {
-                        if (httpStatusField(nested.object)) |status| return status;
-                    }
-                }
-            }
-        }
-    }
-    return null;
+    if (statusCodeField(root.object)) |status| return status;
+    const err = root.object.get("error") orelse return null;
+    if (err != .object) return null;
+    if (statusCodeField(err.object)) |status| return status;
+    const param = err.object.get("param") orelse return null;
+    if (param != .object) return null;
+    return statusCodeField(param.object);
 }
 
-fn httpStatusField(object: std.json.ObjectMap) ?u16 {
-    inline for (.{ "statusCode", "status", "status_code", "httpStatus", "http_status" }) |key| {
-        if (object.get(key)) |value| {
-            if (value == .integer and value.integer >= 100 and value.integer <= 599) {
-                return @intCast(value.integer);
-            }
-        }
-    }
-    return null;
+fn statusCodeField(object: std.json.ObjectMap) ?u16 {
+    const value = object.get("statusCode") orelse return null;
+    if (value != .integer or value.integer < 100 or value.integer > 599) return null;
+    return @intCast(value.integer);
 }
 
 /// The event's top-level `code`, or the `code`, then the `type`, of its
@@ -4861,18 +4874,28 @@ test "errorEventClass retries only server errors and overload" {
         .{ .event = "{\"type\":\"error\",\"error\":{\"code\":\"RestrictedProvidersError\",\"message\":\"restricted\"}}", .class = .non_retryable },
         .{ .event = "{\"type\":\"error\",\"error\":{\"code\":\"something_new\",\"message\":\"unknown\"}}", .class = .non_retryable },
         .{ .event = "{\"type\":\"error\",\"error\":{\"code\":\"gateway_stream_timeout\",\"message\":\"too long\"}}", .class = .stream_timeout },
-        // No code: a numeric HTTP status classifies the event.
+        // No code: `statusCode` on the event, its error, or `error.param`
+        // classifies the event.
         .{ .event = "{\"type\":\"error\",\"error\":{\"message\":\"upstream down\",\"statusCode\":503}}", .class = .transient },
         .{ .event = "{\"type\":\"error\",\"statusCode\":502,\"message\":\"bad gateway\"}", .class = .transient },
-        .{ .event = "{\"type\":\"error\",\"error\":{\"message\":\"overloaded\",\"status\":529}}", .class = .transient },
-        .{ .event = "{\"type\":\"error\",\"providerError\":{\"message\":\"slow down\",\"status_code\":429}}", .class = .rate_limited },
-        .{ .event = "{\"type\":\"error\",\"error\":{\"message\":\"bad input\",\"status\":400}}", .class = .non_retryable },
-        .{ .event = "{\"type\":\"error\",\"error\":{\"type\":\"error\",\"error\":{\"message\":\"forbidden\",\"httpStatus\":403}}}", .class = .non_retryable },
-        // A code outranks a status, and a status that is not an error, or
-        // not a number, says nothing.
-        .{ .event = "{\"type\":\"error\",\"error\":{\"code\":\"server_error\",\"status\":400}}", .class = .transient },
-        .{ .event = "{\"type\":\"error\",\"error\":{\"message\":\"odd\",\"status\":200}}", .class = .uncoded },
-        .{ .event = "{\"type\":\"error\",\"error\":{\"message\":\"odd\",\"status\":\"failed\"}}", .class = .uncoded },
+        .{ .event = "{\"type\":\"error\",\"error\":{\"message\":\"overloaded\",\"statusCode\":529}}", .class = .transient },
+        .{ .event = "{\"type\":\"error\",\"error\":{\"message\":\"slow down\",\"statusCode\":429}}", .class = .rate_limited },
+        .{ .event = "{\"type\":\"error\",\"error\":{\"message\":\"bad input\",\"statusCode\":400}}", .class = .non_retryable },
+        .{ .event = "{\"type\":\"error\",\"error\":{\"message\":\"forbidden\",\"param\":{\"statusCode\":403}}}", .class = .non_retryable },
+        // An unrecognized code falls back to its status; a recognized one
+        // decides on its own.
+        .{ .event = "{\"type\":\"error\",\"error\":{\"code\":\"upstream_error\",\"message\":\"bad gateway\",\"statusCode\":502}}", .class = .transient },
+        .{ .event = "{\"type\":\"error\",\"error\":{\"message\":\"Service Unavailable\",\"type\":\"AI_APICallError\",\"param\":{\"statusCode\":503}}}", .class = .transient },
+        .{ .event = "{\"type\":\"error\",\"error\":{\"code\":\"provider_error\",\"message\":\"route failed\",\"statusCode\":400}}", .class = .transient },
+        .{ .event = "{\"type\":\"error\",\"error\":{\"code\":\"invalid_request_error\",\"message\":\"bad input\",\"statusCode\":503}}", .class = .non_retryable },
+        .{ .event = "{\"type\":\"error\",\"error\":{\"code\":\"something_new\",\"message\":\"rejected\",\"statusCode\":400}}", .class = .non_retryable },
+        .{ .event = "{\"type\":\"error\",\"error\":{\"message\":\"Bad Request\",\"type\":\"AI_APICallError\"}}", .class = .non_retryable },
+        // A status that is not an error, is not a number, or sits in a field
+        // nothing in this repository uses says nothing.
+        .{ .event = "{\"type\":\"error\",\"error\":{\"message\":\"odd\",\"statusCode\":200}}", .class = .uncoded },
+        .{ .event = "{\"type\":\"error\",\"error\":{\"message\":\"odd\",\"statusCode\":\"503\"}}", .class = .uncoded },
+        .{ .event = "{\"type\":\"error\",\"error\":{\"message\":\"odd\",\"status\":503}}", .class = .uncoded },
+        .{ .event = "{\"type\":\"error\",\"error\":{\"code\":\"something_new\",\"message\":\"odd\",\"status\":503}}", .class = .non_retryable },
     };
     for (cases) |case| {
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, case.event, .{});
@@ -4891,6 +4914,27 @@ test "errorEventClass retries only server errors and overload" {
     try std.testing.expect(!ErrorEventClass.decides(.rate_limited, .non_retryable));
     try std.testing.expect(!ErrorEventClass.decides(.non_retryable, .stream_timeout));
     try std.testing.expect(!ErrorEventClass.decides(.transient, .uncoded));
+}
+
+test "consumeSseStream reads a gateway stream timeout named on any finish" {
+    const Case = struct { payload: []const u8, cause: ?types.ProviderFailureCause };
+    const cases = [_]Case{
+        // A normal finish that names the timeout is one, as it always was.
+        .{ .payload = "data: {\"type\":\"text-delta\",\"id\":\"t\",\"delta\":\"answer\"}\n\n" ++
+            "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"},\"code\":\"gateway_stream_timeout\"}\n\n", .cause = .gateway_stream_timeout },
+        .{ .payload = "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"error\",\"raw\":\"gateway_stream_timeout\"}}\n\n", .cause = .gateway_stream_timeout },
+        // A content filter still decides on its own.
+        .{ .payload = "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"content-filter\"},\"code\":\"gateway_stream_timeout\"}\n\n", .cause = null },
+        // A classified code on an error finish beats the timeout.
+        .{ .payload = "data: {\"type\":\"error\",\"error\":{\"code\":\"invalid_request_error\",\"message\":\"bad input\"}}\n\n" ++
+            "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"error\",\"raw\":\"gateway_stream_timeout\"}}\n\n", .cause = .non_retryable },
+    };
+    for (cases) |case| {
+        var completion = try testStreamOutcome(case.payload);
+        defer deinitGatewayCompletion(std.testing.allocator, &completion);
+        errdefer std.debug.print("payload: {s}\n", .{case.payload});
+        try std.testing.expectEqual(case.cause, completion.provider_failure_cause);
+    }
 }
 
 test "consumeSseStream lets a content filter finish decide on its own" {

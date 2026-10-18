@@ -1689,8 +1689,8 @@ pub const ProviderFailureCause = enum {
     gateway_stream_timeout,
     non_retryable,
     rate_limited,
-    /// A provider error whose error event named no code, so fx cannot tell
-    /// whether a resend can succeed.
+    /// A provider error whose error event gave neither a code nor a usable
+    /// HTTP status, so fx cannot tell whether a resend can succeed.
     uncoded_error,
     /// A stream that finished with an error that no error event explained.
     unexplained_error_finish,
