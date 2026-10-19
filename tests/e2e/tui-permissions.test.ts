@@ -90,11 +90,19 @@ function createIsolatedRoot(): IsolatedRoot {
   };
 }
 
+// Trace log of the current session's `permission` scope. `decide` reads it to
+// tell an accepted affirmative choice from one fx held back as not yet ready.
+let permissionTracePath: string | null = null;
+
 function gatewayEnv(
   root: IsolatedRoot,
   gateway: ReturnType<typeof startFakeGateway>,
   overrides: Record<string, string | undefined> = {},
 ) {
+  const tracePath = overrides.FX_TRACE_LOG ?? join(root.root, "permission-trace.log");
+  const scopes = overrides.FX_TRACE_SCOPES?.split(",").map((scope) => scope.trim()) ?? [];
+  if (!scopes.includes("permission")) scopes.push("permission");
+  permissionTracePath = tracePath;
   return {
     HOME: root.home,
     AI_GATEWAY_API_KEY: "fake-file-approval-key",
@@ -106,6 +114,8 @@ function gatewayEnv(
     FX_AUTO_UPGRADE: "0",
     NO_COLOR: "1",
     ...overrides,
+    FX_TRACE_LOG: tracePath,
+    FX_TRACE_SCOPES: scopes.filter((scope) => scope !== "").join(","),
   };
 }
 
@@ -348,8 +358,47 @@ test("volatile token status rows normalize before file transcript comparison", (
   expect(normalizeVolatileStatusRows(["  0s (↑10 ↓5)"])).toEqual(["<status>"]);
 });
 
+function permissionTraceCounts(): { submitted: number; blocked: number } {
+  if (!permissionTracePath || !existsSync(permissionTracePath)) {
+    return { submitted: 0, blocked: 0 };
+  }
+  const trace = readFileSync(permissionTracePath, "utf8");
+  return {
+    submitted: trace.split("approval response submitted").length - 1,
+    blocked: trace.split("file_approval_confirmation_blocked").length - 1,
+  };
+}
+
+// fx ignores an affirmative file approval choice until the review frame has
+// settled, so a key sent as soon as the approval text appears can be dropped
+// (`file_approval_confirmation_blocked` in `src/core/app/input_approval_runtime.zig`).
+// Resend only when the trace shows fx held that exact key back, so a resend
+// can never answer a later approval.
 async function decide(session: TmuxSession, choice: 1 | 2 | 3) {
-  await session.sendKeys(String(choice));
+  if (choice === 3 || permissionTracePath === null) {
+    await session.sendKeys(String(choice));
+    return;
+  }
+  const deadline = Date.now() + TIMEOUT;
+  while (true) {
+    const before = permissionTraceCounts();
+    await session.sendKeys(String(choice));
+    let after = before;
+    while (after.submitted === before.submitted) {
+      if (Date.now() > deadline) {
+        throw new Error(`fx never handled approval choice ${choice} in ${session.name}`);
+      }
+      await Bun.sleep(25);
+      after = permissionTraceCounts();
+    }
+    // The blocked line follows the submitted line in the same call.
+    await Bun.sleep(50);
+    if (permissionTraceCounts().blocked === before.blocked) return;
+    if (Date.now() > deadline) {
+      throw new Error(`fx kept blocking approval choice ${choice} in ${session.name}`);
+    }
+    await Bun.sleep(100);
+  }
 }
 
 describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
@@ -614,6 +663,8 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
 
       await session.sendText("Record the prior approval transcript marker.");
       await session.waitForText(priorMarker, TIMEOUT);
+      // Wait for the first turn to finish before sending the next prompt.
+      await session.waitForStableComposer(TIMEOUT);
       await session.sendText("Create the full review fixture.");
       let approval = await waitForFileApproval(session, {
         required: ["full-review.txt", "+ review-line-90"],
