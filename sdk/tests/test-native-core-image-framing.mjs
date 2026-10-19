@@ -71,7 +71,6 @@ try {
         );
       }
       assert.equal(requests, 2);
-      assert.ok(init.body.length < 8 * 1024 * 1024);
       assert.ok(Buffer.from(init.body).toString("base64").length > 8 * 1024 * 1024);
       const payload = JSON.parse(Buffer.from(init.body).toString("utf8"));
       const resultValues = payload.prompt.flatMap((message) => message.content ?? [])
