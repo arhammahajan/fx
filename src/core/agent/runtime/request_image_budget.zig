@@ -69,7 +69,7 @@ pub fn withholdOldestImages(
 }
 
 /// A size no request is fit below: the default, or a larger limit learned
-/// from a provider's rejection. A transport may lower either, never raise it.
+/// from a provider's rejection.
 pub fn largestRequestBytes(learned: ?usize) usize {
     return @max(default_max_request_bytes, learned orelse 0);
 }

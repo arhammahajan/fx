@@ -87,7 +87,7 @@ The native kernel installs host-stream and host model-catalog providers. It does
 | `writeCoreAttachment(handle, id, buffer)` | Copies one raw inbound payload, a prompt image or a restore checkpoint, into the bounded attachment table under a positive `uint32` id. |
 | `takeCoreAttachment(handle, id)` | Removes and returns one outbound payload, a checkpoint, as a Node Buffer, or `null`. |
 | `discardCoreAttachments(handle)` | Drops inbound payloads that no frame consumed. |
-| `takeCoreFetch(runtime)` | Takes the pending bounded Gateway request as `{ request, body }`: a JSON metadata Buffer with the positive `fetchHandle`, method, URL, and headers, and the raw request body Buffer. |
+| `takeCoreFetch(runtime)` | Takes the pending Gateway request as `{ request, body }`: a JSON metadata Buffer with the positive `fetchHandle`, method, URL, and headers, and the raw request body Buffer. |
 | `coreFetchActive(runtime, fetchHandle)` | Reports whether that request may still receive host response operations. |
 | `coreFetchDisposition(runtime, fetchHandle)` | Atomically reports retired (`0`), active (`1`), or explicitly consumed (`2`) for the exact handle. Matching consumption takes precedence. This additive export is optional for version 4 addons. |
 | `startCoreFetchResponse(runtime, fetchHandle, status)` | Publishes the matching fetch response status. |
@@ -115,7 +115,7 @@ Creating a core performs these steps:
 1. Atomically reserve one of 64 process-wide runtime slots.
 2. Read and copy bounded configuration strings from the JavaScript options object.
 3. Validate the Gateway endpoint.
-4. Allocate a `Runtime` and bounded fetch bridge using Zig's C allocator.
+4. Allocate a `Runtime` and fetch bridge using Zig's C allocator.
 5. Spawn one native thread.
 6. Run `acp_server.runWithTransport()` on that thread using callback-backed ACP queues and the shared host-stream provider.
 
