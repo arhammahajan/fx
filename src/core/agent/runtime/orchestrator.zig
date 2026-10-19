@@ -7596,7 +7596,7 @@ fn processQueuedPromptLoop(
                     deps.agent_stream_provider,
                     &request_data,
                     built_request_body,
-                    .{ .max_request_bytes = request_image_budget.maxRequestBytes(agent.requestByteLimit(gateway_model)) },
+                    .{ .max_request_bytes = agent.requestByteLimit(gateway_model) orelse request_image_budget.default_max_request_bytes },
                     config.max_tool_result_bytes,
                     deps.image_blob_dir,
                     step_ctx,

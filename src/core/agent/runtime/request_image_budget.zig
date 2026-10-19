@@ -25,12 +25,6 @@ pub const Limits = struct {
     max_images: usize = default_max_request_images,
 };
 
-/// The size a request must fit: the limit learned from the provider, else
-/// the default.
-pub fn maxRequestBytes(learned: ?usize) usize {
-    return learned orelse default_max_request_bytes;
-}
-
 /// Returns how many of the oldest images must leave a request of
 /// `request_bytes` for it to fit `limits`. `image_bytes` holds each image's
 /// serialized size, oldest first. Returns `image_bytes.len` when the request
@@ -172,11 +166,6 @@ test "oldest images leave until the request fits" {
     try std.testing.expectEqual(@as(usize, 3), oldestImagesToWithhold(&sizes, 1300, limits));
     try std.testing.expectEqual(@as(usize, 3), oldestImagesToWithhold(&sizes, 50_000, limits));
     try std.testing.expectEqual(@as(usize, 0), oldestImagesToWithhold(&.{}, 50_000, limits));
-}
-
-test "a request fits the limit learned from the provider, else the default" {
-    try std.testing.expectEqual(default_max_request_bytes, maxRequestBytes(null));
-    try std.testing.expectEqual(@as(usize, 4000), maxRequestBytes(4000));
 }
 
 test "oldest images leave when a request carries too many" {

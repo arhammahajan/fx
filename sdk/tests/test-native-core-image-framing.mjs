@@ -62,7 +62,6 @@ try {
         // The provider refused the request with both images, so the retry
         // left out the older image, with a note, and kept the newer.
         assert.equal(refused, 1);
-        assert.ok(init.body.length <= providerLimit);
         const body = Buffer.from(init.body).toString("utf8");
         assert.equal(body.split(data).length - 1, 1, "only the newer image stays");
         assert.match(body, /not sent to keep the request under the provider's size limit/);

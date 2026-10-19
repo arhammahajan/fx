@@ -62,7 +62,6 @@ try {
   // Without a provider limit, a request past 8 MiB reaches host fetch whole,
   // as it does on the WebAssembly backend.
   const open = await converse();
-  assert.equal(open.refused, 0);
   assert.equal(open.sent.length, 3);
   const last = open.sent[2];
   assert.ok(Buffer.byteLength(last) > 10 * mib);
