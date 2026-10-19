@@ -90,19 +90,11 @@ function createIsolatedRoot(): IsolatedRoot {
   };
 }
 
-// Trace log of the current session's `permission` scope. `decide` reads it to
-// tell an accepted affirmative choice from one fx held back as not yet ready.
-let permissionTracePath: string | null = null;
-
 function gatewayEnv(
   root: IsolatedRoot,
   gateway: ReturnType<typeof startFakeGateway>,
   overrides: Record<string, string | undefined> = {},
 ) {
-  const tracePath = overrides.FX_TRACE_LOG ?? join(root.root, "permission-trace.log");
-  const scopes = overrides.FX_TRACE_SCOPES?.split(",").map((scope) => scope.trim()) ?? [];
-  if (!scopes.includes("permission")) scopes.push("permission");
-  permissionTracePath = tracePath;
   return {
     HOME: root.home,
     AI_GATEWAY_API_KEY: "fake-file-approval-key",
@@ -114,8 +106,28 @@ function gatewayEnv(
     FX_AUTO_UPGRADE: "0",
     NO_COLOR: "1",
     ...overrides,
-    FX_TRACE_LOG: tracePath,
-    FX_TRACE_SCOPES: scopes.filter((scope) => scope !== "").join(","),
+  };
+}
+
+// Each session's `permission` trace log, which `decide` reads to see whether
+// fx accepted or held back an affirmative file approval choice.
+const permissionTraces = new WeakMap<TmuxSession, string>();
+
+// Adds the `permission` trace scope to `overrides`, keeping any trace log and
+// scopes the test already set.
+function withPermissionTrace(
+  root: IsolatedRoot,
+  overrides: Record<string, string | undefined> = {},
+): { overrides: Record<string, string | undefined>; tracePath: string } {
+  const tracePath = overrides.FX_TRACE_LOG ?? join(root.root, "permission-trace.log");
+  const scopes = (overrides.FX_TRACE_SCOPES ?? "")
+    .split(",")
+    .map((scope) => scope.trim())
+    .filter((scope) => scope !== "");
+  if (!scopes.includes("permission")) scopes.push("permission");
+  return {
+    overrides: { ...overrides, FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: scopes.join(",") },
+    tracePath,
   };
 }
 
@@ -127,14 +139,16 @@ async function launch(
 ) {
   const stderrPath = join(root.root, "stderr.log");
   writeFileSync(stderrPath, "");
+  const traced = withPermissionTrace(root, envOverrides);
   activeSession = await TmuxSession.create({
     cmd: FX_BIN,
     cwd: root.workspace,
-    env: gatewayEnv(root, gateway, envOverrides),
+    env: gatewayEnv(root, gateway, traced.overrides),
     stderrPath,
     width: size.width ?? 120,
     height: size.height ?? 40,
   });
+  permissionTraces.set(activeSession, traced.tracePath);
   await activeSession.waitForComposer(TIMEOUT);
   return { session: activeSession, stderrPath };
 }
@@ -358,46 +372,47 @@ test("volatile token status rows normalize before file transcript comparison", (
   expect(normalizeVolatileStatusRows(["  0s (↑10 ↓5)"])).toEqual(["<status>"]);
 });
 
-function permissionTraceCounts(): { submitted: number; blocked: number } {
-  if (!permissionTracePath || !existsSync(permissionTracePath)) {
-    return { submitted: 0, blocked: 0 };
-  }
-  const trace = readFileSync(permissionTracePath, "utf8");
-  return {
-    submitted: trace.split("approval response submitted").length - 1,
-    blocked: trace.split("file_approval_confirmation_blocked").length - 1,
-  };
+function traceSize(tracePath: string): number {
+  return existsSync(tracePath) ? statSync(tracePath).size : 0;
+}
+
+function traceSince(tracePath: string, offset: number): string {
+  if (!existsSync(tracePath)) return "";
+  return readFileSync(tracePath).subarray(offset).toString("utf8");
 }
 
 // fx ignores an affirmative file approval choice until the review frame has
-// settled, so a key sent as soon as the approval text appears can be dropped
-// (`file_approval_confirmation_blocked` in `src/core/app/input_approval_runtime.zig`).
-// Resend only when the trace shows fx held that exact key back, so a resend
-// can never answer a later approval.
+// settled and logs `file_approval_confirmation_blocked`
+// (`src/core/app/input_approval_runtime.zig`), so a key sent as soon as the
+// approval text appears can be dropped. An accepted choice logs
+// `event=permission_decision` from the agent. Wait for one of the two after
+// each key and resend only after a block, so a resend can never answer a
+// later approval.
 async function decide(session: TmuxSession, choice: 1 | 2 | 3) {
-  if (choice === 3 || permissionTracePath === null) {
+  if (choice === 3) {
     await session.sendKeys(String(choice));
     return;
   }
+  const tracePath = permissionTraces.get(session);
+  if (tracePath === undefined) {
+    throw new Error(`decide needs a session started with withPermissionTrace: ${session.name}`);
+  }
   const deadline = Date.now() + TIMEOUT;
   while (true) {
-    const before = permissionTraceCounts();
+    const offset = traceSize(tracePath);
     await session.sendKeys(String(choice));
-    let after = before;
-    while (after.submitted === before.submitted) {
+    while (true) {
+      const added = traceSince(tracePath, offset);
+      if (added.includes("event=permission_decision")) return;
+      if (added.includes("file_approval_confirmation_blocked")) break;
       if (Date.now() > deadline) {
-        throw new Error(`fx never handled approval choice ${choice} in ${session.name}`);
+        throw new Error(
+          `fx neither accepted nor blocked approval choice ${choice} in ${session.name}.\n` +
+            `Trace since the key:\n${added}`,
+        );
       }
       await Bun.sleep(25);
-      after = permissionTraceCounts();
     }
-    // The blocked line follows the submitted line in the same call.
-    await Bun.sleep(50);
-    if (permissionTraceCounts().blocked === before.blocked) return;
-    if (Date.now() > deadline) {
-      throw new Error(`fx kept blocking approval choice ${choice} in ${session.name}`);
-    }
-    await Bun.sleep(100);
   }
 }
 
@@ -1555,14 +1570,16 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       ]);
       const stderrPath = join(root.root, "stderr.log");
       writeFileSync(stderrPath, "");
+      const traced = withPermissionTrace(root, { FX_DEBUG_RECORD: "1" });
       activeSession = await TmuxSession.create({
         cmd: FX_BIN,
         cwd: root.workspace,
-        env: { ...gatewayEnv(root, gateway), FX_DEBUG_RECORD: "1" },
+        env: gatewayEnv(root, gateway, traced.overrides),
         stderrPath,
         width: 180,
         height: 40,
       });
+      permissionTraces.set(activeSession, traced.tracePath);
       const session = activeSession;
 
       await session.waitForText("visual terminal capture:", TIMEOUT);
