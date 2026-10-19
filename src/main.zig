@@ -734,6 +734,8 @@ const App = struct {
                     return err;
                 };
                 SessionAppRuntime.syncTerminalTitle(&app);
+            } else {
+                SessionAppRuntime.showInterruptedTurnHint(&app);
             }
         }
         const env_disabled = if (io_mod.getenv("FX_AUTO_UPGRADE")) |val|

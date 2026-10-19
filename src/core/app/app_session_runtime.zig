@@ -2083,6 +2083,26 @@ pub fn Runtime(comptime App: type) type {
             return resumeRequestedSessionWithNotice(app, .session);
         }
 
+        /// Plain `fx`, after the session `fx -c` would open left a turn
+        /// unfinished, shows one hint line (decision 56). v1 only: the v2
+        /// store records the session each host last opened on its own.
+        pub fn showInterruptedTurnHint(app: *App) void {
+            if (comptime !@hasField(App, "session_persistence")) return;
+            if (app.session_persistence.v2_store != null) return;
+            const store = app.session_persistence.store orelse return;
+            const id = (store.readRememberedSessionId(app.alloc) catch return) orelse return;
+            defer app.alloc.free(id);
+            if (!store.hasUnfinishedTurn(id)) return;
+            debug_trace.logf("session", "event=interrupted_turn_hint id={s}", .{id});
+            app.writeDomainNotice(.{
+                .topic = "session",
+                .tone = .neutral,
+                .body = "Interrupted turn · fx -c to continue",
+            }, true) catch |err| {
+                debug_trace.logf("session", "interrupted turn hint failed err={s}", .{@errorName(err)});
+            };
+        }
+
         pub fn resumeRequestedSessionAfterUpgrade(
             app: *App,
             version: []const u8,
