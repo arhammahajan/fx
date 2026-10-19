@@ -1540,6 +1540,14 @@ const messageTypes = new Set(["prompt", "steer", "cancel", "resume"]);
 // public route, so its body may come from anyone: a worker acts only on a
 // message its session's log already holds, and runs only what that log
 // says (`tests/tla/sdk/TenantIsolation.tla` OnlySentRuns).
+// The queue's idempotency key for delivering a stored input to `agent`. A
+// forward to the agent a queued message already names takes that message's
+// key, so the queue holds the input once (`tests/tla/sdk/TenantIsolation.tla`
+// keeps its queue as a set).
+function deliveryKey(message, agent) {
+  return `${message.sessionId}:${message.type}:${message.messageId}:to:${agent}`;
+}
+
 function queuedMessage(message, store) {
   return {
     type: message.type,
@@ -1785,7 +1793,7 @@ class SessionWorker {
     const owner = state.agent ?? agentOf(message);
     if (owner !== this.agent.name) {
       await this.backend.queue.send(queuedMessage({ ...message, agent: owner }, this.backend.store), {
-        idempotencyKey: `${message.sessionId}:${message.type}:${message.messageId}:to:${owner}`,
+        idempotencyKey: deliveryKey(message, owner),
       });
       this.agent.emit("session.forwarded", { sessionId: this.sessionId, agent: owner });
       return undefined;
@@ -3143,7 +3151,7 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
         const log = await created.session(sessionId);
         await recordMessage(log, foldSessionLog(await log.read()), full);
         const queued = queuedMessage(full, created.store);
-        const idempotencyKey = `${sessionId}:${message.type}:${message.messageId}`;
+        const idempotencyKey = deliveryKey(full, agentName);
         if (inRequest && created.runInRequest) {
           await created.refreshDeadline?.();
           const deadline = deliveryDeadline(created);

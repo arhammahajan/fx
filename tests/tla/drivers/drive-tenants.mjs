@@ -116,7 +116,10 @@ const createTenantAgent = createDurableAgentFactory({
   }),
 });
 
-// The queue every World shares: each message, until a step delivers it.
+// The queue every World shares: each message, until a step delivers it. Like
+// Vercel Queues, and `sdk/tests/queue-world.mjs`, it drops a message whose
+// idempotency key a held message has, and forgets the key once that message
+// is delivered.
 const held = [];
 const keys = new Set();
 let queued = 0;
@@ -125,7 +128,7 @@ function enqueue(queueName, payload, idempotencyKey) {
   const messageId = `msg_${String(queued).padStart(6, "0")}`;
   if (idempotencyKey !== undefined && keys.has(idempotencyKey)) return { messageId };
   if (idempotencyKey !== undefined) keys.add(idempotencyKey);
-  held.push({ messageId, queueName, payload, attempt: 0 });
+  held.push({ messageId, queueName, payload, attempt: 0, key: idempotencyKey });
   return { messageId };
 }
 
@@ -327,7 +330,10 @@ async function perform(walk, act) {
       assert.ok(message, `message ${act.id} for ${act.s} on ${act.n}/${act.key} is queued`);
       message.attempt += 1;
       const { status, body } = await post(message.payload);
-      if (status === 200) held.splice(held.indexOf(message), 1);
+      if (status === 200) {
+        held.splice(held.indexOf(message), 1);
+        if (message.key !== undefined) keys.delete(message.key);
+      }
       else if (body?.code !== "FX_NO_AGENT") throw new Error(`delivery of ${act.id} failed: ${status} ${JSON.stringify(body)}`);
       return status === 200 ? "delivered" : "missed";
     }
