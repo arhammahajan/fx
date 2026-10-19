@@ -11685,6 +11685,11 @@ test "session picker cold open paints the persisted catalog before revalidation"
         };
         var writable = try store.startWritableSession(alloc, durable);
         writable.deinit(alloc);
+        // A new session records the current time as its last update, so let
+        // the clock pass this one before starting the next. In the same
+        // millisecond the order would fall back to the session ids.
+        const saved_ms = io_mod.milliTimestamp();
+        while (io_mod.milliTimestamp() <= saved_ms) io_mod.sleep(std.time.ns_per_ms / 4);
     }
     // Publish the on-disk picker catalog, then drop the in-memory copy so the
     // next open is cold, as in a freshly launched process.
