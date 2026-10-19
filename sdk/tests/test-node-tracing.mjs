@@ -8,8 +8,9 @@ import { dirname, join, resolve, sep } from "node:path";
 import { serializeError } from "./package-report.mjs";
 
 const packageDir = resolve(process.argv[2]);
-// This machine's addon package, wherever the package manager put it beside libfx.
-const nativeName = `@libfx/${process.platform}-${process.arch}`;
+// This machine's addon version, under the alias libfx installs it as,
+// wherever the package manager put it beside libfx.
+const nativeName = `libfx-${process.platform}-${process.arch}`;
 const nativeDir = dirname(createRequire(join(packageDir, "package.json")).resolve(`${nativeName}/package.json`));
 const { nodeFileTrace } = createRequire(import.meta.url)(resolve(process.argv[3]));
 const artifactRoot = process.env.LIBFX_TEST_ARTIFACT_ROOT || tmpdir();

@@ -218,9 +218,10 @@ jobs:
             zig-out/bin/fx-term.wasm
           if-no-files-found: error
 
-  # libfx ships as six packages at one version: libfx, one @libfx/<platform>
-  # per native addon (PKG-2), which libfx names as optional dependencies, and
-  # @libfx/term with the terminal (PKG-3). See sdk/scripts/package-libfx.mjs.
+  # libfx ships as five versions of the one package libfx: the release, and
+  # one version per native addon (PKG-2), which the release installs as
+  # aliased optional dependencies. See sdk/scripts/package-libfx.mjs and
+  # sdk/scripts/companion-version.mjs.
   package:
     needs: [metadata, native, wasm]
     runs-on: ubuntu-24.04
@@ -266,21 +267,32 @@ jobs:
             (.scripts | keys | all(startswith("test:"))) and
             (.dependencies == null) and
             (.devDependencies == null) and
-            ((.optionalDependencies | keys) == ["@libfx/darwin-arm64", "@libfx/darwin-x64", "@libfx/linux-arm64", "@libfx/linux-x64"]) and
+            ((.optionalDependencies | keys) == ["libfx-darwin-arm64", "libfx-darwin-x64", "libfx-linux-arm64", "libfx-linux-x64"]) and
             (.peerDependencies == null) and
             (.bin == null)
           ' sdk/package.json >/dev/null
 
           LIBFX_REQUIRE_DOCS=1 node sdk/scripts/package-libfx.mjs sdk/dist native-addons/*.node
-          # Every package has the release's version, and libfx's addons and
-          # @libfx/term's libfx are pinned to it.
-          jq -e --arg v "$LIBFX_VERSION" '.version == $v and ([.optionalDependencies[]] | length == 4 and all(. == $v))' sdk/dist/libfx/package.json >/dev/null
-          jq -e --arg v "$LIBFX_VERSION" '.version == $v and .peerDependencies == { libfx: $v }' sdk/dist/libfx-term/package.json >/dev/null
-          for platform in linux-x64 linux-arm64 darwin-x64 darwin-arm64; do
-            jq -e --arg v "$LIBFX_VERSION" '.version == $v' "sdk/dist/libfx-$platform/package.json" >/dev/null
-          done
+          # libfx has the release's version and names each addon version as
+          # an alias; each addon package is libfx at its companion version.
+          node --input-type=module -e '
+            import { readFileSync } from "node:fs";
+            import { companions, companionVersion } from "./sdk/scripts/companion-version.mjs";
+            const version = process.env.LIBFX_VERSION;
+            const manifest = (dir) => JSON.parse(readFileSync(`sdk/dist/${dir}/package.json`, "utf8"));
+            const libfx = manifest("libfx");
+            const wanted = Object.fromEntries(companions.map((name) => [`libfx-${name}`, `npm:libfx@${companionVersion(version, name)}`]));
+            if (libfx.name !== "libfx" || libfx.version !== version || JSON.stringify(libfx.optionalDependencies) !== JSON.stringify(wanted)) {
+              throw new Error(`libfx ${libfx.version} names ${JSON.stringify(libfx.optionalDependencies)}, not ${JSON.stringify(wanted)}`);
+            }
+            for (const name of companions) {
+              const companion = manifest(`libfx-${name}`);
+              if (companion.name !== "libfx" || companion.version !== companionVersion(version, name)) throw new Error(`libfx-${name} is ${companion.name}@${companion.version}`);
+              if (companion.dependencies || companion.peerDependencies || companion.optionalDependencies) throw new Error(`libfx-${name} must depend on nothing`);
+            }
+          '
           mkdir packages
-          npm pack ./sdk/dist/libfx-linux-x64 ./sdk/dist/libfx-linux-arm64 ./sdk/dist/libfx-darwin-x64 ./sdk/dist/libfx-darwin-arm64 ./sdk/dist/libfx-term ./sdk/dist/libfx \
+          npm pack ./sdk/dist/libfx-linux-x64 ./sdk/dist/libfx-linux-arm64 ./sdk/dist/libfx-darwin-x64 ./sdk/dist/libfx-darwin-arm64 ./sdk/dist/libfx \
             --ignore-scripts --pack-destination packages --json > /tmp/libfx-pack.json
           (cd packages && sha256sum -- *.tgz > SHA256SUMS)
 
@@ -288,49 +300,51 @@ jobs:
         env:
           LIBFX_VERSION: ${{ needs.metadata.outputs.version }}
         run: |
-          node -e '
+          node --input-type=module -e '
+            import { readFileSync } from "node:fs";
+            import { pathToFileURL } from "node:url";
+            // From the checkout, which sdk/tests/test-node-package.mjs runs this in too.
+            const { companionVersion } = await import(pathToFileURL("sdk/scripts/companion-version.mjs").href);
             const version = process.env.LIBFX_VERSION;
-            const reports = require("/tmp/libfx-pack.json");
+            const reports = JSON.parse(readFileSync("/tmp/libfx-pack.json", "utf8"));
             const platforms = ["linux-x64", "linux-arm64", "darwin-x64", "darwin-arm64"];
+            // Each archive is libfx at one version.
             const expected = new Map([
-              ["libfx", [
+              [version, [
                 "package.json", "README.md", "LICENSE", "browser.js", "node.js", "node.cjs", "fx-sdk.js", "wasm.js", "wasm-module.js",
                 "core-output.js", "tool-observation.js", "fetch-cleanup.js", "mcp.js", "skills.js", "skills-node.js", "subscription.js", "oauth.js", "chatgpt.js", "chatgpt-sign-in.js", "grok.js", "grok-sign-in.js", "custom-provider.js",
                 "durable.js", "fx-harness.js", "durable/local.mjs", "durable/vercel.mjs", "durable/world.mjs",
                 "types/browser.d.ts", "types/chatgpt.d.ts", "types/durable-local.d.ts", "types/durable-vercel.d.ts", "types/durable-world.d.ts", "types/grok.d.ts", "types/libfx.d.cts", "types/mcp.d.ts", "types/node.d.cts", "types/node.d.ts", "types/skills-node.d.ts", "types/skills.d.ts", "types/wasm.d.ts",
-                "fx-core.wasm",
+                "fx-core.wasm", "fx-term.wasm",
               ]],
-              ...platforms.map((platform) => [`@libfx/${platform}`, ["package.json", "README.md", "LICENSE", "index.js", `libfx.${platform}.node`]]),
-              ["@libfx/term", ["package.json", "README.md", "LICENSE", "node.js", "browser.js", "node.d.ts", "browser.d.ts", "fx-term.wasm"]],
+              ...platforms.map((platform) => [companionVersion(version, platform), ["package.json", "README.md", "LICENSE", "index.js", `libfx.${platform}.node`]]),
             ]);
-            const names = reports.map((report) => report.name);
-            if (names.length !== expected.size || new Set(names).size !== expected.size || !names.every((name) => expected.has(name))) {
-              throw new Error(`expected ${expected.size} packages, ${[...expected.keys()].join(", ")}; got ${names.join(", ")}`);
+            const versions = reports.map((report) => report.version);
+            if (!reports.every((report) => report.name === "libfx") || versions.length !== expected.size || new Set(versions).size !== expected.size || !versions.every((value) => expected.has(value))) {
+              throw new Error(`expected libfx at ${[...expected.keys()].join(", ")}; got ${reports.map((report) => `${report.name}@${report.version}`).join(", ")}`);
             }
             for (const report of reports) {
-              if (report.version !== version) throw new Error(`${report.name} is ${report.version}, not ${version}`);
               const files = new Set(report.files.map(({ path }) => path));
               let docs = 0;
-              if (report.name === "libfx") {
-                // PKG-2, PKG-3: the addons and the terminal ship in packages of their own.
-                if ([...files].some((name) => name.endsWith(".node") || name === "fx-term.wasm")) throw new Error("libfx must not carry a native addon or fx-term.wasm");
+              if (report.version === version) {
+                // PKG-2: the addons ship as versions of their own.
+                if ([...files].some((name) => name.endsWith(".node"))) throw new Error("libfx must not carry a native addon");
                 // The libfx docs pages, taken from fx.sh when the package is built.
                 if (!files.has("docs/README.md") || !files.has("docs/api.md")) throw new Error("libfx is missing the libfx docs");
                 docs = [...files].filter((name) => /^docs\/[A-Za-z0-9/-]+\.md$/.test(name)).length;
               }
-              const required = expected.get(report.name);
+              const required = expected.get(report.version);
               for (const name of required) {
-                if (!files.has(name)) throw new Error(`${report.name} is missing ${name}`);
+                if (!files.has(name)) throw new Error(`libfx@${report.version} is missing ${name}`);
               }
-              if (files.size !== required.length + docs) throw new Error(`${report.name}: unexpected file count: ${files.size}`);
-              console.log(`validated ${report.name}@${report.version}: ${report.files.length} files, ${report.size} bytes packed, ${report.unpackedSize} unpacked`);
+              if (files.size !== required.length + docs) throw new Error(`libfx@${report.version}: unexpected file count: ${files.size}`);
+              console.log(`validated libfx@${report.version}: ${report.files.length} files, ${report.size} bytes packed, ${report.unpackedSize} unpacked`);
             }
           '
 
       # Pull request CI runs the full package qualification (Next, resilience,
       # every module format). Publishing only proves these exact archives
-      # install and run on each backend: libfx with the linux-x64 addon, and
-      # @libfx/term.
+      # install and run on each backend: libfx with the linux-x64 addon.
       - name: Smoke test the installed packages
         env:
           LIBFX_VERSION: ${{ needs.metadata.outputs.version }}
@@ -379,49 +393,37 @@ jobs:
             exit 1
           fi
 
-      # Trusted publishing can't create a package, so a missing one stops the
-      # release here, before any package of this version is published.
-      - name: Confirm every package exists on npm
-        run: |
-          set -euo pipefail
-          missing=()
-          for name in @libfx/linux-x64 @libfx/linux-arm64 @libfx/darwin-x64 @libfx/darwin-arm64 @libfx/term libfx; do
-            if ! output=$(npm view "$name" name --registry=https://registry.npmjs.org/ 2>&1); then
-              if grep -q E404 <<<"$output"; then
-                missing+=("$name")
-              else
-                echo "$output" >&2
-                echo "::error::could not look up ${name} on npm"
-                exit 1
-              fi
-            fi
-          done
-          if [ "${#missing[@]}" -gt 0 ]; then
-            echo "::error::Not on npm yet: ${missing[*]}. Trusted publishing cannot create a package: create each one on npmjs.com and add this workflow as its trusted publisher (repository vercel-labs/fx, workflow publish-libfx.yml, environment npm), then run this workflow again."
-            exit 1
-          fi
-
-      # The packages libfx depends on go first, so libfx never appears on the
-      # registry before them. A version already published is left as it is,
-      # so a rerun after a partial publish finishes the rest.
+      # The addon versions go first, so the release never appears on the
+      # registry before the versions it installs. They go under a dist-tag of
+      # their own (`addon`, or `addon-dev` on the dev channel), so `latest`
+      # and `dev` only ever name a release. A version already
+      # published is left as it is, so a rerun after a partial publish
+      # finishes the rest.
       - name: Publish the verified archives with npm trusted publishing
         env:
+          CHANNEL: ${{ needs.metadata.outputs.channel }}
           LIBFX_VERSION: ${{ needs.metadata.outputs.version }}
           NPM_TAG: ${{ needs.metadata.outputs.npm_tag }}
         run: |
           set -euo pipefail
           publish() {
-            if npm view "$1@${LIBFX_VERSION}" version --registry=https://registry.npmjs.org/ >/dev/null 2>&1; then
-              echo "$1@${LIBFX_VERSION} is already published; leaving ${NPM_TAG} unchanged"
+            if npm view "libfx@$1" version --registry=https://registry.npmjs.org/ >/dev/null 2>&1; then
+              echo "libfx@$1 is already published; leaving $2 unchanged"
               return
             fi
-            npm publish "$2" --ignore-scripts --access public --tag "$NPM_TAG" --provenance
+            # `./`: npm reads `packages/<file>.tgz` as a GitHub repository.
+            npm publish "./packages/libfx-$1.tgz" --ignore-scripts --access public --tag "$2" --provenance
           }
-          # `./`: npm reads `packages/<file>.tgz` as a GitHub repository.
-          for package in linux-x64 linux-arm64 darwin-x64 darwin-arm64 term; do
-            publish "@libfx/${package}" "./packages/libfx-${package}-${LIBFX_VERSION}.tgz"
-          done
-          publish libfx "./packages/libfx-${LIBFX_VERSION}.tgz"
+          # A failure here stops the step before anything is published.
+          companions=$(node --input-type=module -e '
+            import { companions, companionTag, companionVersion } from "./sdk/scripts/companion-version.mjs";
+            for (const name of companions) console.log(companionVersion(process.env.LIBFX_VERSION, name), companionTag(process.env.CHANNEL === "dev"));
+          ')
+          [ "$(wc -l <<<"$companions")" -eq 4 ]
+          while read -r version tag; do
+            publish "$version" "$tag"
+          done <<<"$companions"
+          publish "$LIBFX_VERSION" "$NPM_TAG"
 
   verify-published:
     needs: [metadata, publish]
@@ -444,8 +446,10 @@ jobs:
           cd packages
           sha256sum --check SHA256SUMS
           mkdir registry
-          for name in @libfx/linux-x64 @libfx/linux-arm64 @libfx/darwin-x64 @libfx/darwin-arm64 @libfx/term libfx; do
-            file=$(npm pack "${name}@${LIBFX_VERSION}" --ignore-scripts --registry=https://registry.npmjs.org/ --pack-destination registry --json | jq -r '.[0].filename')
-            cmp "$(basename "$file")" "registry/$(basename "$file")"
-            echo "${name}@${LIBFX_VERSION} on npm is the archive this workflow tested"
+          for file in libfx-*.tgz; do
+            version=${file#libfx-}
+            version=${version%.tgz}
+            fetched=$(npm pack "libfx@${version}" --ignore-scripts --registry=https://registry.npmjs.org/ --pack-destination registry --json | jq -r '.[0].filename')
+            cmp "$file" "registry/$(basename "$fetched")"
+            echo "libfx@${version} on npm is the archive this workflow tested"
           done

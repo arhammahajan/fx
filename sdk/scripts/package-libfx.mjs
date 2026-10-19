@@ -1,17 +1,19 @@
 #!/usr/bin/env node
-// Assembles libfx and the packages that ship beside it, each in a directory of
-// its own under <dist> (default sdk/dist), ready for `npm pack` or
-// `npm publish`:
+// Assembles libfx and the versions of libfx that ship beside it, each in a
+// directory of its own under <dist> (default sdk/dist), ready for `npm pack`
+// or `npm publish`:
 //
-//   <dist>/libfx             libfx: the JavaScript, fx-core.wasm, types and docs
-//   <dist>/libfx-<platform>  @libfx/<platform>: one native addon (PKG-2)
-//   <dist>/libfx-term        @libfx/term: fx-term.wasm and its entry (PKG-3)
+//   <dist>/libfx             libfx: the JavaScript, both .wasm files, types and docs
+//   <dist>/libfx-<platform>  libfx@<version>-0.<platform>: one native addon (PKG-2)
 //
 // With no addons named, it packages zig-out/lib/libfx.node as this machine's
-// platform. A release names all four, as `libfx.<platform>.node`. Every
-// package gets the version in LIBFX_VERSION, or sdk/package.json's, and libfx
-// names its platform packages, and @libfx/term names libfx, at exactly that
-// version.
+// platform. A release names all four, as `libfx.<platform>.node`. libfx gets
+// the version in LIBFX_VERSION, or sdk/package.json's, and the others the
+// versions companion-version.mjs derives from it. libfx installs each addon
+// version as the optional dependency `libfx-<platform>`, an npm alias, so no
+// package but libfx exists on npm. The terminal's fx-term.wasm stays in libfx:
+// as a version of its own, the alias an app saves for it would resolve to the
+// release on its next fresh install.
 //
 //   node sdk/scripts/package-libfx.mjs [<dist>] [<addon>...]
 import { spawnSync } from "node:child_process";
@@ -19,6 +21,7 @@ import { existsSync } from "node:fs";
 import { cp, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, posix, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { companionVersion } from "./companion-version.mjs";
 
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
 const repoRoot = resolve(scriptDir, "../..");
@@ -60,20 +63,13 @@ const libfxFiles = [
   ["sdk/skills.js", "skills.js"],
   ["sdk/skills-node.js", "skills-node.js"],
   ["zig-out/bin/fx-core.wasm", "fx-core.wasm"],
-];
-const termFiles = [
-  ["sdk/term/README.md", "README.md"],
-  ["LICENSE", "LICENSE"],
-  ["sdk/term/node.js", "node.js"],
-  ["sdk/term/browser.js", "browser.js"],
-  ["sdk/term/node.d.ts", "node.d.ts"],
-  ["sdk/term/browser.d.ts", "browser.d.ts"],
   ["zig-out/bin/fx-term.wasm", "fx-term.wasm"],
 ];
 
 const libfxManifest = JSON.parse(await readFile(resolve(repoRoot, "sdk/package.json"), "utf8"));
 const version = process.env.LIBFX_VERSION || libfxManifest.version;
-const platformPackages = Object.keys(platforms).map((platform) => `@libfx/${platform}`).sort();
+// The names libfx installs its addon versions under (npm aliases).
+const platformPackages = Object.keys(platforms).map((platform) => `libfx-${platform}`).sort();
 if (JSON.stringify(Object.keys(libfxManifest.optionalDependencies ?? {}).sort()) !== JSON.stringify(platformPackages) ||
     JSON.stringify(Object.keys(libfxManifest.peerDependenciesMeta ?? {}).sort()) !== JSON.stringify(platformPackages)) {
   throw new Error(`sdk/package.json must list exactly ${platformPackages.join(", ")} in optionalDependencies and peerDependenciesMeta`);
@@ -97,9 +93,8 @@ if (requestedNativeAddons.length) {
 }
 
 const libfxDir = resolve(distDir, "libfx");
-const termDir = resolve(distDir, "libfx-term");
 const platformDir = (platform) => resolve(distDir, `libfx-${platform}`);
-for (const dir of [libfxDir, termDir, ...Object.keys(platforms).map(platformDir)]) {
+for (const dir of [libfxDir, ...Object.keys(platforms).map(platformDir)]) {
   await rm(dir, { recursive: true, force: true });
 }
 await mkdir(libfxDir, { recursive: true });
@@ -143,10 +138,10 @@ await writeManifest(libfxDir, {
   ...libfxManifest,
   version,
   files: undefined,
-  optionalDependencies: Object.fromEntries(platformPackages.map((name) => [name, version])),
+  optionalDependencies: Object.fromEntries(Object.keys(platforms).map((platform) => [`libfx-${platform}`, `npm:libfx@${companionVersion(version, platform)}`])),
 });
 
-// One package for each addon.
+// One version of libfx for each addon.
 for (const { path, platform } of nativeAddons) {
   if (!path.endsWith(".node")) throw new Error(`native addon must end in .node: ${path}`);
   const { os, cpu, libc, label } = platforms[platform];
@@ -158,9 +153,9 @@ for (const { path, platform } of nativeAddons) {
   // The URL bundlers and tracers follow to the addon (PKG-10); libfx loads it.
   await writeFile(resolve(dir, "index.js"), `export default new URL("./${addon}", import.meta.url);\n`);
   await writeFile(resolve(dir, "README.md"), [
-    `# @libfx/${platform}`,
+    `# libfx ${companionVersion(version, platform)}`,
     "",
-    `The native addon of [libfx](https://www.npmjs.com/package/libfx) for ${label}. libfx lists it as an optional dependency, so installing libfx installs it on this platform only. Install libfx, not this package.`,
+    `The native addon of [libfx](https://www.npmjs.com/package/libfx) ${version} for ${label}. libfx ${version} installs this version as its optional dependency \`libfx-${platform}\`, on this platform only. Install libfx, not this version.`,
     "",
     "## License",
     "",
@@ -168,9 +163,9 @@ for (const { path, platform } of nativeAddons) {
     "",
   ].join("\n"));
   await writeManifest(dir, {
-    name: `@libfx/${platform}`,
-    version,
-    description: `The ${platform} native addon of libfx`,
+    name: "libfx",
+    version: companionVersion(version, platform),
+    description: `The ${platform} native addon of libfx ${version}`,
     type: "module",
     repository: libfxManifest.repository,
     homepage: libfxManifest.homepage,
@@ -185,18 +180,10 @@ for (const { path, platform } of nativeAddons) {
   });
 }
 
-// @libfx/term.
-await mkdir(termDir, { recursive: true });
-for (const [source, destination] of termFiles) {
-  await cp(resolve(repoRoot, source), resolve(termDir, destination));
-}
-const termManifest = JSON.parse(await readFile(resolve(repoRoot, "sdk/term/package.json"), "utf8"));
-await writeManifest(termDir, { ...termManifest, version, peerDependencies: { ...termManifest.peerDependencies, libfx: version } });
-
 console.log(`packaged libfx ${version} in ${distDir}`);
-for (const dir of [libfxDir, ...nativeAddons.map(({ platform }) => platformDir(platform)), termDir]) {
+for (const dir of [libfxDir, ...nativeAddons.map(({ platform }) => platformDir(platform))]) {
   const manifest = JSON.parse(await readFile(resolve(dir, "package.json"), "utf8"));
-  console.log(`${manifest.name} (${basename(dir)}/)`);
+  console.log(`${manifest.name}@${manifest.version} (${basename(dir)}/)`);
   for (const file of (await readdir(dir, { recursive: true, withFileTypes: true })).filter((entry) => entry.isFile())) {
     console.log(`  ${relative(dir, resolve(file.parentPath, file.name))}`);
   }

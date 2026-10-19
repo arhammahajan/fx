@@ -6,11 +6,12 @@ import { cp, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { nativePackageBeside, nativePlatform } from "./package-siblings.mjs";
+import { nativeAlias, nativePackageBeside, nativePlatform } from "./package-siblings.mjs";
 
 const repoRoot = fileURLToPath(new URL("../..", import.meta.url));
-// Where the native addon is installed: in this platform's package (PKG-2).
-const nativePackage = join("node_modules", "@libfx", nativePlatform);
+// Where the native addon is installed: in this platform's addon version of
+// libfx, under the alias libfx installs it as (PKG-2).
+const nativePackage = join("node_modules", nativeAlias);
 const captureLimit = 8 * 1024 * 1024;
 
 function parseArgs(argv) {
@@ -96,8 +97,8 @@ async function packageIdentity(packageDir, input, inputType) {
   };
 }
 
-// libfx with this machine's addon package from beside it, where
-// sdk/scripts/package-libfx.mjs and `npm pack` put it.
+// libfx with this machine's addon version from beside it, where
+// sdk/scripts/package-libfx.mjs and `npm pack` put it, under its alias.
 async function installPackage(input, consumerDir, npmBin) {
   const inputStat = await stat(input);
   const native = nativePackageBeside(input);
@@ -108,7 +109,7 @@ async function installPackage(input, consumerDir, npmBin) {
     if (native) await cp(native, join(consumerDir, nativePackage), { recursive: true });
     return "staged-directory-copy";
   }
-  const npmArgs = ["install", "--ignore-scripts", "--no-audit", "--no-fund", "--no-package-lock", input, ...(native ? [native] : [])];
+  const npmArgs = ["install", "--ignore-scripts", "--no-audit", "--no-fund", "--no-package-lock", `libfx@file:${input}`, ...(native ? [`${nativeAlias}@file:${native}`] : [])];
   const npmIsJavaScript = npmBin.endsWith(".js") || npmBin.endsWith(".cjs");
   await runProcess({
     label: "tarball installation",

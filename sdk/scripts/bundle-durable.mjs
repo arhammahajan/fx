@@ -136,6 +136,10 @@ for (const name of ["local", "vercel", "world"]) {
     minify: true,
     // cbor-x prefers an optional native addon and falls back without it.
     external: ["cbor-extract"],
+    // An ES module has no __dirname, and Bun would write in this machine's
+    // path for each module that reads one, such as @vercel/queue's. Undefined,
+    // they fall back to import.meta.url, the bundle's own location.
+    define: { __dirname: "undefined", __filename: "undefined" },
     plugins: [pinWorldVersion, recordFenceLockHolder, placeStreamChunks, noUndici],
     metafile: true,
   });
@@ -146,6 +150,10 @@ for (const name of ["local", "vercel", "world"]) {
   const bundled = Object.keys(result.metafile.inputs).filter((input) => /(^|[\\/])node_modules[\\/]undici[\\/]/.test(input));
   if (bundled.length > 0) throw new Error(`durable/${name}.mjs would bundle undici: ${bundled.slice(0, 3).join(", ")}`);
   const inputs = Object.keys(result.metafile.inputs);
+  const repoRoot = fileURLToPath(new URL("../..", import.meta.url)).replace(/[\\/]$/, "");
+  for (const output of result.outputs) {
+    if ((await output.text()).includes(repoRoot)) throw new Error(`durable/${name}.mjs carries this machine's path ${repoRoot}`);
+  }
   if (name === "local" && !inputs.some((input) => /(^|[\\/])world-local-fence-lock\.mjs$/.test(input))) {
     throw new Error("durable/local.mjs bundles world-local without the fence lock patch");
   }

@@ -115,27 +115,28 @@
     "skills.js",
     "skills-node.js",
     "fx-core.wasm",
+    "fx-term.wasm",
     "README.md",
     "docs/",
     "LICENSE"
   ],
   "optionalDependencies": {
-    "@libfx/darwin-arm64": "0.0.0",
-    "@libfx/darwin-x64": "0.0.0",
-    "@libfx/linux-arm64": "0.0.0",
-    "@libfx/linux-x64": "0.0.0"
+    "libfx-darwin-arm64": "npm:libfx@0.0.0-0.darwin-arm64",
+    "libfx-darwin-x64": "npm:libfx@0.0.0-0.darwin-x64",
+    "libfx-linux-arm64": "npm:libfx@0.0.0-0.linux-arm64",
+    "libfx-linux-x64": "npm:libfx@0.0.0-0.linux-x64"
   },
   "peerDependenciesMeta": {
-    "@libfx/darwin-arm64": {
+    "libfx-darwin-arm64": {
       "optional": true
     },
-    "@libfx/darwin-x64": {
+    "libfx-darwin-x64": {
       "optional": true
     },
-    "@libfx/linux-arm64": {
+    "libfx-linux-arm64": {
       "optional": true
     },
-    "@libfx/linux-x64": {
+    "libfx-linux-x64": {
       "optional": true
     }
   },

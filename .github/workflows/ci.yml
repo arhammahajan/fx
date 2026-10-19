@@ -453,15 +453,15 @@ jobs:
           node --experimental-wasm-jspi sdk/tests/test-node-bundled-assets.mjs
           node sdk/tests/test-node-package.mjs
           node sdk/tests/test-term-demo-package.mjs
-          # libfx, @libfx/<platform> for each addon, and @libfx/term, in sdk/dist.
+          # libfx, and the libfx version for each addon, in sdk/dist.
           node sdk/scripts/package-libfx.mjs sdk/dist native-addons/libfx.linux-x64.node native-addons/libfx.linux-arm64.node native-addons/libfx.darwin-x64.node native-addons/libfx.darwin-arm64.node
           node --experimental-wasm-jspi sdk/tests/test-node-async-assets.mjs sdk/dist
           node sdk/tests/test-world-local-fence-lock.mjs sdk/dist/libfx
           node sdk/tests/test-world-local-stream-place.mjs sdk/dist/libfx
-          # The tests install libfx's tarball with this runner's addon package
-          # and @libfx/term from beside it, as npm would from the registry.
+          # The tests install libfx's tarball with this runner's addon version
+          # from beside it, as npm would from the registry.
           mkdir -p /tmp/libfx-packages
-          npm pack ./sdk/dist/libfx ./sdk/dist/libfx-linux-x64 ./sdk/dist/libfx-term --ignore-scripts --pack-destination /tmp/libfx-packages --json > /tmp/libfx-pack.json
+          npm pack ./sdk/dist/libfx ./sdk/dist/libfx-linux-x64 --ignore-scripts --pack-destination /tmp/libfx-packages --json > /tmp/libfx-pack.json
           libfx_tgz="/tmp/libfx-packages/$(node -p 'require("/tmp/libfx-pack.json")[0].filename')"
           echo "LIBFX_TGZ=$libfx_tgz" >> "$GITHUB_ENV"
           node sdk/tests/test-packed-example.mjs "$libfx_tgz" native esm

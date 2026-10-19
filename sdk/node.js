@@ -36,9 +36,7 @@ const fetchOperationBackpressure = 2;
 
 const nodeRequire = createRequire(import.meta.url);
 const defaultCoreWasm = new URL("./fx-core.wasm", import.meta.url);
-// The terminal's WebAssembly ships in @libfx/term (PKG-3), whose
-// createFxTerminal() passes it as `wasm`.
-const terminalWasmRequired = 'createFxTerminal() needs the fx terminal\'s WebAssembly, which ships in @libfx/term: import createFxTerminal from "@libfx/term", or pass wasm';
+const defaultTermWasm = new URL("./fx-term.wasm", import.meta.url);
 let nativeBackendPromise;
 const wasmFilePromises = new Map();
 
@@ -137,35 +135,37 @@ async function loadNativeCandidate(candidate) {
   return imported.default ?? imported;
 }
 
-// Each platform's addon is a package of its own, an optional dependency that
-// npm, pnpm and Bun install only on its platform (PKG-2). Its module exports
+// Each platform's addon is a version of libfx of its own, such as
+// libfx@0.0.15-0.linux-x64, that libfx installs as the optional dependency
+// `libfx-<platform>`, an npm alias; npm, pnpm and Bun install it only on its
+// platform (PKG-2). Its module exports
 // `new URL("./libfx.<platform>.node", import.meta.url)`, so a bundler copies
 // the addon into its output and rewrites the URL, and tracers keep the file
-// (PKG-10). The imports name each package literally, with no bundler hints,
+// (PKG-10). The imports name each alias literally, with no bundler hints,
 // so that bundlers follow them: Turbopack keeps only the build machine's
 // branch, and Next.js's webpack turns the packages that aren't installed into
 // empty modules because package.json lists them in `peerDependenciesMeta`.
-// Returns the package's name and the URL it exports, or null on a platform
+// Returns the alias and the URL its module exports, or null on a platform
 // with no addon.
 async function platformAddon() {
   if (process.platform === "linux" && process.arch === "x64") {
-    return { name: "@libfx/linux-x64", url: (await import("@libfx/linux-x64")).default };
+    return { name: "libfx-linux-x64", url: (await import("libfx-linux-x64")).default };
   }
   if (process.platform === "linux" && process.arch === "arm64") {
-    return { name: "@libfx/linux-arm64", url: (await import("@libfx/linux-arm64")).default };
+    return { name: "libfx-linux-arm64", url: (await import("libfx-linux-arm64")).default };
   }
   if (process.platform === "darwin" && process.arch === "x64") {
-    return { name: "@libfx/darwin-x64", url: (await import("@libfx/darwin-x64")).default };
+    return { name: "libfx-darwin-x64", url: (await import("libfx-darwin-x64")).default };
   }
   if (process.platform === "darwin" && process.arch === "arm64") {
-    return { name: "@libfx/darwin-arm64", url: (await import("@libfx/darwin-arm64")).default };
+    return { name: "libfx-darwin-arm64", url: (await import("libfx-darwin-arm64")).default };
   }
   return null;
 }
 
 function platformPackageName() {
   const platform = `${process.platform}-${process.arch}`;
-  return ["linux-x64", "linux-arm64", "darwin-x64", "darwin-arm64"].includes(platform) ? `@libfx/${platform}` : null;
+  return ["linux-x64", "linux-arm64", "darwin-x64", "darwin-arm64"].includes(platform) ? `libfx-${platform}` : null;
 }
 
 // The platform package is missing: npm skipped it, as with `--omit=optional`,
@@ -386,11 +386,6 @@ export async function getBackendInfo(value = {}) {
     if (backend === "native") return { surface, backend: "unavailable", attempts };
   }
 
-  const wasmSource = wasm ?? (surface === "agent" ? defaultCoreWasm : undefined);
-  if (wasmSource === undefined) {
-    attempts.push({ backend: "wasm-jspi", available: false, reason: reason(backendReasonCodes.wasmLoad, terminalWasmRequired) });
-    return { surface, backend: "unavailable", attempts };
-  }
   if (!supportsJspi()) {
     attempts.push({
       backend: "wasm-jspi",
@@ -402,6 +397,8 @@ export async function getBackendInfo(value = {}) {
     });
     return { surface, backend: "unavailable", attempts };
   }
+  const defaultWasm = surface === "agent" ? defaultCoreWasm : defaultTermWasm;
+  const wasmSource = wasm ?? defaultWasm;
   try {
     await loadModule(await wasmInput(wasmSource));
     attempts.push({ backend: "wasm-jspi", available: true, reason: null });
@@ -726,8 +723,6 @@ async function createWithFallback(surface, nativeMethod, wasmFactory, defaultWas
     }
   }
 
-  const wasmSource = runtimeOptions.wasm ?? defaultWasm;
-  if (wasmSource === undefined) throw nativeAttempted ? nativeError : new TypeError(terminalWasmRequired);
   if (!supportsJspi()) {
     if (overLimit) throw nativeLimitError(nativeError);
     if (nativeAttempted) throw nativeError;
@@ -738,6 +733,7 @@ async function createWithFallback(surface, nativeMethod, wasmFactory, defaultWas
       runtimeOptions.onEvent?.({ type: "runtime.fallback", timestamp: performance.now(), backend: "wasm", code: nativeError.code, message: nativeError.message });
     } catch {}
   }
+  const wasmSource = runtimeOptions.wasm ?? defaultWasm;
   return wasmFactory({ ...runtimeOptions, wasm: await wasmInput(wasmSource) });
 }
 
@@ -819,5 +815,5 @@ export const createFxAgent = createDurableAgentFactory({
 });
 
 export function createFxTerminal(options = {}) {
-  return createWithFallback("terminal", "createFxTerminal", createWasmTerminal, undefined, options);
+  return createWithFallback("terminal", "createFxTerminal", createWasmTerminal, defaultTermWasm, options);
 }

@@ -106,14 +106,14 @@ try {
     (error) => error?.code === "ERR_MODULE_NOT_FOUND",
   );
 
-  // PKG-2: the addon comes from this platform's package, which the
-  // repository's sdk/ doesn't have installed.
+  // PKG-2: the addon comes from this platform's addon version of libfx,
+  // libfx-<platform>, which the repository's sdk/ doesn't have installed.
   const defaultMissing = await getBackendInfo({ backend: "native" });
   assert.equal(defaultMissing.backend, "unavailable");
   assert.equal(defaultMissing.attempts[0].reason.code, "LIBFX_NATIVE_ARTIFACT_MISSING");
   assert.equal(defaultMissing.attempts[0].reason.causeCode, "ERR_MODULE_NOT_FOUND");
   assert.equal(defaultMissing.attempts[0].reason.message,
-    `native addon artifact was not found: @libfx/${process.platform}-${process.arch} is not installed; it holds libfx's native addon for ${process.platform}-${process.arch}`);
+    `native addon artifact was not found: libfx-${process.platform}-${process.arch} is not installed; it holds libfx's native addon for ${process.platform}-${process.arch}`);
   await assert.rejects(
     createFxEngine({ backend: "native", apiKey: "missing-default-key" }),
     (error) => error?.code === "LIBFX_NATIVE_UNAVAILABLE",
@@ -122,17 +122,6 @@ try {
     createFxTerminal({ backend: "native" }),
     (error) => error?.code === "LIBFX_NATIVE_UNAVAILABLE",
   );
-
-  // PKG-3: libfx carries no terminal WebAssembly; @libfx/term passes it.
-  const terminalWasmRequired = 'createFxTerminal() needs the fx terminal\'s WebAssembly, which ships in @libfx/term: import createFxTerminal from "@libfx/term", or pass wasm';
-  for (const backend of ["auto", "wasm"]) {
-    assert.deepEqual((await getBackendInfo({ surface: "terminal", backend, nativeAddon: false })).attempts.at(-1), {
-      backend: "wasm-jspi",
-      available: false,
-      reason: { code: "LIBFX_WASM_LOAD_FAILED", message: terminalWasmRequired },
-    });
-    await assert.rejects(createFxTerminal({ backend, nativeAddon: false, terminal: {} }), { name: "TypeError", message: terminalWasmRequired });
-  }
 
   const corrupt = await getBackendInfo({ backend: "native", nativeAddon: corruptAddon });
   assert.equal(corrupt.backend, "unavailable");

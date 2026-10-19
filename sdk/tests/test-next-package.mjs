@@ -11,7 +11,7 @@ import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { serializeError } from "./package-report.mjs";
-import { nativePackageBeside, nativePlatform } from "./package-siblings.mjs";
+import { nativeAlias, nativePackageBeside, nativePlatform } from "./package-siblings.mjs";
 
 const tarball = resolve(process.argv[2]);
 const nativeTarball = nativePackageBeside(tarball);
@@ -209,12 +209,13 @@ try {
   manifest.dependencies.libfx = "file:./libfx.tgz";
   if (next15) manifest.dependencies.next = "15.5.25";
   await writeFile(resolve(app, "package.json"), JSON.stringify(manifest, null, 2));
-  // libfx's optional dependency on this machine's addon package resolves to
-  // the tarball beside libfx's instead of the registry, and pnpm links it
-  // beside libfx as it would a registry install (PKG-2).
-  assert.ok(nativeTarball, `no @libfx/${nativePlatform} tarball beside ${tarball}`);
+  // libfx's optional dependency on this machine's addon version, the alias
+  // libfx-<platform>, resolves to the tarball beside libfx's instead of the
+  // registry, and pnpm links it beside libfx as it would a registry install
+  // (PKG-2).
+  assert.ok(nativeTarball, `no ${nativeAlias} tarball beside ${tarball}`);
   await cp(nativeTarball, resolve(app, "libfx-native.tgz"));
-  await writeFile(resolve(app, "pnpm-workspace.yaml"), `overrides:\n  "@libfx/${nativePlatform}": "file:./libfx-native.tgz"\n`);
+  await writeFile(resolve(app, "pnpm-workspace.yaml"), `overrides:\n  "${nativeAlias}": "file:./libfx-native.tgz"\n`);
   await run(process.env.PNPM_BIN || "pnpm", ["install", "--no-frozen-lockfile", "--ignore-scripts"], app, "install");
   const require = createRequire(resolve(app, "package.json"));
   if (!next15) {

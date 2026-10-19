@@ -59,11 +59,12 @@ try {
     await cp(resolve(input), resolve(app, "libfx.tgz"));
     manifest.dependencies.libfx = "file:./libfx.tgz";
     // Vercel installs and runs on linux-x64: libfx's optional dependency on
-    // that addon package resolves to the tarball beside libfx's (PKG-2).
+    // that addon version, the alias libfx-linux-x64, resolves to the tarball
+    // beside libfx's (PKG-2).
     const native = packageBeside(resolve(input), "linux-x64");
-    assert.ok(native, `no @libfx/linux-x64 tarball beside ${input}`);
+    assert.ok(native, `no libfx-linux-x64 tarball beside ${input}`);
     await cp(native, resolve(app, "libfx-linux-x64.tgz"));
-    await writeFile(resolve(app, "pnpm-workspace.yaml"), 'overrides:\n  "@libfx/linux-x64": "file:./libfx-linux-x64.tgz"\n');
+    await writeFile(resolve(app, "pnpm-workspace.yaml"), 'overrides:\n  "libfx-linux-x64": "file:./libfx-linux-x64.tgz"\n');
   } else {
     assert.match(input, /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/, "pin an immutable version, not a tag");
     manifest.dependencies.libfx = input;

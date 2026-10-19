@@ -522,7 +522,7 @@ A checkpoint records the libfx version, a hash of the tool set and the model it 
 | Browsers | WebAssembly with JSPI, from `libfx/browser` |
 | Bun | The same as Node.js. For WebAssembly, use Bun 1.3.10 or newer, except 1.3.14, which can crash when WebAssembly resumes through JSPI. |
 
-Each platform's native addon is a package of its own: `@libfx/linux-x64`, `@libfx/linux-arm64`, `@libfx/darwin-x64` and `@libfx/darwin-arm64`. libfx lists them as optional dependencies, so `npm install libfx` downloads only the one for the machine it runs on, and so do pnpm and Bun. Install on the platform that runs the app: `node_modules` copied from a Mac into a Linux container has no Linux addon. Without its addon package, such as with `npm install --omit=optional` or on a musl Linux, libfx runs on WebAssembly.
+Each platform's native addon ships as a version of libfx of its own, such as `libfx@0.0.15-0.linux-x64` beside `libfx@0.0.15`. libfx lists them as optional dependencies under the names `libfx-linux-x64`, `libfx-linux-arm64`, `libfx-darwin-x64` and `libfx-darwin-arm64`, so `npm install libfx` downloads only the one for the machine it runs on, and so do pnpm and Bun. No version range you write for libfx matches one of these versions. Install on the platform that runs the app: `node_modules` copied from a Mac into a Linux container has no Linux addon. Without its addon, such as with `npm install --omit=optional` or on a musl Linux, libfx runs on WebAssembly.
 
 The default `backend: "auto"` tries the native addon first. Pass `"native"` or `"wasm"` to require one, and call `getBackendInfo()` to see what would load without creating anything. A `wasm` URL whose server answers with an error, such as a 404 for a file it doesn't serve, rejects with `LIBFX_WASM_LOAD_FAILED`, naming the URL and the status.
 
@@ -532,18 +532,12 @@ A process runs at most 64 native runtimes at once, across its worker threads. A 
 - An agent may take another native runtime while it holds fewer than 64 divided by the number of agents holding them, itself included, rounded down. The last free runtime is kept for an agent that holds none, so an agent alone holds at most 63, and a new agent's turn always starts natively.
 - An engine beyond its agent's share, with `backend: "auto"` or `"native"`, runs on WebAssembly instead, and `onEvent` gets a `runtime.fallback` event. Without JSPI, where WebAssembly can't run, `createFxEngine()` rejects with `LIBFX_NATIVE_LIMIT`, naming the limit, and a durable session's turn ends with that error. libfx never waits for a native runtime to free.
 
-Next.js works in Node.js route handlers, with webpack or Turbopack, and doesn't need `serverExternalPackages`: the build copies the addon from its package into the output, so a Vercel deployment carries it. CommonJS apps can `require("libfx")`. With TypeScript's `moduleResolution: "bundler"`, add `"node"` to `customConditions` to get the Node.js types.
+Next.js works in Node.js route handlers, with webpack or Turbopack, and doesn't need `serverExternalPackages`: the build copies the addon into the output, so a Vercel deployment carries it. CommonJS apps can `require("libfx")`. With TypeScript's `moduleResolution: "bundler"`, add `"node"` to `customConditions` to get the Node.js types.
 
 ## The fx terminal in a browser
 
-The terminal is its own package, `@libfx/term`, so apps that only run agents don't download it. Install it next to libfx, at the same version:
-
-```sh
-npm install libfx @libfx/term
-```
-
 ```js
-import { createFxTerminal, xtermAdapter } from "@libfx/term";
+import { createFxTerminal, xtermAdapter } from "libfx/browser";
 
 const terminal = await createFxTerminal({
   terminal: xtermAdapter(term), // an xterm.js Terminal
@@ -553,7 +547,7 @@ const terminal = await createFxTerminal({
 await terminal.interactive;
 ```
 
-This is the fx CLI's interface compiled to WebAssembly. Your page supplies storage for its sessions, settings and sign-in, and can give it a workspace that runs commands. It works in Node.js too, and `@libfx/term/fx-term.wasm` is the WebAssembly file itself, for apps that serve it. See [Terminal](https://fx.sh/docs/lib/terminal).
+This is the fx CLI's interface compiled to WebAssembly. Your page supplies storage for its sessions, settings and sign-in, and can give it a workspace that runs commands. See [Terminal](https://fx.sh/docs/lib/terminal).
 
 The terminal's `onEvent` gets the `transport.*` diagnostics an agent's does, and `terminal.size` only when the size changes. When the session store refuses a save with `FX_SESSION_REVISION_CONFLICT`, the store keeps its record, fx says on screen that it stopped saving the conversation, and `onEvent` gets `session.persist_error`. A workspace that breaks the version 1 rules is refused: fx runs without it, says so, and `onEvent` gets `workspace.invalid` naming the rule. With `permission: "prompt"`, fx asks before a command it would otherwise review, in `auto` mode too, since the browser has no safety reviewer.
 
@@ -561,16 +555,15 @@ The terminal's `onEvent` gets the `transport.*` diagnostics an agent's does, and
 
 | Import | What's in it |
 | --- | --- |
-| `libfx` | `createFxAgent`, `createFxEngine`, `createFxTerminal`, `memory`, `listModels`, `createMemoryPersistence`, `FxFencedError`, `FxJournalVersionError`, `supportsJspi`, `xtermAdapter`, `encodeXtermKeyEvent`, and on Node.js `getBackendInfo` and `wakeHandler`. Its `createFxTerminal` needs `wasm`. |
+| `libfx` | `createFxAgent`, `createFxEngine`, `createFxTerminal`, `memory`, `listModels`, `createMemoryPersistence`, `FxFencedError`, `FxJournalVersionError`, `supportsJspi`, `xtermAdapter`, `encodeXtermKeyEvent`, and on Node.js `getBackendInfo` and `wakeHandler` |
 | `libfx/node`, `libfx/browser` | The same, for Node.js or browsers explicitly |
 | `libfx/wasm` | The WebAssembly SDK without packaged asset paths, so you pass `wasm` yourself |
 | `libfx/durable-local`, `libfx/durable-vercel`, `libfx/durable-world` | `local()`, `vercel()` and `world()` |
 | `libfx/chatgpt`, `libfx/grok` | Sign-in for ChatGPT and Grok plans, and `refreshCredentials` |
 | `libfx/mcp` | `createMcpAdapter` |
 | `libfx/skills`, `libfx/skills/node` | `createSkillsAdapter`, and `loadSkillFile` for Node.js and Bun |
-| `@libfx/term` | `createFxTerminal` with the terminal's WebAssembly, `xtermAdapter` and `encodeXtermKeyEvent`. A package of its own. |
 
-Every entry point ships TypeScript types. libfx has no runtime dependencies; its native addons are optional dependencies, one package for each platform.
+Every entry point ships TypeScript types. libfx has no runtime dependencies; its native addons are optional dependencies, one version of libfx for each platform.
 
 ## For coding agents
 
@@ -586,7 +579,7 @@ Every entry point ships TypeScript types. libfx has no runtime dependencies; its
 
 ## Upgrading from 0.0.14
 
-libfx no longer carries every platform's native addon or the terminal's WebAssembly. The addons are optional dependencies, one package per platform, which npm installs for the machine that runs `npm install`. The terminal is `@libfx/term`: install it at libfx's version and import `createFxTerminal` from it. libfx's own `createFxTerminal` now needs `wasm`.
+libfx no longer carries every platform's native addon. The addons are optional dependencies, one version of libfx per platform, which npm installs for the machine that runs `npm install`. Nothing changes in your code.
 
 ## Upgrading from 0.0.13
 
