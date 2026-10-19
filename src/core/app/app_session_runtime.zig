@@ -78,13 +78,10 @@ const Allocator = std.mem.Allocator;
 const live_session_handoff_timeout_ms: u64 = 2_000;
 const live_session_worker_cancel_timeout_ms: u64 = 5_000;
 
-const RecoveryAutoContinue = resume_decision.Decision;
-const recoveryAutoContinueDecision = resume_decision.decide;
-
 /// The notice a launch shows instead of resending. Until fx asks with its
 /// own prompt, the next message answers: "continue" resends the request
 /// with the interrupted turn, and anything else moves on (decision 53).
-fn resumeQuestion(decision: RecoveryAutoContinue) []const u8 {
+fn resumeQuestion(decision: resume_decision.Decision) []const u8 {
     return switch (decision) {
         .ask_old => "This request was interrupted more than a day ago, so it was not resent. Send \"continue\" to resend it, or a new message to move on.",
         .ask_crash_loop => "This request crashed fx twice, so it was not resent. Send \"continue\" to retry it, or a new message to move on.",
@@ -2534,7 +2531,7 @@ pub fn Runtime(comptime App: type) type {
 
             // Decide before rendering: the checkpoint replay below must not
             // promise an automatic continuation the gate is about to suppress.
-            const recovery_decision: ?RecoveryAutoContinue = if (comptime @hasDecl(App, "queueRecoveryCheckpoint"))
+            const recovery_decision: ?resume_decision.Decision = if (comptime @hasDecl(App, "queueRecoveryCheckpoint"))
                 if (state.recovery_checkpoint) |checkpoint|
                     recoveryLaunchDecision(app, checkpoint)
                 else
@@ -2641,10 +2638,10 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// Reads the recovery record beside the checkpoint and decides.
-        fn recoveryLaunchDecision(app: *App, checkpoint: session_codec.RecoveryCheckpoint) RecoveryAutoContinue {
+        fn recoveryLaunchDecision(app: *App, checkpoint: session_codec.RecoveryCheckpoint) resume_decision.Decision {
             const record = readRecoveryRecord(app);
             const binding = recoveryRecordBinding(app);
-            const decision = recoveryAutoContinueDecision(checkpoint, record, binding, io_mod.milliTimestamp());
+            const decision = resume_decision.decide(checkpoint, record, binding, io_mod.milliTimestamp());
             debug_trace.logf("session", "event=resume_decision decision={s} record={}", .{ @tagName(decision), record != null });
             return decision;
         }
@@ -4852,7 +4849,7 @@ pub fn Runtime(comptime App: type) type {
             sink: anytype,
             state: session_codec.DurableSessionState,
             labels: *HistoricalSessionLabels,
-            recovery_decision: ?RecoveryAutoContinue,
+            recovery_decision: ?resume_decision.Decision,
         ) !void {
             const checkpoint = state.recovery_checkpoint orelse return;
             var has_prior_turns = false;
@@ -11685,6 +11682,11 @@ test "session picker cold open paints the persisted catalog before revalidation"
         };
         var writable = try store.startWritableSession(alloc, durable);
         writable.deinit(alloc);
+        // A new session records the current time as its last update, so let
+        // the clock pass this one before starting the next. In the same
+        // millisecond the order would fall back to the session ids.
+        const saved_ms = io_mod.milliTimestamp();
+        while (io_mod.milliTimestamp() <= saved_ms) io_mod.sleep(std.time.ns_per_ms / 4);
     }
     // Publish the on-disk picker catalog, then drop the in-memory copy so the
     // next open is cold, as in a freshly launched process.

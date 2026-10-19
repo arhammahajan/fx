@@ -28,7 +28,8 @@ pub fn handler(sig: std.posix.SIG) callconv(.c) void {
 /// cannot run; the caller then keeps a handler of its own.
 pub fn start(restore: []const u8) bool {
     if (started) return true;
-    if (std.c.pipe(&close_pipe) != 0) return false;
+    // Close-on-exec, so the commands and servers fx starts do not inherit it.
+    close_pipe = std.Io.Threaded.pipe2(.{ .CLOEXEC = true }) catch return false;
     restore_bytes = restore;
     const thread = std.Thread.spawn(.{}, closerMain, .{}) catch |err| {
         debug_trace.logf("app", "closer unavailable err={s}", .{@errorName(err)});
