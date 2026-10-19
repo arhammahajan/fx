@@ -184,7 +184,6 @@ All untrusted values crossing the native boundary are bounded before allocation 
 | Input queue | 8 MiB |
 | Output queue | 8 MiB |
 | Encoded output message | 64 MiB |
-| Fetch request body and serialized metadata | 8 MiB |
 | One attachment | 4 MiB |
 | Pending inbound attachments | 8, totaling at most 8 MiB |
 | Pending outbound attachments | 4, totaling at most 8 MiB |
@@ -196,7 +195,7 @@ All untrusted values crossing the native boundary are bounded before allocation 
 | ACP history | 100 turns |
 | Agent steps | 64 |
 
-The fetch request budget covers the full model request, including retained history and metadata. The body crosses to Node unencoded beside its metadata, so the transfer adds no separate bound; accepting one tool result does not reserve space for later requests.
+A model request is not bounded at the native boundary. The core builds it, including the retained history, and the body crosses to Node unencoded beside its metadata, so a long conversation sends the same request on the native and WebAssembly backends. The addon frees each body once Node has taken it. The model's context window and the provider's own size limit bound the request: when a provider refuses a request as too large, the agent leaves out the oldest images or compacts the conversation, then retries.
 
 Prompt images and kernel checkpoints also cross the boundary unencoded. JavaScript writes each inbound payload with `writeCoreAttachment()` and then sends the ACP frame that references its id, an image block's `_meta.fx.attachment` or `libfx/restore`'s `checkpointAttachment`; the core thread takes the payload once while handling that frame. `libfx/checkpoint` answers with `checkpointAttachment`, and JavaScript takes those bytes with `takeCoreAttachment()`. The attachment table has its own mutex and stores C-allocator copies, so the core thread never touches JavaScript memory. JavaScript discards unconsumed inbound payloads before attaching new ones.
 
