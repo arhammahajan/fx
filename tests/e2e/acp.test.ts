@@ -1112,6 +1112,48 @@ test("ACP shell completed and replayed updates show the command output", async (
   }
 }, 45000);
 
+test("ACP finishes tool calls that a cancel stopped before they ran", async () => {
+  const root = createIsolatedRoot("fx-acp-cancel-cards-");
+  const gateway = startFakeGateway([
+    fakeGatewaySse([
+      { type: "tool-call", toolCallId: "call_slow", toolName: "shell", input: { request: { action: "run", yield_time_ms: 30_000, command: "sleep 5; echo slow" } } },
+      { type: "tool-call", toolCallId: "call_skipped", toolName: "shell", input: { request: { action: "run", command: "echo skipped" } } },
+      { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+    ]),
+  ]);
+  let client: AcpClient | undefined;
+  try {
+    client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+    await client.request("initialize", { protocolVersion: 1 }, 1);
+    const created = await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 2) as any;
+    if (created.error) throw new Error(JSON.stringify(created));
+    await client.request("session/set_mode", { modeId: "full-access" }, 3);
+    sendPrompt(client, 4, "Run both commands.");
+    await waitForCondition(
+      "slow command running",
+      () => client!.rawLines.some(line => line.includes("\"call_slow\"") && line.includes("\"in_progress\"")),
+      10_000,
+    );
+    client.send({ jsonrpc: "2.0", method: "session/cancel", params: {} });
+    const { responses } = await readUntilResponses(client, [4]);
+    expect(responses.get(4)!.result.stopReason).toBe("cancelled");
+    const updates = (id: string) => client!.rawLines
+      .map(line => JSON.parse(line))
+      .filter((message: any) => message.method === "session/update" && message.params?.update?.toolCallId === id)
+      .map((message: any) => message.params.update);
+    const slowFinals = updates("call_slow").filter((update: any) => update.status === "completed" || update.status === "failed");
+    expect(slowFinals.map((update: any) => update.status)).toEqual(["failed"]);
+    const skipped = updates("call_skipped");
+    expect(skipped.map((update: any) => update.status)).toEqual(["pending", "failed"]);
+    expect(acpContentText(skipped[1].content)).toBe("Cancelled");
+    expect(client.stderr).toBe("");
+  } finally {
+    await client?.close();
+    gateway.stop();
+    rmSync(root.root, { recursive: true, force: true });
+  }
+}, 45000);
+
 function createIsolatedRoot(prefix: string) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), prefix)));
   const home = join(root, "home");
@@ -1332,13 +1374,16 @@ function sendSteeringPrompt(client: AcpClient, id: number, text: string): void {
 }
 
 // A withheld image's original: the session's blob, which the notice names
-// and its saved prompt lists (D79).
+// (D79) and its saved prompt names by hash, without the image's bytes (D89).
 function expectSavedOriginal(home: string, sessionId: string, body: string, original: Buffer): void {
   const named = /The original is saved at (\S+)\. Use/.exec(body)?.[1];
-  const blob = join(sessionDir(home, sessionId), "blobs", createHash("sha256").update(original).digest("hex"));
+  const hash = createHash("sha256").update(original).digest("hex");
+  const blob = join(sessionDir(home, sessionId), "blobs", hash);
   expect(named).toBe(blob);
   expect(readFileSync(blob)).toEqual(original);
-  expect(savedText(home, sessionId)).toContain(blob);
+  const saved = savedText(home, sessionId);
+  expect(saved).toContain(hash);
+  expect(saved).not.toContain(original.toString("base64"));
 }
 
 async function startAutoSession(client: AcpClient, hooks = false) {
@@ -7109,8 +7154,14 @@ describe("acp: model-independent", () => {
         { type: "image", data: imageData, mimeType: "image/png" },
       ], TIMEOUT);
       expect(JSON.stringify(failed)).toContain("RequiredVisionToolCallMissing");
-      // The failed turn keeps its image inside the saved prompt (D44).
-      expect(savedText(root.home, sessionId)).toContain(imageData);
+      // The failed turn keeps its image as the session's blob, which its
+      // saved prompt names by hash, without the image's bytes (D89).
+      const imageBytes = Buffer.from(imageData, "base64");
+      const hash = createHash("sha256").update(imageBytes).digest("hex");
+      expect(readFileSync(join(sessionDir(root.home, sessionId), "blobs", hash))).toEqual(imageBytes);
+      const saved = savedText(root.home, sessionId);
+      expect(saved).toContain(hash);
+      expect(saved).not.toContain(imageData);
       await client.close();
       client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
       await client.request("initialize", { protocolVersion: 1 }, 10);
