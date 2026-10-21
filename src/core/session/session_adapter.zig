@@ -86,6 +86,77 @@ const replay_page_lines: usize = 256;
 pub const Host = sm.Host;
 pub const ChildOutcome = sm.Outcome;
 
+/// The v27 call projection used by live and replay surfaces while v2 remains
+/// the durable source during the staged cutover.
+pub const V27CallProjection = struct {
+    view: sm.v27.tables.SessionView = .{},
+    opened: bool = false,
+
+    pub fn deinit(self: *V27CallProjection, alloc: Allocator) void {
+        self.view.deinit(alloc);
+        self.* = undefined;
+    }
+
+    fn open(self: *V27CallProjection, alloc: Allocator) !void {
+        if (self.opened) return;
+        const opening = [_]sm.v27.facts.Fact{
+            sm.v27.facts.sessionStarted(.{}),
+            sm.v27.facts.turnStarted(.{ .turnId = "surface-turn", .cause = .{ .hook = "fx" }, .follows = .null }),
+            sm.v27.facts.modelRequested(.{ .runId = "surface-run", .owner = .{ .turnId = "surface-turn" } }),
+            sm.v27.facts.modelStarted(.{ .runId = "surface-run", .modelId = "fx/model", .attempt = 0 }),
+        };
+        try sm.v27.fold.foldCommit(alloc, &self.view, &opening, self.view.position, .complete);
+        self.opened = true;
+    }
+
+    pub fn requested(self: *V27CallProjection, alloc: Allocator, call: types.ToolCall) !void {
+        try self.open(alloc);
+        if (self.view.calls.contains(call.id)) return;
+        const events = [_]sm.v27.facts.Fact{sm.v27.facts.callRequested(.{
+            .callId = call.id,
+            .owner = .{ .runId = "surface-run" },
+            .capability = .{ .kind = "tool", .name = call.name },
+        })};
+        try sm.v27.fold.foldCommit(alloc, &self.view, &events, self.view.position, .complete);
+    }
+
+    pub fn started(self: *V27CallProjection, alloc: Allocator, call_id: []const u8) !void {
+        if (!self.view.calls.contains(call_id)) return;
+        const events = [_]sm.v27.facts.Fact{sm.v27.facts.callStarted(.{ .callId = call_id })};
+        try sm.v27.fold.foldCommit(alloc, &self.view, &events, self.view.position, .complete);
+    }
+
+    pub fn settled(self: *V27CallProjection, alloc: Allocator, call_id: []const u8, outcome: []const u8) !void {
+        const row = self.view.calls.get(call_id) orelse return;
+        if (std.mem.eql(u8, row.status, "settled")) return;
+        const events = [_]sm.v27.facts.Fact{sm.v27.facts.callSettled(.{ .callId = call_id, .outcome = outcome })};
+        try sm.v27.fold.foldCommit(alloc, &self.view, &events, self.view.position, .complete);
+    }
+
+    pub fn settleTurn(self: *V27CallProjection, alloc: Allocator, outcome: []const u8) !void {
+        if (!self.opened) return;
+        // Surface projections only need the fold's terminal state. Settle
+        // each remaining row with the cascade's observable outcome.
+        var ids: std.ArrayList([]const u8) = .empty;
+        defer ids.deinit(alloc);
+        var rows = self.view.calls.iterator();
+        while (rows.next()) |entry| if (!std.mem.eql(u8, entry.value_ptr.status, "settled")) try ids.append(alloc, entry.key_ptr.*);
+        for (ids.items) |id| try self.settled(alloc, id, "interrupted");
+        const ending = [_]sm.v27.facts.Fact{sm.v27.facts.turnSettled(.{ .turnId = "surface-turn", .outcome = outcome })};
+        try sm.v27.fold.foldCommit(alloc, &self.view, &ending, self.view.position, .complete);
+    }
+
+    pub fn state(self: *const V27CallProjection, call_id: []const u8) ?[]const u8 {
+        const row = self.view.calls.get(call_id) orelse return null;
+        return sm.v27.selectors.callState(row);
+    }
+
+    pub fn label(self: *const V27CallProjection, call_id: []const u8) ?[]const u8 {
+        const row = self.view.calls.get(call_id) orelse return null;
+        return sm.v27.selectors.callLabel(row);
+    }
+};
+
 /// One child as its parent's log folds it (D22). Owns its strings.
 pub const Child = struct {
     id: []u8,

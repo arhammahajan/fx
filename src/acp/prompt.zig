@@ -247,6 +247,7 @@ const AcpContext = struct {
     /// card stands. Keys are owned copies of provider call ids so the ID
     /// stays stable from permission review through execution.
     published_tool_calls: std.StringHashMapUnmanaged(ToolCallCard) = .empty,
+    v27_calls: session_adapter.V27CallProjection = .{},
     message_id: acp_types.MessageIdBuffer = undefined,
     message_kind: ?AgentMessageKind = null,
     stop_reason: acp_types.StopReason = .end_turn,
@@ -263,6 +264,7 @@ const AcpContext = struct {
         var keys = self.published_tool_calls.keyIterator();
         while (keys.next()) |key| self.alloc.free(key.*);
         self.published_tool_calls.deinit(self.alloc);
+        self.v27_calls.deinit(self.alloc);
     }
 
     fn sendUpdate(self: *AcpContext, update_json: []const u8) !void {
@@ -383,6 +385,7 @@ const AcpContext = struct {
             owned_id,
             if (tool_presentation.isProviderSearchAlias(call.name)) .awaiting_provider_terminal else .open,
         );
+        try self.v27_calls.requested(self.alloc, call);
         return owned_id;
     }
 
@@ -417,17 +420,26 @@ const AcpContext = struct {
     /// one. A cancel can stop a step before some of its calls run, and a
     /// failed or paused turn can end with a provider search still announced,
     /// so the turn's end is the last point where the client can learn that.
-    fn finishOpenToolCalls(self: *AcpContext, text: []const u8) void {
+    fn settleOpenToolCallsFromFold(self: *AcpContext, turn_outcome: []const u8, text: []const u8) void {
+        self.v27_calls.settleTurn(self.alloc, turn_outcome) catch |err| {
+            debug_trace.logf("acp", "v27 turn settlement unavailable err={s}", .{@errorName(err)});
+        };
         var cards = self.published_tool_calls.iterator();
         while (cards.next()) |entry| {
             if (entry.value_ptr.* == .finished) continue;
-            self.sendToolCallError(entry.key_ptr.*, text) catch |err| {
+            const state = self.v27_calls.state(entry.key_ptr.*) orelse "interrupted";
+            const send = if (std.mem.eql(u8, state, "completed"))
+                self.sendToolCallCompletedWithCommandResult(entry.key_ptr.*, null, null)
+            else
+                self.sendToolCallError(entry.key_ptr.*, text);
+            send catch |err| {
                 debug_trace.logf("acp", "tool call card left open call_id={s} err={s}", .{ entry.key_ptr.*, @errorName(err) });
             };
         }
     }
 
     fn sendToolCallProgressText(self: *AcpContext, tool_call_id: []const u8, text: ?[]const u8) !void {
+        try self.v27_calls.started(self.alloc, tool_call_id);
         const plain = if (text) |value| try stripAnsiAlloc(self.alloc, value) else null;
         defer if (plain) |value| if (text) |original| {
             if (value.ptr != original.ptr) self.alloc.free(value);
@@ -453,6 +465,7 @@ const AcpContext = struct {
     }
 
     fn sendToolCallCompletedWithCommandResult(self: *AcpContext, tool_call_id: []const u8, result_text: ?[]const u8, command_result_json: ?[]const u8) !void {
+        try self.v27_calls.settled(self.alloc, tool_call_id, "completed");
         var out: std.Io.Writer.Allocating = .init(self.alloc);
         defer out.deinit();
         try acp_types.writeToolCallUpdateWithCommandResult(&out.writer, tool_call_id, .completed, result_text, command_result_json);
@@ -465,6 +478,7 @@ const AcpContext = struct {
     }
 
     fn sendToolCallErrorWithCommandResult(self: *AcpContext, tool_call_id: []const u8, err_text: []const u8, command_result_json: ?[]const u8) !void {
+        try self.v27_calls.settled(self.alloc, tool_call_id, "failed");
         var out: std.Io.Writer.Allocating = .init(self.alloc);
         defer out.deinit();
         try acp_types.writeToolCallUpdateWithCommandResult(&out.writer, tool_call_id, .failed, err_text, command_result_json);
@@ -2243,10 +2257,12 @@ fn finalizeTurn(raw_ctx: *anyopaque, turn_id: u64, outcome: types.TurnPresentati
     } else if (outcome == .failed or outcome == .paused) {
         ctx.stop_reason = .refused;
     }
-    // The core reports no more tool events once a turn finishes, so close
-    // what it left open, as the terminal transcript does at the same point.
     const cancel_requested = if (ctx.state.active_session) |*session| session.cancel_flag.load(.seq_cst) else false;
-    ctx.finishOpenToolCalls(unfinishedToolCallText(outcome, cancel_requested));
+    ctx.settleOpenToolCallsFromFold(switch (outcome) {
+        .completed => "completed",
+        .interrupted => "cancelled",
+        .failed, .paused => "failed",
+    }, unfinishedToolCallText(outcome, cancel_requested));
 }
 
 /// The text of the final update for a tool call a finished turn left open.
@@ -5114,8 +5130,8 @@ test "ACP finishes each open tool-call card once when a turn is cancelled" {
         } });
     }
     try ctx.sendToolCallCompletedWithCommandResult("ran", "read", null);
-    ctx.finishOpenToolCalls("Cancelled");
-    ctx.finishOpenToolCalls("Cancelled");
+    ctx.settleOpenToolCallsFromFold("cancelled", "Cancelled");
+    ctx.settleOpenToolCallsFromFold("cancelled", "Cancelled");
     try capture.sync(io_mod.getIo());
 
     var captured_file = try tmp.dir.openFile(io_mod.getIo(), "acp-cancelled-cards.jsonl", .{});
