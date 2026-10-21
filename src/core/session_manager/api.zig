@@ -737,6 +737,7 @@ test {
     _ = @import("fold.zig");
     _ = @import("session.zig");
     _ = @import("catalog.zig");
+    _ = @import("v27.zig");
     // Fault injection and traces exist only with -Dhooks=true.
     if (storage.hooks) {
         _ = @import("storage_fault.zig");
@@ -775,10 +776,11 @@ const boundary_tests = struct {
         for (packages) |package| {
             if (std.mem.eql(u8, name, package)) return true;
         }
-        // A sibling file: `x.zig` with no path separator and no parent reference.
+        // A sibling file, or a file in the manager-owned v27 directory.
         return std.mem.endsWith(u8, name, ".zig") and
-            std.mem.findScalar(u8, name, '/') == null and
-            std.mem.findScalar(u8, name, '\\') == null;
+            std.mem.find(u8, name, "..") == null and
+            std.mem.findScalar(u8, name, '\\') == null and
+            (std.mem.findScalar(u8, name, '/') == null or std.mem.startsWith(u8, name, "v27/"));
     }
 
     test "boundary scanner accepts std and siblings" {
