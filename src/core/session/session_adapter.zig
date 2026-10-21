@@ -1459,7 +1459,10 @@ pub const Session = struct {
         if (self.v27 != null or !std.mem.eql(u8, io_mod.getenv("FX_SESSION_V27_SHADOW") orelse "", "1")) return;
         const folder = try self.folderPath(self.alloc);
         defer self.alloc.free(folder);
-        self.v27 = try v27_shadow.Shadow.create(self.alloc, folder);
+        self.v27 = v27_shadow.Shadow.create(self.alloc, folder) catch |err| {
+            debug_trace.logf("session", "event=v27_shadow_open_deferred session={s} err={s}", .{ self.id(), @errorName(err) });
+            return;
+        };
     }
 
     pub fn id(self: *const Session) []const u8 {
@@ -1636,6 +1639,7 @@ pub const Session = struct {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
         try self.openTurnLocked();
+        try self.ensureV27Shadow();
         if (self.v27) |shadow| try shadow.beginTurn();
     }
 
@@ -1726,14 +1730,8 @@ pub const Session = struct {
         if (derived_title) |title| try tail.append(a, .{ .set = .{ .key = .title, .value = try jsonString(a, title) } });
 
         try self.writePieces(a, all[start..], encoded[start..], tail.items);
-        if (self.v27) |shadow| try shadow.settleTurn(switch (end) {
-            .turn_completed => "completed",
-            .interrupted => |interruption| switch (interruption.reason) {
-                .cancelled => "cancelled",
-                .failed => "failed",
-            },
-            else => unreachable,
-        });
+        try self.ensureV27Shadow();
+        if (self.v27) |shadow| try shadow.finish(turn);
         try self.turn_numbers.append(self.alloc, self.last_turn);
         self.turn_open = false;
         self.clearStreamed();
@@ -1873,6 +1871,8 @@ pub const Session = struct {
             for (encoded[start..]) |bytes| self.streamed.appendAssumeCapacity(try self.alloc.dupe(u8, bytes));
         }
         try self.saveRunning(a, running);
+        try self.ensureV27Shadow();
+        if (self.v27) |shadow| try shadow.progress(execution, running.calls);
     }
 
     /// The step whose calls are running: its calls in their saved form, and
