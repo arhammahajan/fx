@@ -16,6 +16,7 @@
 
 const std = @import("std");
 const schema = @import("schema.zig");
+const v27_facts = @import("v27/facts.zig");
 const storage = @import("storage.zig");
 const log_mod = @import("log.zig");
 const fold = @import("fold.zig");
@@ -345,6 +346,69 @@ pub const Session = struct {
         };
         if (sync_through) |seq| try session.syncThrough(seq);
         return result;
+    }
+
+    /// Appends one v27 line. `private_events` update migration and profile
+    /// state inside the same durable frame as `facts`.
+    pub fn appendCommitReport(session: *Session, facts: []const u8, private_events: []const fold.Event, ts_ms: ?u64) AppendError!Appended {
+        const io = session.env.s.io;
+        var sync_through: ?u64 = null;
+        const result = blk: {
+            session.mutex.lockUncancelable(io);
+            defer session.mutex.unlock(io);
+            session.observe(.mutex_acquired);
+            const was_held = session.phase == .held;
+            session.import_ts = ts_ms;
+            const last = try session.appendCommitLocked(facts, private_events, &sync_through);
+            session.observe(.mutex_releasing);
+            break :blk Appended{
+                .last_seq = last,
+                .published = was_held and session.phase == .live,
+                .listing_changed = session.phase == .live and changesListing(private_events),
+            };
+        };
+        if (sync_through) |seq| try session.syncThrough(seq);
+        return result;
+    }
+
+    fn appendCommitLocked(session: *Session, facts: []const u8, private_events: []const fold.Event, sync_through: *?u64) AppendError!u64 {
+        switch (session.phase) {
+            .closed => return error.SessionClosed,
+            .failed => return session.fault orelse error.Io,
+            .held, .live => {},
+        }
+        if (faultFromCode(session.sync_fault.load(.acquire))) |cause| {
+            session.markFailed(cause);
+            return cause;
+        }
+        const gpa = session.env.gpa;
+        try session.bodies.resize(gpa, private_events.len);
+        fold.plan(&session.state, private_events, session.bodies.items) catch return error.InvalidTransition;
+        const private_bodies = try gpa.dupe(schema.Body, session.bodies.items);
+        defer gpa.free(private_bodies);
+        std.debug.assert(private_bodies.len == private_events.len);
+        for (private_bodies) |private_body| std.debug.assert(private_body != .v27_commit);
+        const commit: schema.Body = .{ .v27_commit = .{ .facts = facts, .private_bodies = private_bodies } };
+        const bodies = [_]schema.Body{commit};
+        const ts = session.timestamp();
+        switch (session.phase) {
+            .held => if (session.import) {
+                try session.holdImport(&bodies, ts);
+            } else if (!hasTurnStart(session.bodies.items) and std.mem.find(u8, facts, "\"type\":\"turn.started\"") == null) {
+                try session.hold(&bodies, ts);
+            } else {
+                try session.publish(&bodies, ts);
+                try session.maybeSnapshot(&session.phase.live, &bodies, ts);
+            },
+            .live => |*live| {
+                try session.checkBlobRefs(live, session.bodies.items);
+                try session.writeBodies(live, &bodies, ts, .host);
+                try session.maybeSnapshot(live, &bodies, ts);
+                if (needsSync(&bodies)) sync_through.* = session.state.last_seq;
+            },
+            .failed, .closed => unreachable,
+        }
+        return session.state.last_seq;
     }
 
     fn appendLocked(session: *Session, events: []const fold.Event, sync_through: *?u64) AppendError!u64 {
@@ -907,6 +971,16 @@ pub const Session = struct {
             },
             .live => |*live| {
                 var result: AppendError!void = {};
+                if (session.state.native_v27) {
+                    const resources = switch (session.phase) {
+                        .live => |l| l,
+                        .failed => |l| l.?,
+                        else => unreachable,
+                    };
+                    session.release(resources);
+                    session.phase = .closed;
+                    return result;
+                }
                 var bodies_buffer: [2]schema.Body = undefined;
                 var n: usize = 0;
                 if (session.state.open_turn) |turn| {
@@ -1019,8 +1093,17 @@ test "a fault code round trips every I/O fault, and none is no fault" {
 fn hasBlobRefs(bodies: []const schema.Body) bool {
     for (bodies) |body| {
         if (body.blobRefs().len > 0) return true;
+        if (body == .v27_commit and hasBlobRefs(body.v27_commit.private_bodies)) return true;
     }
     return false;
+}
+
+fn blobsWhole(env: *const Env, session_id: []const u8, body: schema.Body) !bool {
+    for (body.blobRefs()) |hash| if (!try blobIsWhole(env, session_id, hash)) return false;
+    if (body == .v27_commit) for (body.v27_commit.private_bodies) |private_body| {
+        if (!try blobsWhole(env, session_id, private_body)) return false;
+    };
+    return true;
 }
 
 /// Copies the first `len` bytes of `from` into `to` in chunks and returns
@@ -1073,6 +1156,7 @@ fn changesListing(events: []const fold.Event) bool {
 fn hasTurnStart(bodies: []const schema.Body) bool {
     for (bodies) |body| {
         if (body == .turn_started) return true;
+        if (body == .v27_commit and hasTurnStart(body.v27_commit.private_bodies)) return true;
     }
     return false;
 }
@@ -1084,7 +1168,12 @@ fn needsSync(bodies: []const schema.Body) bool {
         // A running call may have side effects before its result is stored.
         // Make its start durable so resume reports that it may have run.
         .item => |piece| if (std.mem.eql(u8, piece.type, "tool_running")) return true,
-        .v27_commit => |commit| if (std.mem.find(u8, commit.facts, "\"type\":\"call.started\"") != null) return true,
+        .v27_commit => |commit| {
+            if (std.mem.find(u8, commit.facts, "\"type\":\"call.started\"") != null or
+                std.mem.find(u8, commit.facts, "\"type\":\"turn.settled\"") != null or
+                std.mem.find(u8, commit.facts, "\"type\":\"context.settled\"") != null or
+                needsSync(commit.private_bodies)) return true;
+        },
         // Usage is durable before fx clears its usage-recovery marker
         // (`tests/tla/session_manager/Wiring.tla` UsageNeverSilent).
         // fx removes the side folder only once the move is durable (D47).
@@ -1424,6 +1513,7 @@ fn loadFolded(env: *const Env, arena_state: *std.heap.ArenaAllocator, file: stor
             continue;
         };
         const body = schema.parseLineBody(line_arena.allocator(), kind, line.bytes) catch return error.Corrupt;
+        if ((state.native_v27 or body == .v27_commit) and !try blobsWhole(env, identity.id, body)) return error.Corrupt;
         try fold.apply(gpa, &state, fork_seq, .{ .seq = line.header.seq, .offset = line.offset, .body = body });
     }
     return .{
@@ -1450,9 +1540,9 @@ fn repair(session: *Session, workspace: []const u8) AppendError!void {
     const live = &session.phase.live;
     const ts = session.timestamp();
     // An open turn from the previous owner is interrupted (D1).
-    if (session.state.open_turn) |turn| {
+    if (!session.state.native_v27) if (session.state.open_turn) |turn| {
         try session.writeBodies(live, &.{.{ .turn_interrupted = .{ .turn = turn, .reason = .crash } }}, ts, .interrupt_repair);
-    }
+    };
     session.observe(.reopened);
     // Every unfinished work item gets a known outcome (tests/tla/session_manager/Subagents.tla).
     var finished: std.ArrayList(schema.Body) = .empty;
@@ -1848,6 +1938,7 @@ fn findForkPoint(env: *const Env, source: []const u8, src: storage.File, end: u6
     const line1_end = line1.offset + line1.bytes.len;
     var before_first_turn: ForkPointFound = .{ .seq = 1, .end = line1_end, .line1_end = line1_end };
     var turn_seen = false;
+    var v27_turn: u64 = 0;
     var last_end: ?ForkPointFound = null;
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -1880,6 +1971,27 @@ fn findForkPoint(env: *const Env, source: []const u8, src: storage.File, end: u6
                 };
                 last_end = here;
                 if (at == .turn and at.turn == turn) return here;
+            },
+            .v27_commit => {
+                _ = arena.reset(.retain_capacity);
+                const body = schema.parseLineBody(arena.allocator(), kind, line.bytes) catch return error.Corrupt;
+                for (body.v27_commit.private_bodies) |private_body| for (private_body.blobRefs()) |hash| {
+                    if (!try blobIsWhole(env, source, hash)) return last_end orelse error.InvalidForkPoint;
+                };
+                for (schema.rawElements(arena.allocator(), body.v27_commit.facts) catch return error.Corrupt) |raw| {
+                    const fact = v27_facts.decode(arena.allocator(), raw) catch continue;
+                    switch (fact.data) {
+                        .turn_started => {
+                            turn_seen = true;
+                            v27_turn += 1;
+                        },
+                        .turn_settled => {
+                            last_end = here;
+                            if (at == .turn and at.turn == v27_turn) return here;
+                        },
+                        else => {},
+                    }
+                }
             },
             else => {},
         }
@@ -2091,9 +2203,7 @@ pub fn verifySession(env: *const Env, id_: []const u8) OpenError!Verified {
             result.damaged_at = line.offset;
             break;
         };
-        for (body.blobRefs()) |hash| {
-            if (!try blobIsWhole(env, id_, hash)) result.bad_blobs += 1;
-        }
+        if (!try blobsWhole(env, id_, body)) result.bad_blobs += 1;
         switch (body) {
             .session_created => |c| fork_seq = if (c.forked_from) |o| o.seq else 0,
             .snapshot => |snap| {
@@ -3464,7 +3574,7 @@ const session_model_tests = struct {
 
         fn byOf(arena: std.mem.Allocator, value: []const u8) []const u8 {
             const Parsed = struct { by: []const u8 };
-            const parsed = std.json.parseFromSliceLeaky(Parsed, arena, value, .{}) catch return "?";
+            const parsed = std.json.parseFromSliceLeaky(Parsed, arena, value, .{ .allocate = .alloc_always }) catch return "?";
             return parsed.by;
         }
     };

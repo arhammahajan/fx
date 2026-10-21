@@ -59,11 +59,27 @@ export function decodeLogLine(value: string | Record<string, any>): any {
   };
 }
 
+function decodeLogLines(value: string): any[] {
+  const parsed = JSON.parse(value);
+  const publicLine = {
+    ...parsed,
+    envelope_kind: parsed.kind,
+    kind: parsed.commit === "v27" ? "v27_commit" : parsed.kind,
+  };
+  const privateLines = (parsed.private ?? []).map((entry: any) => ({
+    ...parsed,
+    ...(entry?.data?.body ?? {}),
+    envelope_kind: parsed.kind,
+    kind: entry?.data?.record ?? parsed.kind,
+  }));
+  return parsed.commit === "v27" ? [publicLine, ...privateLines] : [decodeLogLine(parsed)];
+}
+
 /// Every complete line of a session's log. A line fx is still appending is
 /// left out, so a test may read the log while fx runs.
 function readLog(home: string, id: string): LogLine[] {
   const text = readFileSync(join(sessionDir(home, id), "log.jsonl"), "utf8");
-  return text.slice(0, text.lastIndexOf("\n") + 1).split("\n").filter(Boolean).map(decodeLogLine);
+  return text.slice(0, text.lastIndexOf("\n") + 1).split("\n").filter(Boolean).flatMap(decodeLogLines);
 }
 
 /// Every line of a session's log. A streamed turn always matches its

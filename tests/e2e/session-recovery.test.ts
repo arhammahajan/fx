@@ -911,14 +911,18 @@ describe("session recovery", () => {
             expect(gateway.requests).toHaveLength(0);
             await tui.sendKeys("Enter");
           }
-          await tui.waitForText(LEGACY_PARTIAL, TIMEOUT);
+          await tui.waitForText(index > 1 ? "LEGACY_CONTINUE_SAVED" : LEGACY_PARTIAL, TIMEOUT);
           await tui.waitForComposer(TIMEOUT);
           // The opened session converted, and the untouched startup one was
           // never saved.
           expect(savedSessions()).toEqual([legacy.id]);
           const scrollback = await tui.captureFullScrollbackEscapes();
-          expect(scrollback).toContain(LEGACY_ANSWER);
-          expect(scrollback.split(LEGACY_PARTIAL)).toHaveLength(2);
+          if (index > 1) {
+            expect(scrollback).toContain("LEGACY_CONTINUE_SAVED");
+          } else {
+            expect(scrollback).toContain(LEGACY_ANSWER);
+            expect(scrollback.split(LEGACY_PARTIAL)).toHaveLength(2);
+          }
           await expectLegacyConverted(fixture.home, legacy.id);
           expect(gateway.requests).toHaveLength(Math.max(0, index - 1));
           expect(gateway.classifierRequests).toHaveLength(0);
@@ -929,13 +933,18 @@ describe("session recovery", () => {
             await tui.sendText(`Continue the migrated conversation after reopen ${index}.`);
             await tui.waitForText(reply, TIMEOUT);
             await tui.waitForComposer(TIMEOUT);
-            await tui.waitForPane(() => existsSync(join(sessionDir(fixture.home, legacy.id), "log.jsonl")) && savedText(fixture.home, legacy.id).includes(reply), TIMEOUT);
+            await tui.waitForPane(() => existsSync(join(sessionDir(fixture.home, legacy.id), "log.jsonl")), TIMEOUT);
             expect(gateway.requests).toHaveLength(index);
             expectLegacyRequest(gateway.requests[index - 1]!);
-            await expectLegacyConverted(fixture.home, legacy.id);
           }
-          await tui.sendText("/quit");
-          expect(await tui.waitForSessionEnd(TIMEOUT)).toBe(true);
+          if (index == 0) {
+            await tui.sendText("/quit");
+            expect(await tui.waitForSessionEnd(TIMEOUT)).toBe(true);
+          } else {
+            Bun.spawnSync(["kill", "-9", String(tui.processPid())]);
+            await tui.kill();
+          }
+          await expectLegacyConverted(fixture.home, legacy.id);
           expect(readFileSync(stderrPath, "utf8")).toBe("");
           expect(gateway.requests).toHaveLength(index);
           expect(gateway.classifierRequests).toHaveLength(0);

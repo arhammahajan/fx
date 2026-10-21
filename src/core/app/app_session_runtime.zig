@@ -2825,6 +2825,32 @@ pub fn Runtime(comptime App: type) type {
             try v2.appendProgress(progress.user, progress.execution, .{ .calls = progress.running_calls, .assistant = progress.running_assistant });
         }
 
+        pub fn recordModelLifecycle(app: *App, event: agent_runtime.ModelLifecycleEvent) !void {
+            app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+            defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
+            const session = app.session_persistence.v2 orelse return;
+            switch (event) {
+                .requested => |data| try session.modelRequested(data.model),
+                .started => |data| try session.modelStarted(data.attempt),
+                .retried => |data| try session.modelRetried(data.attempt, data.code, data.message),
+                .settled => |data| try session.modelSettled(data.outcome, data.finish_reason, data.usage),
+            }
+        }
+
+        pub fn recordInteractionOpened(app: *App, call_id: []const u8, kind: []const u8) !void {
+            app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+            defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
+            const session = app.session_persistence.v2 orelse return;
+            try session.interactionOpened(call_id, kind);
+        }
+
+        pub fn recordInteractionSettled(app: *App, call_id: []const u8, outcome: []const u8) !void {
+            app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+            defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
+            const session = app.session_persistence.v2 orelse return;
+            try session.interactionSettled(call_id, outcome);
+        }
+
         /// `AgentRuntimeDeps.save_prompt_images` on v2: the prompt's images
         /// become the session's blobs before its first request (D89).
         pub fn savePromptImages(app: *App, alloc: std.mem.Allocator, images: []types.ImageAttachment) !void {

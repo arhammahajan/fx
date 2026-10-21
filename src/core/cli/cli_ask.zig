@@ -2063,6 +2063,7 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .propagate_history_turn = propagateHistoryTurn,
         .commit_context_compaction = .{ .commit = commitContextCompaction },
         .append_turn_piece = if (ctx.v2 != null) appendTurnPiece else null,
+        .record_model_lifecycle = if (ctx.v2 != null) recordModelLifecycle else null,
         .save_prompt_images = if (ctx.v2 != null) savePromptImages else null,
         .propagate_grant = propagateGrant,
         .push_event = pushEvent,
@@ -2294,7 +2295,7 @@ fn cliAdmissionContext(
 fn requestPreparedFileMutationPermissionOutcomeForRuntime(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, prepared: *tool_admission.PreparedFileMutationCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?agent_runtime.LiveToolAuthority, advertised_dynamic_tool_names: []const []const u8) !command_admission.PermissionOutcome {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     const tool_ctx = cliAdmissionContext(ctx, advertised_dynamic_tool_names, review_turn);
-    return finishCliPermissionOutcome(
+    const outcome = try finishCliPermissionOutcome(
         ctx,
         tool_ctx,
         arena,
@@ -2309,12 +2310,14 @@ fn requestPreparedFileMutationPermissionOutcomeForRuntime(raw_ctx: *anyopaque, a
             local_grants,
         ),
     );
+    try recordPermissionInteraction(ctx, call, outcome);
+    return outcome;
 }
 
 fn requestToolPermissionOutcome(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, permission_mode: PermissionMode, local_grants: []const PermissionGrant, advertised_dynamic_tool_names: []const []const u8) !command_admission.PermissionOutcome {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     const tool_ctx = cliAdmissionContext(ctx, advertised_dynamic_tool_names, null);
-    return finishCliPermissionOutcome(
+    const outcome = try finishCliPermissionOutcome(
         ctx,
         tool_ctx,
         arena,
@@ -2328,6 +2331,15 @@ fn requestToolPermissionOutcome(raw_ctx: *anyopaque, arena: Allocator, call: Too
             local_grants,
         ),
     );
+    try recordPermissionInteraction(ctx, call, outcome);
+    return outcome;
+}
+
+fn recordPermissionInteraction(ctx: *AskContext, call: ToolCall, outcome: command_admission.PermissionOutcome) !void {
+    if (outcome.requirement != .approval_required and outcome.human_approval == .none) return;
+    const session = ctx.v2 orelse return;
+    try session.interactionOpened(call.id, "approval");
+    try session.interactionSettled(call.id, if (outcome.decision.isDenied()) "declined" else "accepted");
 }
 
 fn requestToolPermissionOutcomeWithRequest(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?agent_runtime.LiveToolAuthority, revalidation: ?agent_runtime.LivePermissionRevalidation, advertised_dynamic_tool_names: []const []const u8, mcp_review_schema_json: ?[]const u8) !command_admission.PermissionOutcome {
@@ -2997,6 +3009,19 @@ fn appendTurnPiece(raw_ctx: *anyopaque, progress: agent_runtime.TurnProgress) !v
     };
     // The log now refers to this prompt's images.
     ctx.prompt_snapshot_committed = true;
+}
+
+fn recordModelLifecycle(raw_ctx: *anyopaque, event: agent_runtime.ModelLifecycleEvent) !void {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer ctx.session_write_mutex.unlock(io_mod.getIo());
+    const session = ctx.v2 orelse return;
+    switch (event) {
+        .requested => |data| try session.modelRequested(data.model),
+        .started => |data| try session.modelStarted(data.attempt),
+        .retried => |data| try session.modelRetried(data.attempt, data.code, data.message),
+        .settled => |data| try session.modelSettled(data.outcome, data.finish_reason, data.usage),
+    }
 }
 
 /// The prompt's images become the session's blobs before its first request

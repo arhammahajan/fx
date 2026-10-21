@@ -2,6 +2,7 @@
 import { readFile } from "node:fs/promises";
 
 import { check } from "./eve-v27.mjs";
+import catalog from "./catalog.json";
 
 interface FxLine {
   kind?: string;
@@ -29,12 +30,20 @@ if (path === undefined) {
 }
 
 const input = await readFile(path, "utf8");
+const knownFacts = new Set(Object.keys(catalog));
+const envelopeViolations: string[] = [];
 const lines = input
   .split("\n")
   .filter((line) => line.trim().length > 0)
   .map((line, index) => {
     try {
-      return asEveLine(JSON.parse(line));
+      const parsed = JSON.parse(line);
+      if (Array.isArray(parsed.facts)) {
+        for (const fact of parsed.facts) {
+          if (!knownFacts.has(fact?.type)) envelopeViolations.push(`${path}:${index + 1}: unknown-fact: ${String(fact?.type)}`);
+        }
+      }
+      return asEveLine(parsed);
     } catch (error) {
       console.error(`${path}:${index + 1}: envelope: ${String(error)}`);
       process.exit(1);
@@ -43,10 +52,11 @@ const lines = input
   .filter((line) => line !== undefined);
 
 const violations = check(lines);
+for (const violation of envelopeViolations) console.error(violation);
 for (const violation of violations) {
   const fact = violation.index === undefined ? "" : `:${violation.index + 1}`;
   console.error(
     `${path}:${violation.position + 1}${fact}: ${violation.rule}: ${violation.message}`,
   );
 }
-if (violations.length > 0) process.exit(1);
+if (envelopeViolations.length > 0 || violations.length > 0) process.exit(1);

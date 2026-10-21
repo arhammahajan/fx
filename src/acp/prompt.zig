@@ -247,7 +247,6 @@ const AcpContext = struct {
     /// card stands. Keys are owned copies of provider call ids so the ID
     /// stays stable from permission review through execution.
     published_tool_calls: std.StringHashMapUnmanaged(ToolCallCard) = .empty,
-    v27_calls: session_adapter.V27CallProjection = .{},
     message_id: acp_types.MessageIdBuffer = undefined,
     message_kind: ?AgentMessageKind = null,
     stop_reason: acp_types.StopReason = .end_turn,
@@ -264,7 +263,6 @@ const AcpContext = struct {
         var keys = self.published_tool_calls.keyIterator();
         while (keys.next()) |key| self.alloc.free(key.*);
         self.published_tool_calls.deinit(self.alloc);
-        self.v27_calls.deinit(self.alloc);
     }
 
     fn sendUpdate(self: *AcpContext, update_json: []const u8) !void {
@@ -385,7 +383,6 @@ const AcpContext = struct {
             owned_id,
             if (tool_presentation.isProviderSearchAlias(call.name)) .awaiting_provider_terminal else .open,
         );
-        try self.v27_calls.requested(self.alloc, call);
         return owned_id;
     }
 
@@ -421,13 +418,12 @@ const AcpContext = struct {
     /// failed or paused turn can end with a provider search still announced,
     /// so the turn's end is the last point where the client can learn that.
     fn settleOpenToolCallsFromFold(self: *AcpContext, turn_outcome: []const u8, text: []const u8) void {
-        self.v27_calls.settleTurn(self.alloc, turn_outcome) catch |err| {
-            debug_trace.logf("acp", "v27 turn settlement unavailable err={s}", .{@errorName(err)});
-        };
+        _ = turn_outcome;
+        const session = if (self.state.active_session) |*active| active.v2 else null;
         var cards = self.published_tool_calls.iterator();
         while (cards.next()) |entry| {
             if (entry.value_ptr.* == .finished) continue;
-            const state = self.v27_calls.state(entry.key_ptr.*) orelse "interrupted";
+            const state = if (session) |saved| saved.v27CallState(entry.key_ptr.*) orelse "interrupted" else "interrupted";
             const send = if (std.mem.eql(u8, state, "completed"))
                 self.sendToolCallCompletedWithCommandResult(entry.key_ptr.*, null, null)
             else
@@ -439,7 +435,6 @@ const AcpContext = struct {
     }
 
     fn sendToolCallProgressText(self: *AcpContext, tool_call_id: []const u8, text: ?[]const u8) !void {
-        try self.v27_calls.started(self.alloc, tool_call_id);
         const plain = if (text) |value| try stripAnsiAlloc(self.alloc, value) else null;
         defer if (plain) |value| if (text) |original| {
             if (value.ptr != original.ptr) self.alloc.free(value);
@@ -465,7 +460,6 @@ const AcpContext = struct {
     }
 
     fn sendToolCallCompletedWithCommandResult(self: *AcpContext, tool_call_id: []const u8, result_text: ?[]const u8, command_result_json: ?[]const u8) !void {
-        try self.v27_calls.settled(self.alloc, tool_call_id, "completed");
         var out: std.Io.Writer.Allocating = .init(self.alloc);
         defer out.deinit();
         try acp_types.writeToolCallUpdateWithCommandResult(&out.writer, tool_call_id, .completed, result_text, command_result_json);
@@ -478,7 +472,6 @@ const AcpContext = struct {
     }
 
     fn sendToolCallErrorWithCommandResult(self: *AcpContext, tool_call_id: []const u8, err_text: []const u8, command_result_json: ?[]const u8) !void {
-        try self.v27_calls.settled(self.alloc, tool_call_id, "failed");
         var out: std.Io.Writer.Allocating = .init(self.alloc);
         defer out.deinit();
         try acp_types.writeToolCallUpdateWithCommandResult(&out.writer, tool_call_id, .failed, err_text, command_result_json);
@@ -1973,6 +1966,7 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
             appendJournalToolIntent
         else
             null,
+        .record_model_lifecycle = if (session.v2 != null) recordModelLifecycle else null,
         .save_prompt_images = if (session.v2 != null) savePromptImages else null,
         .commit_context_compaction = .{ .commit = commitContextCompaction },
         .recovery_checkpoint = if (session.journal != null)
@@ -2357,7 +2351,7 @@ fn requestPreparedFileMutationPermissionOutcomeForRuntime(raw_ctx: *anyopaque, a
     var tool_ctx = tool_runtime.withAdvertisedDynamicToolNames(ctx.toolContext(), advertised_dynamic_tool_names);
     tool_ctx.permission_review_turn = review_turn;
     const admission = tool_ctx.admissionInputWithLiveAuthority(live_authority);
-    return tool_admission.requestPreparedFileMutationPermissionOutcome(
+    const outcome = try tool_admission.requestPreparedFileMutationPermissionOutcome(
         admission,
         arena,
         call,
@@ -2365,6 +2359,8 @@ fn requestPreparedFileMutationPermissionOutcomeForRuntime(raw_ctx: *anyopaque, a
         permission_mode,
         local_grants,
     );
+    try recordPermissionInteraction(ctx, call, outcome);
+    return outcome;
 }
 
 fn requestToolPermissionOutcome(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, permission_mode: PermissionMode, local_grants: []const PermissionGrant, advertised_dynamic_tool_names: []const []const u8) !command_admission.PermissionOutcome {
@@ -2385,7 +2381,7 @@ fn requestToolPermissionOutcomeWithRequest(raw_ctx: *anyopaque, arena: Allocator
     tool_ctx.permission_review_turn = review_turn;
     tool_ctx.mcp_review_schema_json = mcp_review_schema_json;
     const admission = tool_ctx.admissionInputWithLiveAuthority(live_authority);
-    return if (revalidation) |request| switch (request) {
+    const outcome = try if (revalidation) |request| switch (request) {
         .action => |action| tool_admission.revalidateLiveActionPermissionOutcome(
             admission,
             arena,
@@ -2402,6 +2398,18 @@ fn requestToolPermissionOutcomeWithRequest(raw_ctx: *anyopaque, arena: Allocator
         permission_mode,
         local_grants,
     );
+    try recordPermissionInteraction(ctx, call, outcome);
+    return outcome;
+}
+
+fn recordPermissionInteraction(ctx: *AcpContext, call: ToolCall, outcome: command_admission.PermissionOutcome) !void {
+    if (outcome.requirement != .approval_required and outcome.human_approval == .none) return;
+    const active = if (ctx.state.active_session) |*value| value else return;
+    active.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer active.session_write_mutex.unlock(io_mod.getIo());
+    const session = active.v2 orelse return;
+    try session.interactionOpened(call.id, "approval");
+    try session.interactionSettled(call.id, if (outcome.decision.isDenied()) "declined" else "accepted");
 }
 
 const TestReviewTurn = struct {
@@ -2834,6 +2842,20 @@ fn appendTurnPiece(raw_ctx: *anyopaque, progress: agent_runtime.TurnProgress) !v
     v2.appendProgress(progress.user, progress.execution, .{ .calls = progress.running_calls, .assistant = progress.running_assistant }) catch |err| {
         debug_trace.logf("session", "event=sessions_v2_stream_failed session={s} err={s} deferred=commit", .{ v2.id(), @errorName(err) });
     };
+}
+
+fn recordModelLifecycle(raw_ctx: *anyopaque, event: agent_runtime.ModelLifecycleEvent) !void {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    const active = if (ctx.state.active_session) |*value| value else return;
+    active.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer active.session_write_mutex.unlock(io_mod.getIo());
+    const session = active.v2 orelse return;
+    switch (event) {
+        .requested => |data| try session.modelRequested(data.model),
+        .started => |data| try session.modelStarted(data.attempt),
+        .retried => |data| try session.modelRetried(data.attempt, data.code, data.message),
+        .settled => |data| try session.modelSettled(data.outcome, data.finish_reason, data.usage),
+    }
 }
 
 /// `AgentRuntimeDeps.save_prompt_images` on v2: the prompt's images become

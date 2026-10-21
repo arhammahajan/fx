@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { compactionRecordPath, logLines, sessionDir } from "./saved-sessions";
+import { compactionRecordPath, sessionDir } from "./saved-sessions";
 
 process.env.FX_E2E_DISABLE_DOTENV = "1";
 const { fakeGatewayFinalText, startDynamicFakeGateway } = await import("./tmux-helpers");
@@ -63,9 +63,13 @@ for (const userHeavy of [false, true]) test(`automatic compaction ${userHeavy ? 
     // The turn is only a user message and a final reply, which both stay, so
     // there is nothing for the model to summarize.
     expect(summaryCalls).toBe(0);
-    const checkpoints = logLines(home, seed.session_id).filter((line: any) => (line.private?.[0]?.data?.record ?? line.legacy_kind ?? line.kind) === "compacted");
+    const frames = readFileSync(log, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    const checkpoints = frames.flatMap((line) => line.facts ?? [])
+      .filter((fact) => fact.type === "context.settled" && fact.data.kind === "compaction");
     expect(checkpoints.length).toBe(1);
-    const saved: string = (checkpoints[0] as any).data.summary;
+    const compatibility = frames.flatMap((line) => line.private ?? [])
+      .find((entry) => entry.data?.record === "compacted");
+    const saved: string = compatibility.data.body.data.summary;
     expect(saved.startsWith(checkpointMarker)).toBe(true);
     const payload = JSON.parse(saved.slice(checkpointMarker.length));
     expect(payload.turn_count).toBe(1);

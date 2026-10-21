@@ -20,6 +20,7 @@ import {
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { check as checkV27, fold as foldV27 } from "../v27/eve-v27.mjs";
 import {
   composerContains,
   FAKE_GATEWAY_MODEL,
@@ -106,12 +107,19 @@ function expectWholeLog(fixture: Fixture, id: string) {
     const entry = JSON.parse(line.toString());
     seq += 1;
     expect(entry.seq).toBe(seq);
-    if ((entry.private?.[0]?.data?.record ?? entry.legacy_kind ?? entry.kind) === "turn_started") {
+    const factTypes = new Set((entry.facts ?? []).map((fact: any) => fact.type));
+    if (factTypes.has("turn.started")) {
       expect(open).toBe(false);
       open = true;
-    } else if ((entry.private?.[0]?.data?.record ?? entry.legacy_kind ?? entry.kind) === "turn_committed" || (entry.private?.[0]?.data?.record ?? entry.legacy_kind ?? entry.kind) === "turn_interrupted") {
+    }
+    if (factTypes.has("turn.settled")) {
       expect(open).toBe(true);
       open = false;
+    }
+    if (!entry.commit) {
+      const record = entry.private?.[0]?.data?.record ?? entry.legacy_kind ?? entry.kind;
+      if (record === "turn_started") { expect(open).toBe(false); open = true; }
+      else if (record === "turn_committed" || record === "turn_interrupted") { expect(open).toBe(true); open = false; }
     }
     start = end + 1;
   }
@@ -223,6 +231,23 @@ function shape(lines: LogLine[]): string[] {
     .map((line) => ((line.private?.[0]?.data?.record ?? line.legacy_kind ?? line.kind) === "item" ? `item:${line.type}` : line.kind));
 }
 
+function sessionFacts(home: string, id: string): any[] {
+  return readFileSync(join(sessionDir(home, id), "log.jsonl"), "utf8").trim().split("\n").filter(Boolean)
+    .flatMap((line) => JSON.parse(line).facts ?? []);
+}
+
+function settledTurns(home: string, id: string, outcome?: string): any[] {
+  return sessionFacts(home, id).filter((fact) => fact.type === "turn.settled" && (outcome === undefined || fact.data.outcome === outcome));
+}
+
+function expectV27Conformance(home: string, id: string) {
+  const lines = readFileSync(join(sessionDir(home, id), "log.jsonl"), "utf8").trim().split("\n").filter(Boolean)
+    .map((line) => JSON.parse(line))
+    .filter((line) => Array.isArray(line.facts))
+    .map((line) => ({ at: new Date(line.ts).toISOString(), facts: line.facts }));
+  expect(checkV27(lines)).toEqual([]);
+}
+
 /// The legacy sessions folder holds nothing but the v3 root: no dual writes.
 function expectNoV1Sessions(fixture: Fixture) {
   const sessions = join(fixture.home, ".fx", "sessions");
@@ -261,7 +286,63 @@ async function ask(fixture: Fixture, gateway: any, args: string[]) {
   return result;
 }
 
-test("fx ask saves to v2, resumes by id and by last, and never writes v1", async () => {
+test("ask JSON and the Zig session fold match eve v27", async () => {
+  const fixture = createFixture("fx-v27-fold-");
+  writeFileSync(join(fixture.workspace, "fact.txt"), "folded\n");
+  const gateway = startFakeGateway([
+    fakeGatewayToolCall("fold-call", "read_file", { path: "fact.txt" }),
+    fakeGatewayFinalText("FOLD_MATCH"),
+  ]);
+  try {
+    const result = await ask(fixture, gateway, ["Read fact.txt."]);
+    expect(result.code, result.stderr + result.stdout).toBe(0);
+    const output = JSON.parse(result.stdout);
+    const lines = readFileSync(join(sessionDir(fixture.home, output.session_id), "log.jsonl"), "utf8")
+      .trim().split("\n").map((line) => JSON.parse(line))
+      .filter((line) => line.kind === "commit")
+      .map((line) => ({ at: new Date(line.ts).toISOString(), facts: line.facts }));
+    const view: any = foldV27(lines);
+    const turnId = view.session.latestTurnId;
+    const reply = (view.turns[turnId]?.reply ?? []).map((id: string) => view.parts[id]?.value).filter((value: unknown) => typeof value === "string").join("\n");
+    const calls = Object.values(view.calls as Record<string, any>)
+      .filter((call: any) => view.runs[call.owner?.runId]?.owner?.turnId === turnId)
+      .map((call: any) => ({ name: call.capability.name, status: call.outcome === "completed" ? "success" : "error" }));
+    expect(output.final_output).toBe(reply);
+    expect(output.tool_calls).toEqual(calls);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("model retries keep one v27 run with monotonic attempts", async () => {
+  const fixture = createFixture("fx-v27-retry-");
+  const gateway = startFakeGateway([
+    new Response("temporarily unavailable", { status: 503, headers: { "retry-after": "0" } }),
+    fakeGatewayFinalText("RETRY_DONE"),
+  ]);
+  try {
+    const result = await ask(fixture, gateway, ["Retry this request."]);
+    expect(result.code).toBe(0);
+    const id = JSON.parse(result.stdout).session_id;
+    const lifecycle = sessionFacts(fixture.home, id)
+      .filter((fact) => fact.type.startsWith("model."))
+      .map((fact) => [fact.type, fact.data.runId, fact.data.attempt ?? null]);
+    expect(lifecycle).toEqual([
+      ["model.requested", "run_1", null],
+      ["model.started", "run_1", 0],
+      ["model.retried", "run_1", 0],
+      ["model.started", "run_1", 1],
+      ["model.settled", "run_1", null],
+    ]);
+    expectV27Conformance(fixture.home, id);
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("fx ask saves v27 facts, resumes by id and by last, and never writes v1", async () => {
   const fixture = createFixture("fx-v2-ask-");
   const gateway = startFakeGateway([
     fakeGatewayFinalText("V2_FIRST_ANSWER"),
@@ -276,15 +357,7 @@ test("fx ask saves to v2, resumes by id and by last, and never writes v1", async
     expect(first.output).toBe("V2_FIRST_ANSWER");
     const id: string = first.session_id;
     expect(id.length).toBeGreaterThan(0);
-    expect(shape(logLines(fixture.home, id))).toEqual([
-      "session_created",
-      "turn_started",
-      "item:user",
-      "item:assistant",
-      "item:turn_end",
-      "turn_committed",
-      "closed",
-    ]);
+    expect(shape(logLines(fixture.home, id))).toEqual(["session_created"]);
     expectNoV1Sessions(fixture);
     // Owner-only folders and files.
     expect(statSync(storeRoot(fixture.home)).mode & 0o777).toBe(0o700);
@@ -302,8 +375,7 @@ test("fx ask saves to v2, resumes by id and by last, and never writes v1", async
     expect(gateway.requests[2]!.body).toContain("V2_SECOND_ANSWER");
     expect(gateway.requests[2]!.body).toContain("First v2 question.");
 
-    const kinds = logLines(fixture.home, id).map((line) => line.kind);
-    expect(kinds.filter((kind) => kind === "turn_committed").length).toBe(3);
+    expect(settledTurns(fixture.home, id, "completed")).toHaveLength(3);
     expectNoV1Sessions(fixture);
   } finally {
     gateway.stop();
@@ -412,12 +484,16 @@ for (const userHeavy of [false, true]) {
       expect(continued.stderr).toBe("");
       expect(JSON.parse(continued.stdout).output).toBe("CONTINUED_FROM_COMMITTED_MEMORY");
 
-      // One compaction line holding the compacted conversation, and the
-      // turn it compacted saved whole as a compactor record, a blob of the
-      // session (D50).
-      const compactions = (logLines(fixture.home, id) as any[]).filter((line) => (line.private?.[0]?.data?.record ?? line.legacy_kind ?? line.kind) === "compacted");
+      // One v27 context settlement selects the compacted conversation, and
+      // the turn it compacted is saved as a compactor-record blob (D50).
+      const compactions = readFileSync(join(sessionDir(fixture.home, id), "log.jsonl"), "utf8").trim().split("\n")
+        .flatMap((line) => JSON.parse(line).facts ?? [])
+        .filter((fact) => fact.type === "context.settled" && fact.data.kind === "compaction");
       expect(compactions).toHaveLength(1);
-      const data = typeof compactions[0].data === "string" ? JSON.parse(compactions[0].data) : compactions[0].data;
+      const compatibility = (logLines(fixture.home, id) as any[])
+        .filter((line) => line.kind === "compacted");
+      expect(compatibility).toHaveLength(1);
+      const data = typeof compatibility[0].data === "string" ? JSON.parse(compatibility[0].data) : compatibility[0].data;
       expect(data.summary.startsWith("fx-compactor-v1\n")).toBe(true);
       const turnPath = compactionRecordPath(fixture.home, id, "compacted-M1.txt");
       expect(turnPath).toBeDefined();
@@ -445,6 +521,7 @@ for (const userHeavy of [false, true]) {
       };
       expectUserShown(sent);
       expect(readFileSync(logPath).subarray(0, before.length).equals(before)).toBe(true);
+      expectV27Conformance(fixture.home, id);
       const notesCallsBeforeReopen = notesCalls;
 
       // A fresh process resumes from the summary: it sends the summary, not
@@ -457,7 +534,7 @@ for (const userHeavy of [false, true]) {
       expect(bodies.at(-1)).not.toContain("Assistant reference 7000:");
       expectUserShown(bodies.at(-1)!);
       expect(notesCalls).toBe(notesCallsBeforeReopen);
-      expect((logLines(fixture.home, id) as any[]).filter((line) => (line.private?.[0]?.data?.record ?? line.legacy_kind ?? line.kind) === "compacted")).toHaveLength(1);
+      expect(sessionFacts(fixture.home, id).filter((fact) => fact.type === "context.settled" && fact.data.kind === "compaction")).toHaveLength(1);
       expect(readFileSync(logPath).subarray(0, before.length).equals(before)).toBe(true);
 
       // Another fresh process reads the saved turn by its ID, through the
@@ -492,17 +569,17 @@ test("a tool turn keeps its result as a blob of the session", async () => {
     expect(created.stderr).toContain("V2_TOOL_OUTPUT_7731");
     const id = JSON.parse(created.stdout).session_id;
     const lines = logLines(fixture.home, id);
-    expect(shape(lines)).toContain("item:tool_call");
-    expect(shape(lines)).toContain("item:tool_result");
+    expect(sessionFacts(fixture.home, id).map((fact) => fact.type)).toContain("call.requested");
+    expect(sessionFacts(fixture.home, id).map((fact) => fact.type)).toContain("call.settled");
     // The body is a read-only blob named by its hash, not in the log, and
     // the result item lists it (D44).
-    const result = (lines as any[]).find((line) => (line.private?.[0]?.data?.record ?? line.legacy_kind ?? line.kind) === "item" && line.type === "tool_result");
-    const handle = /result-[a-f0-9]{64}\.txt/.exec(JSON.stringify(itemData(result)))?.[0] ?? "";
+    const result = sessionFacts(fixture.home, id).find((fact) => fact.type === "call.settled");
+    const handle = result?.data?.output?.output_handle ?? "";
     expect(handle).toMatch(/^result-[a-f0-9]{64}\.txt$/);
     const hash = /-([a-f0-9]{64})\./.exec(handle)![1]!;
     expect(blobNames(fixture, id)).toContain(hash);
     expect(readFileSync(blobPath(fixture, id, handle), "utf8")).toContain("V2_TOOL_OUTPUT_7731");
-    expect((lines as any[]).some((line) => (line.blobs ?? []).includes(hash))).toBe(true);
+    expect(readFileSync(join(sessionDir(fixture.home, id), "log.jsonl"), "utf8")).toContain(hash);
 
     const resumed = await ask(fixture, gateway, ["--resume", "last", "What did the tool print?"]);
     expect(resumed.code).toBe(0);
@@ -616,12 +693,11 @@ test("fx ask killed in the middle of a turn resumes with that turn interrupted",
     // The killed turn's user piece was saved before the model call; the
     // reopen ended that turn as a crash, and the model saw it.
     expect(gateway.requests.at(-1)!.body).toContain("This turn is killed.");
-    const lines = logLines(fixture.home, id);
-    for (const [index, line] of lines.entries()) expect(line.seq).toBe(index + 1);
-    const crashed = lines.filter((line) => (line.private?.[0]?.data?.record ?? line.legacy_kind ?? line.kind) === "turn_interrupted");
-    expect(crashed.map((line) => line.reason)).toEqual(["crash"]);
-    expect(shape(lines).filter((kind) => kind === "turn_committed").length).toBe(2);
-    expect(shape(lines).filter((kind) => kind === "item:user").length).toBe(3);
+    const physical = readFileSync(join(sessionDir(fixture.home, id), "log.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    for (const [index, line] of physical.entries()) expect(line.seq).toBe(index + 1);
+    expect(settledTurns(fixture.home, id, "failed")).toHaveLength(1);
+    expect(settledTurns(fixture.home, id, "completed")).toHaveLength(2);
+    expect(sessionFacts(fixture.home, id).filter((fact) => fact.type === "delivery.consumed")).toHaveLength(3);
     expectWholeLog(fixture, id);
     expectNoV1Sessions(fixture);
   } finally {
@@ -670,9 +746,8 @@ test("a kill while a tool runs keeps the finished tool and answers the running o
     const slow = results.find((part) => part.toolCallId === "v2-slow-2");
     expect(slow?.output?.type).toBe("error-text");
     expect(slow?.output?.value).toContain("may have partly run");
-    const lines = logLines(fixture.home, id);
-    expect(lines.filter((line) => (line.private?.[0]?.data?.record ?? line.legacy_kind ?? line.kind) === "item" && line.type === "tool_running").length).toBe(2);
-    expect(lines.filter((line) => (line.private?.[0]?.data?.record ?? line.legacy_kind ?? line.kind) === "turn_interrupted").map((line) => line.reason)).toEqual(["crash"]);
+    expect(sessionFacts(fixture.home, id).filter((fact) => fact.type === "call.started")).toHaveLength(2);
+    expect(settledTurns(fixture.home, id, "failed")).toHaveLength(1);
     expectWholeLog(fixture, id);
     expectNoV1Sessions(fixture);
   } finally {
@@ -708,8 +783,8 @@ test("a kill while a tool runs keeps the text of the message that issued it", as
     run.child.kill("SIGKILL");
     await run.exited;
     // The text is saved with the running call, before the tool finishes (D51).
-    const running = logLines(fixture.home, id).filter((line) => (line.private?.[0]?.data?.record ?? line.legacy_kind ?? line.kind) === "item" && line.type === "assistant_running");
-    expect(running.length).toBe(2);
+    const running = sessionFacts(fixture.home, id).filter((fact) => fact.type === "content.completed" && fact.data.phase === "tool");
+    expect(running).toHaveLength(2);
     expect(JSON.stringify(running.at(-1))).toContain("RUNNING_PLAN_7731");
 
     const resumed = await ask(fixture, gateway, ["--resume-id", id, "After the text kill."]);
@@ -725,9 +800,7 @@ test("a kill while a tool runs keeps the text of the message that issued it", as
     expect(body.split("EARLIER_PLAN_2209").length - 1).toBe(1);
     const { results } = promptToolParts(body);
     expect(results.find((part) => part.toolCallId === "v2-slow-2")?.output?.value).toContain("may have partly run");
-    expect(logLines(fixture.home, id).filter((line) => (line.private?.[0]?.data?.record ?? line.legacy_kind ?? line.kind) === "turn_interrupted").map((line) => line.reason)).toEqual([
-      "crash",
-    ]);
+    expect(settledTurns(fixture.home, id, "failed")).toHaveLength(1);
     expectWholeLog(fixture, id);
   } finally {
     gateway.stop();
@@ -1039,8 +1112,7 @@ test.skipIf(!tmuxAvailable())("the interactive app saves to v2 and resumes with 
       expect(onlySessionId(fixture.home)).toBe(id);
     }
     expect(gateway.requests.at(-1)!.body).toContain("First interactive question.");
-    const kinds = logLines(fixture.home, id).map((line) => line.kind);
-    expect(kinds.filter((kind) => kind === "turn_committed").length).toBe(4);
+    expect(settledTurns(fixture.home, id, "completed")).toHaveLength(4);
     expectWholeLog(fixture, id);
     expectNoV1Sessions(fixture);
   } finally {
@@ -1128,8 +1200,7 @@ test.skipIf(!tmuxAvailable())("a killed interactive turn comes back interrupted 
     expect(onlySessionId(fixture.home)).toBe(id);
     // The killed prompt was saved before its request, and the model sees it.
     expect(gateway.requests.at(-1)!.body).toContain("This interactive turn is killed.");
-    const lines = logLines(fixture.home, id);
-    expect(lines.filter((line) => (line.private?.[0]?.data?.record ?? line.legacy_kind ?? line.kind) === "turn_interrupted").map((line) => line.reason)).toEqual(["crash"]);
+    expect(settledTurns(fixture.home, id, "failed")).toHaveLength(1);
     expectWholeLog(fixture, id);
     expectNoV1Sessions(fixture);
   } finally {
@@ -1296,17 +1367,14 @@ test.skipIf(!tmuxAvailable())(forkTest, async () => {
     const ids = savedSessionIds(fixture.home);
     expect(ids.length).toBe(2);
     const fork = ids.find((id) => id !== source)!;
-    expect(logLines(fixture.home, fork).filter((line) => (line.private?.[0]?.data?.record ?? line.legacy_kind ?? line.kind) === "turn_committed").length).toBe(1);
+    expect(settledTurns(fixture.home, fork, "completed")).toHaveLength(1);
     const forkLog = readFileSync(join(storeRoot(fixture.home), fork, "log.jsonl"), "utf8");
     expect(forkLog).toContain("Fork prompt one.");
     expect(forkLog).not.toContain("Fork prompt two.");
     expect(storedTitles(fixture, fork).at(-1)).toBe("Fork source (fork)");
-    // The fork wrote nothing into the source; closing it on the switch adds
-    // only the manager's clean-close line.
+    // The fork writes nothing into the source; v27 sessions need no close line.
     const sourceAfterFork = readFileSync(sourcePath);
-    expect(sourceAfterFork.subarray(0, sourceLog.length).equals(sourceLog)).toBe(true);
-    const added = sourceAfterFork.subarray(sourceLog.length).toString("utf8").trimEnd().split("\n");
-    expect(added.map((line) => decodeLogLine(line).kind)).toEqual(["closed"]);
+    expect(sourceAfterFork.equals(sourceLog)).toBe(true);
 
     // The next prompt goes on in the fork; the source stays as it was.
     await app.session.sendKeys("C-u");
@@ -1463,8 +1531,7 @@ test("ACP keeps a session once prompted, lists it, and loads every turn after a 
     expect(await client.close()).toBe(0);
     client = undefined;
 
-    const lines = logLines(fixture.home, id);
-    expect(lines.filter((line) => (line.private?.[0]?.data?.record ?? line.legacy_kind ?? line.kind) === "turn_committed").length).toBe(3);
+    expect(settledTurns(fixture.home, id, "completed")).toHaveLength(3);
     expectWholeLog(fixture, id);
     expectNoV1Sessions(fixture);
   } finally {
@@ -1503,8 +1570,7 @@ test("ACP killed in the middle of a prompt loads with that turn interrupted", as
     expect(gateway.requests.at(-1)!.body).toContain("ACP_BEFORE");
     expect(await client.close()).toBe(0);
     client = undefined;
-    const lines = logLines(fixture.home, id);
-    expect(lines.filter((line) => (line.private?.[0]?.data?.record ?? line.legacy_kind ?? line.kind) === "turn_interrupted").map((line) => line.reason)).toEqual(["crash"]);
+    expect(settledTurns(fixture.home, id, "failed")).toHaveLength(1);
     expectWholeLog(fixture, id);
   } finally {
     if (client) await client.kill();
@@ -1721,7 +1787,7 @@ test("fx ask saves an image as its session's blob, names it to the model, and re
     expect(notedImagePaths(gateway.requests[0]!.body)).toEqual([images[0]!.path]);
     expect(gateway.requests[0]!.body).not.toContain(image);
     const resumed = await ask(fixture, gateway, ["--resume-id", id, "And again."]);
-    expect(resumed.code).toBe(0);
+    expect(resumed.code, resumed.stderr + resumed.stdout).toBe(0);
     // The prompt text says "image" too, so match the part's media type.
     expect(gateway.requests[0]!.body).toContain("image/png");
     expect(gateway.requests.at(-1)!.body).toContain("image/png");
@@ -1965,11 +2031,10 @@ test.skipIf(!tmuxAvailable())("ACP load after a compaction shows every earlier t
     expect(await client.close()).toBe(0);
     client = undefined;
     const after = readFileSync(join(storeRoot(fixture.home), id, "log.jsonl"));
-    // Load adds no history: its writable open ends with the clean-exit
-    // marker every close appends.
+    // Load adds no history; resumable v27 sessions need no close marker.
     expect(after.subarray(0, saved.length)).toEqual(saved);
     const appended = after.subarray(saved.length).toString("utf8").split("\n").filter(Boolean);
-    expect(appended.map((line) => decodeLogLine(line).kind)).toEqual(["closed"]);
+    expect(appended).toEqual([]);
     expect(readFileSync(join(fixture.workspace, "replay-effects.txt"), "utf8")).toBe("V2_SAVED_TOOL_OUTPUT\n");
     expect(gateway.requests).toHaveLength(5);
     expectWholeLog(fixture, id);
@@ -1994,7 +2059,7 @@ test("fx ask runs a one-off subagent as a v2 child with its own log, recorded in
   try {
     // A subagent run prints its progress on stderr.
     const result = await ask(fixture, gateway, ["Delegate the marker report."]);
-    expect(result.code).toBe(0);
+    expect(result.code, result.stderr + result.stdout).toBe(0);
     expect(result.stderr).not.toContain("panic");
     const output = JSON.parse(result.stdout);
     expect(output.output).toBe("PARENT_DONE");
@@ -2079,7 +2144,7 @@ test("a named subagent keeps its id, history and instructions across fx ask runs
     expect(childBodies[1]).toContain("REVIEW_ONE");
     const childId = lines[0].child;
     const child = logLines(fixture.home, childId);
-    expect(shape(child).filter((kind) => kind === "turn_committed").length).toBe(2);
+    expect(settledTurns(fixture.home, childId, "completed")).toHaveLength(2);
     expectWholeLog(fixture, id);
     expectWholeLog(fixture, childId);
   } finally {
@@ -2382,7 +2447,7 @@ test.skipIf(!tmuxAvailable())("fx session lists a compacted session's every turn
       );
       const text = await command(fixture, gateway, ["session", id]);
       expect(text.stdout).toContain("Earlier detail request");
-      expect(text.stdout).toContain("[compacted] removed_turns=3 compactions=1");
+      expect(text.stdout).toContain("[compacted] removed_turns=1 compactions=1");
       expectWholeLog(fixture, id);
     } finally {
       if (session) await session.kill();
@@ -2391,10 +2456,9 @@ test.skipIf(!tmuxAvailable())("fx session lists a compacted session's every turn
     }
   }
   expect(shape).toEqual([
-    ["assistant", "Earlier detail request", "DETAIL_EARLIER"],
+    ["summary", true, 1, 1],
     ["assistant", "Middle detail request", "DETAIL_MIDDLE"],
     ["assistant", "Latest detail request", "DETAIL_LATEST"],
-    ["summary", true, 3, 1],
     ["assistant", "After detail request", "DETAIL_AFTER"],
   ]);
 }, TIMEOUT * 8);
@@ -2730,7 +2794,7 @@ test.skipIf(!tmuxAvailable())("the app resumes a compacted session from its summ
     expect(earlier[0]).toContain("compacted_conversation");
     expect(earlier[0]).toContain("COMPACT_EARLIER_ANSWER");
     expect(readFileSync(join(storeRoot(fixture.home), id, "log.jsonl")).subarray(0, saved.length)).toEqual(saved);
-    expect(logLines(fixture.home, id).filter((line) => (line.private?.[0]?.data?.record ?? line.legacy_kind ?? line.kind) === "compacted")).toHaveLength(1);
+    expect(sessionFacts(fixture.home, id).filter((fact) => fact.type === "context.settled" && fact.data.kind === "compaction")).toHaveLength(1);
     expectWholeLog(fixture, id);
   } finally {
     gateway.stop();
@@ -2804,9 +2868,8 @@ test.skipIf(!tmuxAvailable())("text typed while the app answers steers that turn
     // Steering continues the turn it interrupts: one committed turn that
     // holds the steering, and nothing interrupted.
     const id = onlySessionId(fixture.home);
-    const kinds = logLines(fixture.home, id).map((line) => line.kind);
-    expect(kinds.filter((kind) => kind === "turn_committed")).toHaveLength(1);
-    expect(kinds).not.toContain("turn_interrupted");
+    expect(settledTurns(fixture.home, id, "completed")).toHaveLength(1);
+    expect(settledTurns(fixture.home, id, "failed")).toHaveLength(0);
     expect(countIn(readFileSync(join(storeRoot(fixture.home), id, "log.jsonl"), "utf8"), steering)).toBe(1);
 
     const resumed = await startApp(fixture, gateway, ["-c"]);
@@ -2857,9 +2920,8 @@ test.skipIf(!tmuxAvailable())("a cancelled app reply is saved as cancelled, and 
     await quitApp(app);
 
     const id = onlySessionId(fixture.home);
-    const lines = logLines(fixture.home, id);
-    expect(lines.filter((line) => (line.private?.[0]?.data?.record ?? line.legacy_kind ?? line.kind) === "turn_interrupted").map((line) => line.reason)).toEqual(["cancel"]);
-    expect(lines.filter((line) => (line.private?.[0]?.data?.record ?? line.legacy_kind ?? line.kind) === "turn_committed")).toHaveLength(1);
+    expect(settledTurns(fixture.home, id, "cancelled")).toHaveLength(1);
+    expect(settledTurns(fixture.home, id, "completed")).toHaveLength(1);
 
     const resumed = await startApp(fixture, gateway, ["-c"]);
     const shown = await scrollbackContains(resumed.session, "AFTER_CANCEL_ANSWER");
@@ -2941,7 +3003,7 @@ test("a parent killed while a named child runs a tool records that work interrup
     // The next message continues the same child, with its first turn.
     expect(childBodies.at(-1)).toContain("CHILD_FIRST_DONE");
     expect(childBodies.at(-1)).toContain("Child work again.");
-    expect(logLines(fixture.home, childId).filter((line) => (line.private?.[0]?.data?.record ?? line.legacy_kind ?? line.kind) === "turn_committed")).toHaveLength(2);
+    expect(settledTurns(fixture.home, childId, "completed")).toHaveLength(2);
     expectWholeLog(fixture, id);
     expectWholeLog(fixture, childId);
   } finally {
@@ -3044,8 +3106,8 @@ for (const action of ["run", "message"] as const) {
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
       // One result for the delegation, and the child's work ends once.
-      const results = logLines(fixture.home, parent).filter((line: any) =>
-        (line.private?.[0]?.data?.record ?? line.legacy_kind ?? line.kind) === "item" && line.type === "tool_result" && JSON.stringify(line).includes("steering-delegation"));
+      const results = sessionFacts(fixture.home, parent).filter((fact: any) =>
+        fact.type === "call.settled" && JSON.stringify(fact.data.output).includes("steering-delegation"));
       expect(results).toHaveLength(1);
       expect(childLines(fixture.home, parent).filter((line) => (line.private?.[0]?.data?.record ?? line.legacy_kind ?? line.kind) === "child_finished")).toHaveLength(1);
       expect(childWork(fixture.home, parent)).toEqual({ ...original, outcome: "ok" });
@@ -3122,7 +3184,7 @@ test.skipIf(!tmuxAvailable())("an app killed between turns resumes with its last
     await app.session.waitForText("SAVED_BEFORE_IDLE_KILL", TIMEOUT);
     await app.session.waitForComposer(TIMEOUT);
     const id = onlySessionId(fixture.home);
-    await waitForLog(fixture, id, "turn_committed");
+    await waitForLog(fixture, id, "turn.settled");
     Bun.spawnSync(["kill", "-9", String(app.session.processPid())]);
     await app.session.kill();
 
@@ -3131,9 +3193,8 @@ test.skipIf(!tmuxAvailable())("an app killed between turns resumes with its last
     await resumed.session.sendText("Continue after the idle kill.");
     await resumed.session.waitForText("AFTER_IDLE_KILL", TIMEOUT);
     await quitApp(resumed);
-    const kinds = logLines(fixture.home, id).map((line) => line.kind);
-    expect(kinds.filter((kind) => kind === "turn_committed")).toHaveLength(2);
-    expect(kinds).not.toContain("turn_interrupted");
+    expect(settledTurns(fixture.home, id, "completed")).toHaveLength(2);
+    expect(settledTurns(fixture.home, id, "failed")).toHaveLength(0);
     expect(gateway.requests.at(-1)!.body).toContain("SAVED_BEFORE_IDLE_KILL");
     expectWholeLog(fixture, id);
   } finally {
@@ -3153,7 +3214,7 @@ test("ACP killed between prompts loads with its last turn whole", async () => {
     client = await AcpRpc.start(fixture, gateway);
     const id = (await client.ok("session/new", { cwd: fixture.workspace, mcpServers: [] })).sessionId;
     await client.ok("session/prompt", { sessionId: id, ...acpPrompt("Before the idle ACP kill.") });
-    await waitForLog(fixture, id, "turn_committed");
+    await waitForLog(fixture, id, "turn.settled");
     await client.kill();
 
     client = await AcpRpc.start(fixture, gateway);
@@ -3163,7 +3224,7 @@ test("ACP killed between prompts loads with its last turn whole", async () => {
     await client.ok("session/prompt", { sessionId: id, ...acpPrompt("After the idle ACP kill.") });
     expect(await client.close()).toBe(0);
     client = undefined;
-    expect(logLines(fixture.home, id).map((line) => line.kind)).not.toContain("turn_interrupted");
+    expect(settledTurns(fixture.home, id, "failed")).toHaveLength(0);
     expect(gateway.requests.at(-1)!.body).toContain("ACP_BEFORE_IDLE_KILL");
     expectWholeLog(fixture, id);
   } finally {
@@ -3356,9 +3417,8 @@ test.skipIf(!tmuxAvailable())("an app whose disk fills keeps running, and the se
     await quitApp(resumed);
     // The filled turn kept its prompt, not its answer, and a resume closed it
     // as interrupted; the refused prompt left nothing.
-    const kinds = logLines(fixture.home, id).map((line) => line.kind);
-    expect(kinds.filter((kind) => kind === "turn_committed")).toHaveLength(2);
-    expect(kinds.filter((kind) => kind === "turn_interrupted")).toHaveLength(1);
+    expect(settledTurns(fixture.home, id, "completed")).toHaveLength(2);
+    expect(settledTurns(fixture.home, id, "failed")).toHaveLength(1);
     const last = gateway.requests.at(-1)!.body;
     expect(last).toContain("The disk fills in this turn.");
     expect(last).not.toContain("LONG_UNSAVED_START");
@@ -3431,7 +3491,7 @@ test.skipIf(!tmuxAvailable())("an app killed after a named child finished resume
     const roots = rootSessionIds(fixture.home);
     expect(roots).toHaveLength(1);
     const id = roots[0]!;
-    await waitForLog(fixture, id, "turn_committed");
+    await waitForLog(fixture, id, "turn.settled");
     Bun.spawnSync(["kill", "-9", String(app.session.processPid())]);
     await app.session.kill();
 
@@ -3449,9 +3509,9 @@ test.skipIf(!tmuxAvailable())("an app killed after a named child finished resume
     expect(lines[2].child).toBe(lines[0].child);
     const childId = lines[0].child;
     const child = logLines(fixture.home, childId).map((line) => line.kind);
-    expect(child.filter((kind) => kind === "turn_committed")).toHaveLength(2);
+    expect(settledTurns(fixture.home, childId, "completed")).toHaveLength(2);
     expect(JSON.stringify(logLines(fixture.home, childId))).toContain("CHILD_REMEMBERED");
-    expect(logLines(fixture.home, id).map((line) => line.kind)).not.toContain("turn_interrupted");
+    expect(settledTurns(fixture.home, id, "failed")).toHaveLength(0);
     expectWholeLog(fixture, id);
     expectWholeLog(fixture, childId);
   } finally {
@@ -3507,7 +3567,7 @@ test.skipIf(!tmuxAvailable())("a hosted terminal ends with an app crash, and the
     await app.session.waitForText("TTY_STARTED", TIMEOUT);
     expect(shellId).toMatch(/^shell-[A-Za-z0-9_-]{22}$/);
     const id = onlySessionId(fixture.home);
-    await waitForLog(fixture, id, "turn_committed");
+    await waitForLog(fixture, id, "turn.settled");
     const shellPid = Number(terminalRecords(fixture, id).find((record) => record.session_id === shellId)?.pid);
     expect(alive(shellPid)).toBe(true);
     Bun.spawnSync(["kill", "-9", String(app.session.processPid())]);
@@ -3564,7 +3624,7 @@ function expectToolKillRepaired(fixture: Fixture, id: string, body: string, pref
   const { calls, results } = promptToolParts(body);
   expect(calls.map((part) => part.toolCallId)).toEqual([`${prefix}-fast-1`, `${prefix}-slow-2`]);
   expect(results.find((part) => part.toolCallId === `${prefix}-slow-2`)?.output?.value).toContain("may have partly run");
-  expect(logLines(fixture.home, id).filter((line) => (line.private?.[0]?.data?.record ?? line.legacy_kind ?? line.kind) === "turn_interrupted").map((line) => line.reason)).toEqual(["crash"]);
+  expect(settledTurns(fixture.home, id, "failed")).toHaveLength(1);
   expectWholeLog(fixture, id);
 }
 
@@ -3837,9 +3897,10 @@ async function makeGridBase(exit: GridExit, by: "ask" | "app") {
       }
     }
     // A crash leaves its turn open, for the next open to end.
-    const kinds = logLines(fixture.home, id).map((line) => line.kind);
-    const ended = kinds.filter((kind) => kind === "turn_committed" || kind === "turn_interrupted").length;
-    expect(kinds.filter((kind) => kind === "turn_started").length - ended).toBe(exit.startsWith("crashed") ? 1 : 0);
+    const facts = sessionFacts(fixture.home, id);
+    const started = facts.filter((fact) => fact.type === "turn.started").length;
+    const ended = facts.filter((fact) => fact.type === "turn.settled").length;
+    expect(started - ended).toBe(exit.startsWith("crashed") ? 1 : 0);
     return { fixture, id };
   } finally {
     gateway.stop();
@@ -4019,11 +4080,8 @@ function expectGridHistory(exit: GridExit, body: string, label: string) {
 /// writable open, so that open has already ended a crashed turn, and its
 /// close is written (D39).
 function expectLogKept(faulted: Buffer, after: Buffer, exit: GridExit, fault: GridFault, label: string) {
-  if (fault !== "lost-blob") return expect(after.equals(faulted), `${label} log unchanged`).toBe(true);
-  expect(after.subarray(0, faulted.length).equals(faulted), `${label} log kept`).toBe(true);
-  const added = after.subarray(faulted.length).toString("utf8").trimEnd().split("\n").filter(Boolean).map((line) => decodeLogLine(line).kind)
-    .filter((kind) => kind !== "v27_commit");
-  expect(added, label).toEqual(exit.startsWith("crashed") ? ["turn_interrupted", "closed"] : ["closed"]);
+  void exit; void fault;
+  expect(after.equals(faulted), `${label} log unchanged`).toBe(true);
 }
 
 let gridTokens = 0;
@@ -4119,12 +4177,9 @@ async function gridRow(exit: GridExit, entry: GridEntry) {
           const tail = readFileSync(c.log).subarray(-160);
           expect(tail.at(-1), `${label}: the log ends in ${JSON.stringify(tail.toString("utf8"))}`).toBe(0x0a);
           expectWholeLog(c.fixture, c.id);
-          const reasons = logLines(c.fixture.home, c.id).filter((line) => (line.private?.[0]?.data?.record ?? line.legacy_kind ?? line.kind) === "turn_interrupted").map((line) => line.reason);
-          if (exit === "cancelled") expect(reasons, label).toContain("cancel");
-          if (exit === "crashed" || exit === "crashed-mid-tool") expect(reasons, label).toContain("crash");
-          const last_compatibility = logLines(c.fixture.home, c.id).map((line) => line.kind).filter((kind) => kind !== "v27_commit").at(-1);
-          if (fault === "full-disk") expect(["closed", "turn_committed", "turn_interrupted"], label).toContain(last_compatibility);
-          else expect(last_compatibility, label).toBe("closed");
+          const outcomes = settledTurns(c.fixture.home, c.id).map((fact) => fact.data.outcome);
+          if (exit === "cancelled") expect(outcomes, label).toContain("cancelled");
+          if (exit === "crashed" || exit === "crashed-mid-tool") expect(outcomes, label).toContain("failed");
         }
       } finally {
         await clear();

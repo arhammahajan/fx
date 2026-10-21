@@ -962,7 +962,18 @@ pub const Runtime = struct {
     ) !?[]u8 {
         const history = self.children.parent.store.childHistory(alloc, child_id) catch return null;
         defer types.freeHistoryTurnSlice(alloc, history);
-        const text = assistantTextForWork(history, work_id) orelse return null;
+        const text = assistantTextForWork(history, work_id) orelse blk: {
+            var index = history.len;
+            while (index > 0) {
+                index -= 1;
+                switch (history[index]) {
+                    .assistant => |entry| break :blk entry.assistant,
+                    .interrupted => |entry| if (entry.assistant) |value| break :blk value,
+                    .compacted_summary => {},
+                }
+            }
+            return null;
+        };
         return @as(?[]u8, try alloc.dupe(u8, text));
     }
 

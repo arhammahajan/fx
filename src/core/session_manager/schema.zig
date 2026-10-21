@@ -89,6 +89,15 @@ pub fn parseHeader(line: []const u8) HeaderError!Header {
             return .{ .v = v, .seq = seq, .ts_ms = ts_ms, .kind_name = "snapshot", .kind = .snapshot, .len = p.at, .pos = pos };
         }
         if (!std.mem.eql(u8, name, "commit")) return error.BadHeader;
+        if (std.mem.findPos(u8, line, p.at, ",\"commit\":\"v27\"") != null) return .{
+            .v = v,
+            .seq = seq,
+            .ts_ms = ts_ms,
+            .kind_name = "v27_commit",
+            .kind = .v27_commit,
+            .len = p.at,
+            .pos = pos,
+        };
         const private_at = std.mem.findPos(u8, line, p.at, ",\"private\":[") orelse return error.BadHeader;
         const record_prefix = "\"record\":\"";
         const record_at = std.mem.findPos(u8, line, private_at, record_prefix) orelse return error.BadHeader;
@@ -192,7 +201,10 @@ pub const Body = union(Kind) {
     /// `data` is fx's raw JSON about the child or the work (D22).
     pub const WorkItem = struct { child: []const u8, work_id: []const u8, data: ?[]const u8 = null };
     pub const Finished = struct { child: []const u8, work_id: []const u8, outcome: Outcome, data: ?[]const u8 = null };
-    pub const V27Commit = struct { facts: []const u8 };
+    pub const V27Commit = struct {
+        facts: []const u8,
+        private_bodies: []const Body = &.{},
+    };
     pub const Snapshot = struct { covers_seq: u64, state: []const u8, compaction_offset: ?u64 };
 };
 
@@ -245,7 +257,16 @@ pub fn appendBody(gpa: std.mem.Allocator, out: *std.ArrayList(u8), body: Body) e
             try w.string("outcome", @tagName(c.outcome));
             if (c.data) |data| try w.raw("data", data);
         },
-        .v27_commit => |commit| try w.raw("facts", commit.facts),
+        .v27_commit => |commit| {
+            try w.raw("facts", commit.facts);
+            const has_private = for (commit.private_bodies) |private_body| {
+                if (private_body != .v27_commit) break true;
+            } else false;
+            if (has_private) {
+                try w.key("private");
+                try appendPrivateBodies(gpa, out, commit.private_bodies);
+            }
+        },
         .snapshot => |s| {
             try w.number("covers_seq", s.covers_seq);
             try w.raw("state", s.state);
@@ -258,15 +279,31 @@ pub fn appendBody(gpa: std.mem.Allocator, out: *std.ArrayList(u8), body: Body) e
 /// Appends the durable v3 fields for an internal transition. Public history
 /// is facts only; compatibility state is confined to a private entry.
 pub fn appendStoredBody(gpa: std.mem.Allocator, out: *std.ArrayList(u8), body: Body) error{OutOfMemory}!void {
-    if (body == .snapshot) return appendBody(gpa, out, body);
+    switch (body) {
+        .snapshot => return appendBody(gpa, out, body),
+        .v27_commit => |commit| {
+            try out.appendSlice(gpa, ",\"commit\":\"v27\"");
+            var writer: FieldWriter = .{ .gpa = gpa, .out = out };
+            try writer.raw("facts", commit.facts);
+            const has_private = for (commit.private_bodies) |private_body| {
+                if (private_body != .v27_commit) break true;
+            } else false;
+            if (has_private) {
+                try writer.key("private");
+                try appendPrivateBodies(gpa, out, commit.private_bodies);
+            }
+            return;
+        },
+        else => {},
+    }
+    std.debug.assert(std.meta.activeTag(body) != .v27_commit);
     var legacy: std.ArrayList(u8) = .empty;
     defer legacy.deinit(gpa);
     try appendBody(gpa, &legacy, body);
     try out.appendSlice(gpa, ",\"facts\":");
     switch (body) {
-        .v27_commit => |commit| try out.appendSlice(gpa, commit.facts),
         .session_created => try out.appendSlice(gpa, "[{\"type\":\"session.started\",\"data\":{}}]"),
-        else => try out.print(gpa, "[{{\"type\":\"fx.{s}\",\"data\":{{}}}}]", .{@tagName(std.meta.activeTag(body))}),
+        else => try appendLegacyContextFacts(gpa, out, body, legacy.items),
     }
     try out.appendSlice(gpa, ",\"private\":[{");
     const private_kind: []const u8 = switch (body) {
@@ -294,6 +331,27 @@ pub fn appendStoredBody(gpa: std.mem.Allocator, out: *std.ArrayList(u8), body: B
     try out.appendSlice(gpa, "}}}]");
 }
 
+fn appendLegacyContextFacts(gpa: std.mem.Allocator, out: *std.ArrayList(u8), body: Body, encoded: []const u8) error{OutOfMemory}!void {
+    const tag = @tagName(std.meta.activeTag(body));
+    var hasher = std.hash.Wyhash.init(0);
+    hasher.update(out.items);
+    hasher.update(encoded);
+    const hash = hasher.final();
+    const change_id = try gpa.print("legacy-{s}-{x}", .{ tag, hash });
+    defer gpa.free(change_id);
+    const kind = try gpa.print("legacy.{s}", .{tag});
+    defer gpa.free(kind);
+    try out.appendSlice(gpa, "[{\"type\":\"context.started\",\"data\":{\"changeId\":");
+    try appendJsonString(gpa, out, change_id);
+    try out.appendSlice(gpa, ",\"kind\":");
+    try appendJsonString(gpa, out, kind);
+    try out.appendSlice(gpa, "}},{\"type\":\"context.settled\",\"data\":{\"changeId\":");
+    try appendJsonString(gpa, out, change_id);
+    try out.appendSlice(gpa, ",\"kind\":");
+    try appendJsonString(gpa, out, kind);
+    try out.appendSlice(gpa, ",\"outcome\":\"completed\"}}]");
+}
+
 pub const BodyError = error{ BadBody, OutOfMemory };
 
 /// Parses the fields of a line of `kind`. Unknown fields are ignored.
@@ -309,7 +367,10 @@ pub fn parseLineBody(arena: std.mem.Allocator, kind: Kind, line: []const u8) Bod
     if (line.len == 0 or line[line.len - 1] != '\n') return error.BadBody;
     const outer = try Fields.parseObject(arena, line[0 .. line.len - 1]);
     if (kind == .snapshot) return bodyOf(kind, outer);
-    if (kind == .v27_commit) return .{ .v27_commit = .{ .facts = try outer.rawReq("facts") } };
+    if (kind == .v27_commit) return .{ .v27_commit = .{
+        .facts = try outer.rawReq("facts"),
+        .private_bodies = try parsePrivateBodies(arena, outer.raw("private")),
+    } };
     if (outer.raw("private")) |private| {
         const entries = try rawElements(arena, private);
         if (entries.len == 0) return error.BadBody;
@@ -359,7 +420,10 @@ fn bodyOf(kind: Kind, f: Fields) BodyError!Body {
             .outcome = try f.req(Outcome, "outcome"),
             .data = f.raw("data"),
         } },
-        .v27_commit => .{ .v27_commit = .{ .facts = try f.rawReq("facts") } },
+        .v27_commit => .{ .v27_commit = .{
+            .facts = try f.rawReq("facts"),
+            .private_bodies = try parsePrivateBodies(f.arena, f.raw("private")),
+        } },
         .snapshot => .{ .snapshot = .{
             .covers_seq = try f.req(u64, "covers_seq"),
             .state = try f.rawReq("state"),
@@ -367,6 +431,22 @@ fn bodyOf(kind: Kind, f: Fields) BodyError!Body {
         } },
         .closed => .closed,
     };
+}
+
+fn parsePrivateBodies(arena: std.mem.Allocator, raw: ?[]const u8) BodyError![]const Body {
+    const source = raw orelse return &.{};
+    var bodies: std.ArrayList(Body) = .empty;
+    for (try rawElements(arena, source)) |raw_entry| {
+        const entry = try Fields.parseObject(arena, raw_entry);
+        const data = try Fields.parseObject(arena, try entry.rawReq("data"));
+        const record = try data.req([]const u8, "record");
+        const kind = std.meta.stringToEnum(Kind, record) orelse return error.BadBody;
+        if (kind == .v27_commit) continue;
+        if (kind == .snapshot) return error.BadBody;
+        const fields = try Fields.parseObject(arena, try data.rawReq("body"));
+        try bodies.append(arena, try bodyOf(kind, fields));
+    }
+    return bodies.items;
 }
 
 /// The top-level fields of a JSON object fragment, as raw value slices.
@@ -577,6 +657,25 @@ fn plainString(value: []const u8) ?[]const u8 {
     return inner;
 }
 
+fn appendPrivateBodies(gpa: std.mem.Allocator, out: *std.ArrayList(u8), bodies: []const Body) error{OutOfMemory}!void {
+    try out.append(gpa, '[');
+    var written: usize = 0;
+    for (bodies) |body| {
+        if (body == .v27_commit) continue;
+        if (written > 0) try out.append(gpa, ',');
+        try out.appendSlice(gpa, "{\"kind\":\"model_context\",\"data\":{\"record\":");
+        try appendJsonString(gpa, out, @tagName(std.meta.activeTag(body)));
+        try out.appendSlice(gpa, ",\"body\":{");
+        var encoded: std.ArrayList(u8) = .empty;
+        defer encoded.deinit(gpa);
+        try appendBody(gpa, &encoded, body);
+        if (encoded.items.len > 0) try out.appendSlice(gpa, encoded.items[1..]);
+        try out.appendSlice(gpa, "}}}");
+        written += 1;
+    }
+    try out.append(gpa, ']');
+}
+
 const FieldWriter = struct {
     gpa: std.mem.Allocator,
     out: *std.ArrayList(u8),
@@ -743,13 +842,16 @@ test "header round trip" {
     try testing.expect(std.mem.find(u8, out.items[h.len..], "\"record\":\"turn_committed\"") != null);
 }
 
-test "v27 commits store public facts outside their private compatibility record" {
+test "v27 commits store public facts and private transitions in one line" {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(testing.allocator);
     try appendHeader(testing.allocator, &out, 2, 1727400000001, .v27_commit);
-    try appendStoredBody(testing.allocator, &out, .{ .v27_commit = .{ .facts = "[{\"type\":\"turn.started\",\"data\":{}}]" } });
+    try appendStoredBody(testing.allocator, &out, .{ .v27_commit = .{
+        .facts = "[{\"type\":\"turn.started\",\"data\":{}}]",
+        .private_bodies = &.{.{ .turn_started = .{ .turn = 1 } }},
+    } });
     try testing.expectEqualStrings(
-        "{\"v\":3,\"seq\":2,\"ts\":1727400000001,\"kind\":\"commit\",\"pos\":1,\"facts\":[{\"type\":\"turn.started\",\"data\":{}}],\"private\":[{\"kind\":\"model_context\",\"data\":{\"record\":\"v27_commit\",\"body\":{}}}]",
+        "{\"v\":3,\"seq\":2,\"ts\":1727400000001,\"kind\":\"commit\",\"pos\":1,\"commit\":\"v27\",\"facts\":[{\"type\":\"turn.started\",\"data\":{}}],\"private\":[{\"kind\":\"model_context\",\"data\":{\"record\":\"turn_started\",\"body\":{\"turn\":1}}}]",
         out.items,
     );
     try testing.expectEqual(Kind.v27_commit, (try parseHeader(out.items)).kind.?);
@@ -758,6 +860,22 @@ test "v27 commits store public facts outside their private compatibility record"
     defer arena.deinit();
     const body = try parseLineBody(arena.allocator(), .v27_commit, out.items);
     try testing.expectEqualStrings("[{\"type\":\"turn.started\",\"data\":{}}]", body.v27_commit.facts);
+    try testing.expectEqual(@as(usize, 1), body.v27_commit.private_bodies.len);
+    try testing.expectEqual(@as(u64, 1), body.v27_commit.private_bodies[0].turn_started.turn);
+}
+
+test "v27 commit without private transitions has no private marker" {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try appendStoredBody(testing.allocator, &out, .{ .v27_commit = .{ .facts = "[{\"type\":\"model.requested\",\"data\":{\"runId\":\"r\",\"owner\":{\"turnId\":\"t\"}}}]" } });
+    try testing.expect(std.mem.find(u8, out.items, "\"private\"") == null);
+
+    out.clearRetainingCapacity();
+    try appendStoredBody(testing.allocator, &out, .{ .v27_commit = .{
+        .facts = "[{\"type\":\"model.requested\",\"data\":{\"runId\":\"r\",\"owner\":{\"turnId\":\"t\"}}}]",
+        .private_bodies = &.{.{ .v27_commit = .{ .facts = "[]" } }},
+    } });
+    try testing.expect(std.mem.find(u8, out.items, "\"private\"") == null);
 }
 
 test "unknown kinds parse with a null kind" {

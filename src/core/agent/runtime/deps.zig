@@ -199,6 +199,13 @@ pub const DiffMarkerStyles = struct {
     removed: []const u8 = "",
 };
 
+pub const ModelLifecycleEvent = union(enum) {
+    requested: struct { model: []const u8 },
+    started: struct { attempt: u32 },
+    retried: struct { attempt: u32, code: []const u8, message: []const u8 },
+    settled: struct { outcome: []const u8, finish_reason: ?[]const u8 = null, usage: ?types.Usage = null },
+};
+
 pub const AgentRuntimeDeps = struct {
     ctx: *anyopaque,
     observer: ?*observation.Observer = null,
@@ -257,6 +264,7 @@ pub const AgentRuntimeDeps = struct {
     /// Called at every model-request boundary with the turn so far, so each
     /// completed piece is saved as it happens rather than at the turn's end.
     append_turn_piece: ?*const fn (ctx: *anyopaque, progress: TurnProgress) anyerror!void = null,
+    record_model_lifecycle: ?*const fn (ctx: *anyopaque, event: ModelLifecycleEvent) anyerror!void = null,
     /// Saves the turn's prompt images in the session before its first
     /// request is built, so the note naming each saved file is true when
     /// that request is sent (D89). It sets `blob_path`, allocated with

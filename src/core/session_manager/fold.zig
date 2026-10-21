@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const schema = @import("schema.zig");
+const v27_facts = @import("v27/facts.zig");
 
 pub const Interruption = struct { turn: u64, reason: schema.Reason };
 
@@ -84,6 +85,8 @@ pub const State = struct {
     compaction_offset: ?u64 = null,
     /// The last line is `closed`.
     clean_exit: bool = false,
+    /// New writes use atomic eve v27 commits rather than legacy line kinds.
+    native_v27: bool = false,
     last_seq: u64 = 0,
     /// `ts` of line 1 and of the newest line; 0 before the first turn
     /// (D20). The session fills both in the copies it hands out, from the
@@ -194,6 +197,7 @@ pub const State = struct {
         return a.last_compaction_seq == b.last_compaction_seq and
             a.compaction_offset == b.compaction_offset and
             a.clean_exit == b.clean_exit and
+            a.native_v27 == b.native_v27 and
             a.last_seq == b.last_seq;
     }
 };
@@ -224,7 +228,16 @@ pub const Line = struct {
 /// before `fork_seq` belong to the source and are skipped.
 pub fn apply(gpa: std.mem.Allocator, state: *State, fork_seq: u64, line: Line) error{OutOfMemory}!void {
     switch (line.body) {
-        .session_created, .item, .v27_commit, .snapshot, .closed => {},
+        .v27_commit => |commit| {
+            state.native_v27 = true;
+            for (commit.private_bodies) |private_body| try apply(gpa, state, fork_seq, .{
+                .seq = line.seq,
+                .offset = line.offset,
+                .body = private_body,
+            });
+            try foldV27Lifecycle(gpa, state, commit);
+        },
+        .session_created, .item, .snapshot, .closed => {},
         .turn_started => |t| {
             state.open_turn = t.turn;
             state.last_turn = @max(state.last_turn, t.turn);
@@ -252,7 +265,45 @@ pub fn apply(gpa: std.mem.Allocator, state: *State, fork_seq: u64, line: Line) e
         .child_finished => |c| if (line.seq > fork_seq) try state.finishChild(gpa, line.seq, c),
     }
     state.last_seq = line.seq;
-    state.clean_exit = line.body == .closed;
+    state.clean_exit = switch (line.body) {
+        .v27_commit => |commit| commit.private_bodies.len > 0 and commit.private_bodies[commit.private_bodies.len - 1] == .closed,
+        else => line.body == .closed,
+    };
+}
+
+fn foldV27Lifecycle(gpa: std.mem.Allocator, state: *State, commit: schema.Body.V27Commit) error{OutOfMemory}!void {
+    const has_private_turn = for (commit.private_bodies) |body| {
+        if (body == .turn_started or body == .turn_committed or body == .turn_interrupted) break true;
+    } else false;
+    if (has_private_turn) return;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const elements = schema.rawElements(arena.allocator(), commit.facts) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.BadBody => return,
+    };
+    for (elements) |raw| {
+        const fact = v27_facts.decode(arena.allocator(), raw) catch continue;
+        switch (fact.data) {
+            .turn_started => if (state.open_turn == null) {
+                state.last_turn += 1;
+                state.open_turn = state.last_turn;
+            },
+            .turn_settled => |settled| if (state.open_turn) |turn| {
+                state.open_turn = null;
+                if (std.mem.eql(u8, settled.outcome, "completed")) {
+                    state.committed += 1;
+                } else {
+                    state.interrupted += 1;
+                    state.last_interrupted = .{
+                        .turn = turn,
+                        .reason = if (std.mem.eql(u8, settled.outcome, "cancelled")) .cancel else .failed,
+                    };
+                }
+            },
+            else => {},
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -355,8 +406,8 @@ fn openWorkAt(state: *const State, earlier: []const Event, child: []const u8) ?[
 pub fn encodeState(gpa: std.mem.Allocator, out: *std.ArrayList(u8), state: *const State) error{OutOfMemory}!void {
     try out.print(gpa, "{{\"open_turn\":", .{});
     try printOptional(gpa, out, state.open_turn);
-    try out.print(gpa, ",\"last_turn\":{d},\"committed\":{d},\"interrupted\":{d},\"last_interrupted\":", .{
-        state.last_turn, state.committed, state.interrupted,
+    try out.print(gpa, ",\"last_turn\":{d},\"committed\":{d},\"interrupted\":{d},\"native_v27\":{},\"last_interrupted\":", .{
+        state.last_turn, state.committed, state.interrupted, state.native_v27,
     });
     if (state.last_interrupted) |i| {
         try out.print(gpa, "{{\"turn\":{d},\"reason\":\"{s}\"}}", .{ i.turn, @tagName(i.reason) });
@@ -404,6 +455,7 @@ pub fn decodeState(gpa: std.mem.Allocator, arena: std.mem.Allocator, raw: []cons
         .last_turn = try f.req(u64, "last_turn"),
         .committed = try f.req(u64, "committed"),
         .interrupted = try f.req(u64, "interrupted"),
+        .native_v27 = try f.opt(bool, "native_v27") orelse false,
         .last_interrupted = try f.opt(Interruption, "last_interrupted"),
         .last_compaction_seq = try f.opt(u64, "last_compaction_seq"),
         .compaction_offset = try f.opt(u64, "compaction_offset"),

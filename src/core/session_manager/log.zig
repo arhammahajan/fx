@@ -84,7 +84,7 @@ pub fn appendLine(
     errdefer out.shrinkRetainingCapacity(start);
     try schema.appendHeader(gpa, out, seq, ts_ms, kind);
     try out.appendSlice(gpa, body);
-    if (kind != .snapshot and std.mem.find(u8, body, "\"record\":\"") == null) {
+    if (kind != .snapshot and kind != .v27_commit and std.mem.find(u8, body, "\"record\":\"") == null) {
         try out.print(gpa, ",\"private\":[{{\"kind\":\"model_context\",\"data\":{{\"record\":\"{s}\",\"body\":{{}}}}}}]", .{@tagName(kind)});
     }
     try sealFrame(gpa, out, start);
@@ -691,6 +691,13 @@ test "a framed line checks, and its body comes back" {
     // The line is still valid JSON.
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out.items, .{});
     parsed.deinit();
+}
+
+test "a v27 frame without private transitions stays public-only" {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try appendLine(testing.allocator, &out, 1, 2, .v27_commit, ",\"commit\":\"v27\",\"facts\":[{\"type\":\"session.started\",\"data\":{}}]");
+    try testing.expect(std.mem.find(u8, out.items, "\"private\"") == null);
 }
 
 test "flipping any single bit of a line is detected" {

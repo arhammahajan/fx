@@ -336,6 +336,10 @@ pub fn Bindings(comptime App: type) type {
                     if (app.session_persistence.v2 != null) agentAppendTurnPiece else null
                 else
                     null,
+                .record_model_lifecycle = if (comptime @hasField(App, "session_persistence"))
+                    if (app.session_persistence.v2 != null) agentRecordModelLifecycle else null
+                else
+                    null,
                 .save_prompt_images = if (comptime @hasField(App, "session_persistence"))
                     if (app.session_persistence.v2 != null) agentSavePromptImages else null
                 else
@@ -944,7 +948,12 @@ pub fn Bindings(comptime App: type) type {
 
         fn agentRequestToolPermission(ctx: *anyopaque, arena: Allocator, call: ToolCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?agent_runtime.LiveToolAuthority, revalidation: ?agent_runtime.LivePermissionRevalidation, advertised_dynamic_tool_names: []const []const u8, mcp_review_schema_json: ?[]const u8) !command_admission.PermissionOutcome {
             const app: *App = @ptrCast(@alignCast(ctx));
-            return app.requestToolPermissionSyncWithAdvertised(arena, call, review_turn, permission_mode, local_grants, live_authority, revalidation, advertised_dynamic_tool_names, mcp_review_schema_json);
+            const outcome = try app.requestToolPermissionSyncWithAdvertised(arena, call, review_turn, permission_mode, local_grants, live_authority, revalidation, advertised_dynamic_tool_names, mcp_review_schema_json);
+            if (comptime @hasField(App, "session_persistence")) if (outcome.requirement == .approval_required or outcome.human_approval != .none) {
+                try app_session_runtime.Runtime(App).recordInteractionOpened(app, call.id, "approval");
+                try app_session_runtime.Runtime(App).recordInteractionSettled(app, call.id, if (outcome.decision.isDenied()) "declined" else "accepted");
+            };
+            return outcome;
         }
 
         fn agentSnapshotRootPermissionMode(ctx: *anyopaque) PermissionMode {
@@ -954,7 +963,12 @@ pub fn Bindings(comptime App: type) type {
 
         fn agentRequestPreparedFileMutationPermission(ctx: *anyopaque, arena: Allocator, call: ToolCall, prepared: *tool_admission.PreparedFileMutationCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?agent_runtime.LiveToolAuthority, advertised_dynamic_tool_names: []const []const u8) !command_admission.PermissionOutcome {
             const app: *App = @ptrCast(@alignCast(ctx));
-            return app.requestPreparedFileMutationPermissionSyncWithAdvertised(arena, call, prepared, review_turn, permission_mode, local_grants, live_authority, advertised_dynamic_tool_names);
+            const outcome = try app.requestPreparedFileMutationPermissionSyncWithAdvertised(arena, call, prepared, review_turn, permission_mode, local_grants, live_authority, advertised_dynamic_tool_names);
+            if (comptime @hasField(App, "session_persistence")) if (outcome.requirement == .approval_required or outcome.human_approval != .none) {
+                try app_session_runtime.Runtime(App).recordInteractionOpened(app, call.id, "approval");
+                try app_session_runtime.Runtime(App).recordInteractionSettled(app, call.id, if (outcome.decision.isDenied()) "declined" else "accepted");
+            };
+            return outcome;
         }
 
         fn agentSnapshotMcpDefinition(ctx: *anyopaque, arena: Allocator, name: []const u8, known: tool_mcp_runtime.Binding) !tool_mcp_runtime.DefinitionSnapshot {
@@ -1191,6 +1205,11 @@ pub fn Bindings(comptime App: type) type {
         fn agentAppendTurnPiece(ctx: *anyopaque, progress: agent_runtime.TurnProgress) anyerror!void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try app_session_runtime.Runtime(App).appendTurnPiece(app, progress);
+        }
+
+        fn agentRecordModelLifecycle(ctx: *anyopaque, event: agent_runtime.ModelLifecycleEvent) anyerror!void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            try app_session_runtime.Runtime(App).recordModelLifecycle(app, event);
         }
 
         fn agentSavePromptImages(ctx: *anyopaque, alloc: std.mem.Allocator, images: []types.ImageAttachment) anyerror!void {

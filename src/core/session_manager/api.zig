@@ -510,6 +510,19 @@ pub const Session = struct {
         return s.appendChecked(events, null);
     }
 
+    /// Appends one atomic v27 commit. Private transitions are folded for
+    /// migration and profile metadata but never become public facts.
+    pub fn appendCommit(s: Session, facts: []const u8, private_events: []const Event) AppendError!u64 {
+        if (s.import and s.inner.awaitsPublish()) return error.InvalidArgument;
+        for (private_events) |event| if (event == .v27_commit) return error.InvalidArgument;
+        if (private_events.len > 0) try checkEvents(s.manager.gpa, private_events, false);
+        try checkV27Facts(s.manager.gpa, facts);
+        if (!s.inner.staysHeld(private_events) or std.mem.find(u8, facts, "\"type\":\"turn.started\"") != null) try s.manager.ready();
+        const result = try s.inner.appendCommitReport(facts, private_events, null);
+        if (result.published) s.updateIndexAs(.published) else if (result.listing_changed) s.updateIndex();
+        return result.last_seq;
+    }
+
     /// Import only, before `publishImport`: appends a batch stamped with its
     /// original time. It stays in memory until the publish (D59).
     pub fn appendAt(s: Session, events: []const Event, ts_ms: u64) AppendError!u64 {
@@ -723,6 +736,19 @@ fn checkEvents(gpa: std.mem.Allocator, events: []const Event, import: bool) Appe
             if (parsed.value != .array or parsed.value.array.items.len == 0) return error.InvalidArgument;
         },
     };
+}
+
+fn checkV27Facts(gpa: std.mem.Allocator, raw: []const u8) AppendError!void {
+    try checkJson(gpa, raw);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const elements = schema.rawElements(arena.allocator(), raw) catch return error.InvalidArgument;
+    if (elements.len == 0) return error.InvalidArgument;
+    const decoded = try arena.allocator().alloc(v27.facts.Fact, elements.len);
+    for (elements, decoded) |element, *fact| {
+        fact.* = v27.facts.decode(arena.allocator(), element) catch return error.InvalidArgument;
+    }
+    v27.checker.check(decoded) catch return error.InvalidArgument;
 }
 
 /// Folded into every snapshot for each child, so kept small (D22).

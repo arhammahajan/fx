@@ -38,8 +38,8 @@
 //! - `tests/tla/session_manager/rollout/pr-1116/PR1116Terminal.tla`: hosted terminal state
 
 const std = @import("std");
-const testing_allocator = @import("../shared/testing_allocator.zig");
 const builtin = @import("builtin");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const sm = @import("session_manager");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
@@ -131,77 +131,35 @@ test "native v27 state releases every partial allocation" {
 pub const Host = sm.Host;
 pub const ChildOutcome = sm.Outcome;
 
-/// A small v27 projection used by ACP while its live call cards are in flight.
-pub const V27CallProjection = struct {
-    view: sm.v27.tables.SessionView = .{},
-    opened: bool = false,
-
-    pub fn deinit(self: *V27CallProjection, alloc: Allocator) void {
-        self.view.deinit(alloc);
-        self.* = undefined;
-    }
-
-    fn open(self: *V27CallProjection, alloc: Allocator) !void {
-        if (self.opened) return;
-        const opening = [_]sm.v27.facts.Fact{
-            sm.v27.facts.sessionStarted(.{}),
-            sm.v27.facts.turnStarted(.{ .turnId = "surface-turn", .cause = .{ .hook = "fx" }, .follows = .null }),
-            sm.v27.facts.modelRequested(.{ .runId = "surface-run", .owner = .{ .turnId = "surface-turn" } }),
-            sm.v27.facts.modelStarted(.{ .runId = "surface-run", .modelId = "fx/model", .attempt = 0 }),
-        };
-        try sm.v27.fold.foldCommit(alloc, &self.view, &opening, self.view.position, .complete);
-        self.opened = true;
-    }
-
-    pub fn requested(self: *V27CallProjection, alloc: Allocator, call: types.ToolCall) !void {
-        try self.open(alloc);
-        if (self.view.calls.contains(call.id)) return;
-        const events = [_]sm.v27.facts.Fact{sm.v27.facts.callRequested(.{
-            .callId = call.id,
-            .owner = .{ .runId = "surface-run" },
-            .capability = .{ .kind = "tool", .name = call.name },
-        })};
-        try sm.v27.fold.foldCommit(alloc, &self.view, &events, self.view.position, .complete);
-    }
-
-    pub fn started(self: *V27CallProjection, alloc: Allocator, call_id: []const u8) !void {
-        if (!self.view.calls.contains(call_id)) return;
-        const events = [_]sm.v27.facts.Fact{sm.v27.facts.callStarted(.{ .callId = call_id })};
-        try sm.v27.fold.foldCommit(alloc, &self.view, &events, self.view.position, .complete);
-    }
-
-    pub fn settled(self: *V27CallProjection, alloc: Allocator, call_id: []const u8, outcome: []const u8) !void {
-        const row = self.view.calls.get(call_id) orelse return;
-        if (std.mem.eql(u8, row.status, "settled")) return;
-        const events = [_]sm.v27.facts.Fact{sm.v27.facts.callSettled(.{ .callId = call_id, .outcome = outcome })};
-        try sm.v27.fold.foldCommit(alloc, &self.view, &events, self.view.position, .complete);
-    }
-
-    pub fn settleTurn(self: *V27CallProjection, alloc: Allocator, outcome: []const u8) !void {
-        if (!self.opened) return;
-        // Surface projections only need the fold's terminal state. Settle
-        // each remaining row with the cascade's observable outcome.
-        var ids: std.ArrayList([]const u8) = .empty;
-        defer ids.deinit(alloc);
-        var rows = self.view.calls.iterator();
-        while (rows.next()) |entry| if (!std.mem.eql(u8, entry.value_ptr.status, "settled")) try ids.append(alloc, entry.key_ptr.*);
-        for (ids.items) |id| try self.settled(alloc, id, "interrupted");
-        const ending = [_]sm.v27.facts.Fact{sm.v27.facts.turnSettled(.{ .turnId = "surface-turn", .outcome = outcome })};
-        try sm.v27.fold.foldCommit(alloc, &self.view, &ending, self.view.position, .complete);
-    }
-
-    pub fn state(self: *const V27CallProjection, call_id: []const u8) ?[]const u8 {
-        const row = self.view.calls.get(call_id) orelse return null;
-        return sm.v27.selectors.callState(row);
-    }
-
-    pub fn label(self: *const V27CallProjection, call_id: []const u8) ?[]const u8 {
-        const row = self.view.calls.get(call_id) orelse return null;
-        return sm.v27.selectors.callLabel(row);
-    }
-};
-
 pub const V27ToolSummary = struct { name: []u8, status: []u8 };
+
+fn textPart(delivery: ?sm.v27.tables.DeliveryRow) []const u8 {
+    const row = delivery orelse return "";
+    for (row.parts) |part| {
+        if (part != .object) continue;
+        const kind = part.object.get("kind") orelse continue;
+        const text = part.object.get("text") orelse continue;
+        if (kind == .string and text == .string and std.mem.eql(u8, kind.string, "text")) return text.string;
+    }
+    return "";
+}
+
+fn validBlobRef(value: []const u8) bool {
+    if (value.len != 64) return false;
+    for (value) |char| if (!std.ascii.isHex(char)) return false;
+    return true;
+}
+
+fn freeToolStep(alloc: Allocator, step: types.ToolExecutionStep) void {
+    if (step.assistant) |text| alloc.free(text);
+    types.freeToolCallSlice(alloc, step.tool_calls);
+    types.freePersistedToolResults(alloc, step.tool_results);
+    if (step.provider_replay) |provider_replay| types.freeProviderReplay(alloc, provider_replay);
+}
+
+fn freePersistedResult(alloc: Allocator, result: types.PersistedToolResult) void {
+    types.freePersistedToolResult(alloc, result);
+}
 
 pub fn freeV27ToolSummaries(alloc: Allocator, summaries: []V27ToolSummary) void {
     for (summaries) |summary| {
@@ -487,11 +445,16 @@ pub const Store = struct {
         };
         var sink: Sink = .{ .alloc = alloc, .history = &history };
         try replay(.{ .store = store, .id = child_id }, alloc, alloc, .start, null, ReplaySink.init(&sink));
-        return history.toOwnedSlice(alloc);
+        if (history.items.len > 0) return history.toOwnedSlice(alloc);
+        history.deinit(alloc);
+        return readV27History(store, alloc, child_id);
     }
 
     /// A child's newest preferences, read without its lock. Caller owns.
     pub fn childPreferences(store: *Store, alloc: Allocator, child_id: []const u8) !session_codec.DurableSessionPreferences {
+        var peeked = try store.manager.peek(alloc, child_id);
+        defer peeked.deinit(alloc);
+        if (peeked.state.prefs) |raw| return decodePreferences(alloc, raw);
         var from: sm.From = .end;
         while (true) {
             var page = try store.manager.read(alloc, child_id, from, .backward, replay_page_lines);
@@ -505,21 +468,13 @@ pub const Store = struct {
     }
 };
 
-/// Moves the previous manager root into v3 before the manager opens it. The
-/// rename is atomic, so a crash leaves either complete root discoverable.
+/// Copies the previous manager root into v3 before the manager opens it. The
+/// old root remains readable by an older fx binary.
 fn migrateV2Root(alloc: Allocator, home: []const u8) !void {
     const parent_path = try std.Io.Dir.path.join(alloc, &.{ home, profile_paths.root_dir_name, profile_paths.sessions_dir_name });
     defer alloc.free(parent_path);
-    const old_path = try std.Io.Dir.path.join(alloc, &.{ parent_path, session_layout.sessions_v2_dir });
-    defer alloc.free(old_path);
     const new_path = try std.Io.Dir.path.join(alloc, &.{ parent_path, session_layout.sessions_v3_dir });
     defer alloc.free(new_path);
-
-    var old = std.Io.Dir.openDirAbsolute(io_mod.getIo(), old_path, .{}) catch |err| switch (err) {
-        error.FileNotFound => return,
-        else => return err,
-    };
-    old.close(io_mod.getIo());
     if (std.Io.Dir.openDirAbsolute(io_mod.getIo(), new_path, .{})) |opened| {
         var existing = opened;
         existing.close(io_mod.getIo());
@@ -528,9 +483,20 @@ fn migrateV2Root(alloc: Allocator, home: []const u8) !void {
         error.FileNotFound => {},
         else => return err,
     }
-    try std.Io.Dir.renameAbsolute(old_path, new_path, io_mod.getIo());
-    var parent = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), parent_path, .{ .iterate = true });
+    var parent = std.Io.Dir.openDirAbsolute(io_mod.getIo(), parent_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
     defer parent.close(io_mod.getIo());
+    var verified_parent: io_mod.VerifiedDir = .{ .dir = parent };
+    var old = (try io_mod.openRealDirIfPresent(&verified_parent, session_layout.sessions_v2_dir)) orelse return;
+    defer old.close();
+    const staging_name = "v3.importing";
+    try parent.deleteTree(io_mod.getIo(), staging_name);
+    var staging = try io_mod.openOrCreateVerifiedPrivateDir(&verified_parent, staging_name);
+    defer staging.close();
+    if (!copyTree(io_mod.openRealDirIfPresent, &old, &staging, 0)) return error.SessionStoreUnavailable;
+    try parent.rename(staging_name, parent, session_layout.sessions_v3_dir, io_mod.getIo());
     io_mod.syncVerifiedDir(parent) catch |err| switch (err) {
         error.OperationUnsupported => {},
         else => return err,
@@ -609,7 +575,22 @@ pub fn readSession(store: *Store, alloc: Allocator, id: []const u8) !Resumed {
     defer scratch.deinit();
     var restored = try settingsFrom(alloc, scratch.allocator(), peeked.state);
     defer restored.deinit(alloc);
-    restored.history = try detailHistory(.{ .store = store, .id = id }, alloc);
+    restored.history = try readV27History(store, alloc, id);
+    const legacy = detailHistory(.{ .store = store, .id = id }, alloc) catch try alloc.alloc(types.HistoryTurn, 0);
+    const has_legacy_turn = for (legacy) |turn| {
+        if (turn != .compacted_summary) break true;
+    } else false;
+    if (has_legacy_turn and restored.history.len > 0) {
+        const joined = try std.mem.concat(alloc, types.HistoryTurn, &.{ legacy, restored.history });
+        alloc.free(legacy);
+        alloc.free(restored.history);
+        restored.history = joined;
+    } else if (restored.history.len == 0) {
+        alloc.free(restored.history);
+        restored.history = legacy;
+    } else {
+        types.freeHistoryTurnSlice(alloc, legacy);
+    }
     return resumedOf(alloc, &restored, id, peeked.workspace);
 }
 
@@ -786,12 +767,21 @@ pub fn recover(store: *Store, alloc: Allocator, id: []const u8) !Recovered {
         else => err,
     };
     defer copy.release();
-    var restored = try restoreFrom(.{ .store = store, .id = copy.id(), .handle = copy }, alloc, sa, try copy.state(sa), null);
-    defer restored.deinit(alloc);
+    var copy_state = try copy.state(sa);
+    defer copy_state.deinit(sa);
+    const history_len = if (copy_state.native_v27) blk: {
+        const history = try readV27History(store, alloc, copy.id());
+        defer types.freeHistoryTurnSlice(alloc, history);
+        break :blk history.len;
+    } else blk: {
+        var restored = try restoreFrom(.{ .store = store, .id = copy.id(), .handle = copy }, alloc, sa, copy_state, null);
+        defer restored.deinit(alloc);
+        break :blk restored.history.len;
+    };
     const copy_id = try alloc.dupe(u8, copy.id());
     errdefer alloc.free(copy_id);
     copy.close() catch |err| debug_trace.logf("session", "event=sessions_v2_recovered_close_failed session={s} err={s}", .{ copy_id, @errorName(err) });
-    return .{ .id = copy_id, .history_len = restored.history.len, .files_complete = store.copyFiles(id, copy_id) };
+    return .{ .id = copy_id, .history_len = history_len, .files_complete = store.copyFiles(id, copy_id) };
 }
 
 /// `fx session recover` on a session only v1 holds (D64). Caller owns the
@@ -1409,9 +1399,10 @@ pub const Session = struct {
     /// A conversion's import: the original time of the batches it writes
     /// next (D59). Null for every other session.
     import_ts: ?u64 = null,
+    /// Read-only projection helpers use an id without constructing a handle.
+    id_override: ?[]const u8 = null,
     v27: *V27Session,
     v27_arena: std.heap.ArenaAllocator,
-    v27_pending: std.ArrayList([]u8) = .empty,
 
     pub fn create(alloc: Allocator, store: *Store, workspace: []const u8, host: Host, seed: Seed) !*Session {
         // Every v2 write needs a writable open, and both start here or in
@@ -1450,12 +1441,13 @@ pub const Session = struct {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const a = arena.allocator();
+        try self.v27.setModel(seed.preferences.model);
+        try self.v27.metadataChange("session-settings");
         _ = try self.write(&.{
             .{ .set = .{ .key = .prefs, .value = try encodePreferences(a, seed.preferences, self.instructions) } },
             .{ .set = .{ .key = .permissions, .value = try session_codec.encodePermissionState(a, seed.permission_state) } },
             .{ .set = .{ .key = .language, .value = try jsonString(a, seed.language.view()) } },
         });
-        try self.v27.setModel(seed.preferences.model);
         self.language = try self.alloc.dupe(u8, seed.language.view());
     }
 
@@ -1479,6 +1471,7 @@ pub const Session = struct {
             const raw = state.prefs orelse return error.InvalidSessionFormat;
             try self.restoreV27Model(raw);
             try self.v27.recoverOpenTurns();
+            if (state.native_v27 and state.open_turn != null) _ = try self.write(&.{.{ .turn_interrupted = .failed }});
             self.instructions = try decodeInstructions(alloc, raw);
             if (seed.instructions.len > 0 and !std.mem.eql(u8, seed.instructions, self.childInstructions())) {
                 var preferences = try decodePreferences(alloc, raw);
@@ -1524,8 +1517,9 @@ pub const Session = struct {
         errdefer self.alloc.free(owned);
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
-        _ = try self.write(&.{.{ .set = .{ .key = .prefs, .value = try encodePreferences(arena.allocator(), preferences, owned) } }});
         try self.v27.setModel(preferences.model);
+        try self.v27.metadataChange("session-settings");
+        _ = try self.write(&.{.{ .set = .{ .key = .prefs, .value = try encodePreferences(arena.allocator(), preferences, owned) } }});
         if (self.instructions) |old| self.alloc.free(old);
         self.instructions = owned;
     }
@@ -1609,6 +1603,7 @@ pub const Session = struct {
         self.last_turn = state.last_turn;
         if (state.prefs) |raw| try self.restoreV27Model(raw);
         try self.v27.recoverOpenTurns();
+        if (state.native_v27 and state.open_turn != null) _ = try self.write(&.{.{ .turn_interrupted = .failed }});
         if (clean) cleanLeftovers(store, alloc, self.id(), &state);
         traceWiring("Open", self.id(), "", self.store.pid);
         return self;
@@ -1627,7 +1622,6 @@ pub const Session = struct {
         errdefer alloc.destroy(self);
         self.* = .{ .alloc = alloc, .store = store, .handle = handle, .files_path = files_path, .host = host, .fresh = fresh, .v27 = v27, .v27_arena = v27_arena };
         try self.replayV27Facts();
-        try v27.setSink(self, persistV27Facts);
         return self;
     }
 
@@ -1650,52 +1644,19 @@ pub const Session = struct {
                     try decoded.append(arena, fact);
                 }
                 if (decoded.items.len > 0) try self.v27.replay(decoded.items);
+                for (body.v27_commit.private_bodies) |private_body| {
+                    if (private_body == .compacted) try self.v27.restoreCompaction(private_body.compacted.data);
+                    if (private_body == .item and std.mem.eql(u8, private_body.item.type, "tool_result")) {
+                        try self.v27.restoreCallOutput(try self.source().pieceData(arena, private_body.item));
+                    }
+                }
             }
             from = .{ .at = page.next orelse break };
         }
     }
 
-    fn persistV27Facts(raw: *anyopaque, committed: []const sm.v27.facts.Fact) !void {
-        const self: *Session = @ptrCast(@alignCast(raw));
-        var pending: std.ArrayList([]u8) = .empty;
-        defer pending.deinit(self.alloc);
-        errdefer for (pending.items) |fact| self.alloc.free(fact);
-        try pending.ensureUnusedCapacity(self.alloc, committed.len);
-        for (committed) |fact| pending.appendAssumeCapacity(try sm.v27.facts.encodeAlloc(self.alloc, fact));
-        try self.v27_pending.ensureUnusedCapacity(self.alloc, committed.len);
-        self.v27_pending.appendSliceAssumeCapacity(pending.items);
-        pending.clearRetainingCapacity();
-        var flush = false;
-        for (committed) |fact| switch (fact.factType()) {
-            .delivery_consumed,
-            .call_started,
-            .call_settled,
-            .turn_settled,
-            .context_settled,
-            .session_ended,
-            => flush = true,
-            else => {},
-        };
-        if (flush) try self.flushV27Facts();
-    }
-
-    fn flushV27Facts(self: *Session) !void {
-        if (self.v27_pending.items.len == 0) return;
-        var encoded: std.Io.Writer.Allocating = .init(self.alloc);
-        defer encoded.deinit();
-        try encoded.writer.writeByte('[');
-        for (self.v27_pending.items, 0..) |fact, index| {
-            if (index > 0) try encoded.writer.writeByte(',');
-            try encoded.writer.writeAll(fact);
-        }
-        try encoded.writer.writeByte(']');
-        _ = try self.handle.append(&.{.{ .v27_commit = encoded.written() }});
-        for (self.v27_pending.items) |fact| self.alloc.free(fact);
-        self.v27_pending.clearRetainingCapacity();
-    }
-
     pub fn id(self: *const Session) []const u8 {
-        return self.handle.id();
+        return self.id_override orelse self.handle.id();
     }
 
     /// The latest public reply from the v27 fold. Caller owns the result.
@@ -1747,6 +1708,331 @@ pub const Session = struct {
         return try out.toOwnedSlice(alloc);
     }
 
+    pub fn v27CallState(self: *const Session, call_id: []const u8) ?[]const u8 {
+        const row = self.v27.view.calls.get(call_id) orelse return null;
+        return sm.v27.selectors.callState(row);
+    }
+
+    /// Projects ordinary completed turns from the eve v27 fold. Caller owns
+    /// the slice and every turn.
+    fn v27HistoryAlloc(self: *Session, alloc: Allocator) ![]types.HistoryTurn {
+        return self.v27HistoryAllocMode(alloc, true);
+    }
+
+    fn v27HistoryAllocMode(self: *Session, alloc: Allocator, apply_selection: bool) ![]types.HistoryTurn {
+        var rows: std.ArrayList(sm.v27.tables.TurnRow) = .empty;
+        defer rows.deinit(alloc);
+        var turns = self.v27.view.turns.iterator();
+        while (turns.next()) |entry| {
+            if (!std.mem.eql(u8, entry.value_ptr.status, "settled")) continue;
+            try rows.append(alloc, entry.value_ptr.*);
+        }
+        std.mem.sort(sm.v27.tables.TurnRow, rows.items, {}, struct {
+            fn lessThan(_: void, a: sm.v27.tables.TurnRow, b: sm.v27.tables.TurnRow) bool {
+                return a.introduced_at < b.introduced_at;
+            }
+        }.lessThan);
+        var removed: usize = 0;
+        var compacted: ?types.CompactedSummaryHistoryTurn = null;
+        if (apply_selection) if (self.v27.compat_selection) |selection| if (selection == .object) {
+            const summary = selection.object.get("summary");
+            const removed_value = selection.object.get("removedTurnCount");
+            const count_value = selection.object.get("compactionCount");
+            if (summary != null and summary.? == .string) {
+                removed = if (removed_value != null and removed_value.? == .integer) @intCast(@max(0, removed_value.?.integer)) else 0;
+                compacted = .{
+                    .summary = try alloc.dupe(u8, summary.?.string),
+                    .removed_turn_count = removed,
+                    .compaction_count = if (count_value != null and count_value.? == .integer) @intCast(@max(0, count_value.?.integer)) else 0,
+                };
+            }
+        };
+        errdefer if (compacted) |summary| types.freeHistoryTurn(alloc, .{ .compacted_summary = summary });
+        removed = @min(removed, rows.items.len);
+        const history = try alloc.alloc(types.HistoryTurn, rows.items.len - removed + @as(usize, @intFromBool(compacted != null)));
+        var built: usize = 0;
+        errdefer {
+            for (history[0..built]) |turn| types.freeHistoryTurn(alloc, turn);
+            alloc.free(history);
+        }
+        if (compacted) |summary| {
+            history[built] = .{ .compacted_summary = summary };
+            built += 1;
+            compacted = null;
+        }
+        for (rows.items[removed..]) |turn| {
+            history[built] = try presentStoredResults(self.source(), alloc, try self.v27TurnAlloc(alloc, turn));
+            built += 1;
+        }
+        if (apply_selection and (self.v27.compat_keep_tool_steps != 0 or self.v27.compat_keep_steering != 0)) {
+            var scratch = std.heap.ArenaAllocator.init(alloc);
+            defer scratch.deinit();
+            var list = std.ArrayList(types.HistoryTurn).fromOwnedSlice(history);
+            _ = try trimFirstKept(alloc, scratch.allocator(), &list, .{
+                .tool_steps = self.v27.compat_keep_tool_steps,
+                .steering = self.v27.compat_keep_steering,
+            }, self.id());
+        }
+        return history;
+    }
+
+    fn v27TurnAlloc(self: *Session, alloc: Allocator, turn: sm.v27.tables.TurnRow) !types.HistoryTurn {
+        const delivery = if (turn.delivery_id) |delivery_id| self.v27.view.deliveries.get(delivery_id) else null;
+        const user = try self.v27UserAlloc(alloc, delivery);
+        errdefer types.freeUserTurn(alloc, user);
+        var assistant: std.ArrayList(u8) = .empty;
+        errdefer assistant.deinit(alloc);
+        for (turn.reply) |part_id| {
+            const part = self.v27.view.parts.get(part_id) orelse continue;
+            if (part.value) |value| {
+                if (value != .string) continue;
+                if (assistant.items.len > 0) try assistant.appendSlice(alloc, "\n");
+                try assistant.appendSlice(alloc, value.string);
+                continue;
+            }
+            if (part.value_ref) |reference| {
+                const ref = reference.ref orelse continue;
+                if (!validBlobRef(ref)) continue;
+                const hash: sm.BlobHash = ref[0..64].*;
+                const bytes = self.store.manager.getBlob(alloc, self.id(), &hash) catch continue;
+                defer alloc.free(bytes);
+                var scratch = std.heap.ArenaAllocator.init(alloc);
+                defer scratch.deinit();
+                const parsed = std.json.parseFromSliceLeaky(std.json.Value, scratch.allocator(), bytes, .{}) catch continue;
+                if (parsed != .object) continue;
+                const value = parsed.object.get("text") orelse continue;
+                if (value != .string) continue;
+                if (assistant.items.len > 0) try assistant.appendSlice(alloc, "\n");
+                try assistant.appendSlice(alloc, value.string);
+            }
+        }
+        const execution = try self.v27ExecutionAlloc(alloc, turn.turn_id);
+        errdefer types.freeExecutionMemory(alloc, execution);
+        const reply = try assistant.toOwnedSlice(alloc);
+        if (std.mem.eql(u8, turn.outcome orelse "failed", "completed")) {
+            return .{ .assistant = .{ .user = user, .assistant = reply, .execution = execution } };
+        }
+        return .{ .interrupted = .{
+            .user = user,
+            .assistant = if (reply.len > 0) reply else null,
+            .execution = execution,
+            .terminal_reason = if (std.mem.eql(u8, turn.outcome orelse "failed", "cancelled")) .cancelled else .failed,
+        } };
+    }
+
+    fn v27UserAlloc(self: *Session, alloc: Allocator, delivery: ?sm.v27.tables.DeliveryRow) !types.UserTurn {
+        const row = delivery orelse return .{ .text = try alloc.dupe(u8, "") };
+        var images: std.ArrayList(types.ImageAttachment) = .empty;
+        errdefer {
+            for (images.items) |image| types.freeImageAttachment(alloc, image);
+            images.deinit(alloc);
+        }
+        for (row.parts) |part| {
+            if (part != .object) continue;
+            const kind = part.object.get("kind") orelse continue;
+            if (kind != .string or !std.mem.eql(u8, kind.string, "file")) continue;
+            const media = part.object.get("mediaType") orelse continue;
+            if (media != .string) continue;
+            const ref = part.object.get("ref");
+            const ref_text = if (ref != null and ref.? == .string) ref.?.string else null;
+            const is_blob = ref_text != null and validBlobRef(ref_text.?);
+            const source_ref = if (ref_text) |value| if (!is_blob) try alloc.dupe(u8, value) else null else null;
+            errdefer if (source_ref) |value| alloc.free(value);
+            const snapshot_sha256 = if (is_blob) try alloc.dupe(u8, ref_text.?) else null;
+            errdefer if (snapshot_sha256) |value| alloc.free(value);
+            var blob_path: ?[]u8 = null;
+            if (is_blob) {
+                const hash: sm.BlobHash = ref_text.?[0..64].*;
+                blob_path = self.store.manager.blobPath(alloc, self.id(), &hash) catch null;
+            }
+            errdefer if (blob_path) |value| alloc.free(value);
+            const filename = part.object.get("filename");
+            try images.append(alloc, .{
+                .id = images.items.len + 1,
+                .path = try alloc.dupe(u8, if (filename != null and filename.? == .string) filename.?.string else ""),
+                .media_type = try alloc.dupe(u8, media.string),
+                .snapshot_sha256 = snapshot_sha256,
+                .source_ref = source_ref,
+                .blob_path = blob_path,
+            });
+        }
+        return .{
+            .text = try alloc.dupe(u8, textPart(delivery)),
+            .images = try images.toOwnedSlice(alloc),
+        };
+    }
+
+    fn v27ExecutionAlloc(self: *Session, alloc: Allocator, turn_id: []const u8) !types.ExecutionMemory {
+        var runs: std.ArrayList(sm.v27.tables.RunRow) = .empty;
+        defer runs.deinit(alloc);
+        var iterator = self.v27.view.runs.iterator();
+        while (iterator.next()) |entry| {
+            const owner = entry.value_ptr.owner.turnId orelse continue;
+            if (std.mem.eql(u8, owner, turn_id)) try runs.append(alloc, entry.value_ptr.*);
+        }
+        std.mem.sort(sm.v27.tables.RunRow, runs.items, {}, struct {
+            fn lessThan(_: void, a: sm.v27.tables.RunRow, b: sm.v27.tables.RunRow) bool {
+                return a.step < b.step;
+            }
+        }.lessThan);
+        var steps: std.ArrayList(types.ToolExecutionStep) = .empty;
+        errdefer {
+            for (steps.items) |step| freeToolStep(alloc, step);
+            steps.deinit(alloc);
+        }
+        var total_usage: types.TurnTokenProgress = .{};
+        for (runs.items) |run| {
+            total_usage.input_tokens += run.usage.inputTokens;
+            total_usage.output_tokens += run.usage.outputTokens;
+            var calls: std.ArrayList(sm.v27.tables.CallRow) = .empty;
+            defer calls.deinit(alloc);
+            var call_iterator = self.v27.view.calls.iterator();
+            while (call_iterator.next()) |entry| {
+                const owner = entry.value_ptr.owner.runId orelse continue;
+                if (std.mem.eql(u8, owner, run.run_id)) try calls.append(alloc, entry.value_ptr.*);
+            }
+            if (calls.items.len == 0) continue;
+            var run_assistant: ?[]u8 = null;
+            var parts = self.v27.view.parts.iterator();
+            while (parts.next()) |entry| {
+                const part = entry.value_ptr.*;
+                if (!std.mem.eql(u8, part.run_id, run.run_id) or !std.mem.eql(u8, part.phase, "tool")) continue;
+                if (part.value) |value| if (value == .string) {
+                    run_assistant = try alloc.dupe(u8, value.string);
+                    break;
+                };
+            }
+            errdefer if (run_assistant) |text| alloc.free(text);
+            std.mem.sort(sm.v27.tables.CallRow, calls.items, {}, struct {
+                fn lessThan(_: void, a: sm.v27.tables.CallRow, b: sm.v27.tables.CallRow) bool {
+                    return a.introduced_at < b.introduced_at;
+                }
+            }.lessThan);
+            const tool_calls = try alloc.alloc(types.ToolCall, calls.items.len);
+            var made_calls: usize = 0;
+            var calls_kept = false;
+            errdefer if (!calls_kept) {
+                for (tool_calls[0..made_calls]) |call| types.freeToolCall(alloc, call);
+                alloc.free(tool_calls);
+            };
+            const tool_results = try alloc.alloc(types.PersistedToolResult, calls.items.len);
+            var made_results: usize = 0;
+            var results_kept = false;
+            errdefer if (!results_kept) {
+                for (tool_results[0..made_results]) |result| freePersistedResult(alloc, result);
+                alloc.free(tool_results);
+            };
+            for (calls.items, 0..) |call, index| {
+                const input = if (call.input) |value| try std.json.Stringify.valueAlloc(alloc, value, .{}) else try alloc.dupe(u8, "{}");
+                tool_calls[index] = .{
+                    .id = try alloc.dupe(u8, call.call_id),
+                    .name = try alloc.dupe(u8, call.capability.name),
+                    .arguments_json = input,
+                };
+                made_calls += 1;
+                if (call.output) |value| {
+                    tool_results[index] = std.json.parseFromValueLeaky(types.PersistedToolResult, alloc, value, .{ .allocate = .alloc_always }) catch blk: {
+                        const output = switch (value) {
+                            .string => |text| try alloc.dupe(u8, text),
+                            else => try std.json.Stringify.valueAlloc(alloc, value, .{}),
+                        };
+                        break :blk .{
+                            .tool_call_id = try alloc.dupe(u8, call.call_id),
+                            .tool_name = try alloc.dupe(u8, call.capability.name),
+                            .status = if (std.mem.eql(u8, call.outcome orelse "failed", "completed")) .success else .failure,
+                            .output = output,
+                            .output_bytes = output.len,
+                            .stored_output_bytes = output.len,
+                        };
+                    };
+                } else {
+                    const missing_output = if (std.mem.eql(u8, call.outcome orelse "failed", "interrupted")) unfinished_tool_output else "";
+                    tool_results[index] = .{
+                        .tool_call_id = try alloc.dupe(u8, call.call_id),
+                        .tool_name = try alloc.dupe(u8, call.capability.name),
+                        .status = .failure,
+                        .output = try alloc.dupe(u8, missing_output),
+                        .output_bytes = missing_output.len,
+                        .stored_output_bytes = missing_output.len,
+                    };
+                }
+                made_results += 1;
+            }
+            try steps.append(alloc, .{ .assistant = run_assistant, .tool_calls = tool_calls, .tool_results = tool_results });
+            calls_kept = true;
+            results_kept = true;
+            run_assistant = null;
+        }
+        const owned_steps = try steps.toOwnedSlice(alloc);
+        errdefer types.freeToolExecutionSteps(alloc, owned_steps);
+        var steering: std.ArrayList(types.PersistedSteering) = .empty;
+        errdefer {
+            for (steering.items) |entry| alloc.free(entry.text);
+            steering.deinit(alloc);
+        }
+        var deliveries = self.v27.view.deliveries.iterator();
+        while (deliveries.next()) |entry| {
+            const delivery = entry.value_ptr.*;
+            const owner = delivery.turn_id orelse continue;
+            if (!std.mem.eql(u8, owner, turn_id) or delivery.source == null or delivery.source.? != .object) continue;
+            const control = delivery.source.?.object.get("control") orelse continue;
+            if (control != .string or !std.mem.eql(u8, control.string, "steer")) continue;
+            const text = textPart(delivery);
+            var after_steps: usize = 0;
+            for (runs.items) |run| {
+                if (run.introduced_at < delivery.introduced_at) after_steps += 1;
+            }
+            try steering.append(alloc, .{ .text = try alloc.dupe(u8, text), .after_tool_step_count = after_steps });
+        }
+        return .{
+            .tool_steps = owned_steps,
+            .steering = try steering.toOwnedSlice(alloc),
+            .turn_summary = .{ .token_progress = total_usage },
+        };
+    }
+
+    pub fn modelRequested(self: *Session, model: []const u8) !void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        try self.v27.modelRequested(model);
+        _ = try self.write(&.{});
+    }
+
+    pub fn modelStarted(self: *Session, attempt: u32) !void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        try self.v27.modelStarted(attempt);
+        _ = try self.write(&.{});
+    }
+
+    pub fn modelRetried(self: *Session, attempt: u32, code: []const u8, message: []const u8) !void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        try self.v27.modelRetried(attempt, code, message);
+        _ = try self.write(&.{});
+    }
+
+    pub fn modelSettled(self: *Session, outcome: []const u8, finish_reason: ?[]const u8, usage: ?types.Usage) !void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        try self.v27.modelSettled(outcome, finish_reason, usage);
+        _ = try self.write(&.{});
+    }
+
+    pub fn interactionOpened(self: *Session, call_id: []const u8, kind: []const u8) !void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        try self.v27.interactionOpened(call_id, kind);
+        _ = try self.write(&.{});
+    }
+
+    pub fn interactionSettled(self: *Session, call_id: []const u8, outcome: []const u8) !void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        try self.v27.interactionSettled(call_id, outcome);
+        _ = try self.write(&.{});
+    }
+
     /// Appends through the manager; a host session also traces the turn and
     /// child lines `Wiring.tla` models. The first item lists every blob the
     /// stores kept since the last such line, so verify and recover see a
@@ -1761,7 +2047,28 @@ pub const Session = struct {
         const with_records = if (due) |records| try std.mem.concat(a, sm.Event, &.{ try self.recordLines(a, records), events }) else events;
         const pending = try self.host.pendingCopy(a);
         const batch = try listPending(a, with_records, pending);
-        const seq = if (self.import_ts) |ts| try self.handle.appendAt(batch.events, ts) else try self.handle.append(batch.events);
+        for (batch.events) |event| if (event == .item and event.item.blobs.len > 0 and std.mem.eql(u8, event.item.type, "assistant")) {
+            try self.v27.externalizeReply(event.item.blobs[0], event.item.data.len);
+        };
+        var facts = try self.v27.pendingJsonAlloc(a);
+        var private_events = if (!self.root) batch.events else try v27PrivateEvents(a, batch.events);
+        if (self.import_ts == null and facts == null) {
+            if (private_events.len == 0) {
+                var state = try self.handle.state(a);
+                defer state.deinit(a);
+                return state.last_seq;
+            }
+            try self.v27.metadataChange("private-metadata");
+            facts = try self.v27.pendingJsonAlloc(a);
+            private_events = if (!self.root) batch.events else try v27PrivateEvents(a, batch.events);
+        }
+        const seq = if (self.import_ts) |ts|
+            try self.handle.appendAt(batch.events, ts)
+        else if (facts) |public_facts|
+            try self.handle.appendCommit(public_facts, private_events)
+        else
+            try self.handle.append(batch.events);
+        if (facts != null) self.v27.factsCommitted();
         if (batch.listed) self.host.listed(pending);
         if (due) |records| self.host.recordsWritten(records);
         if (self.root) for (events) |event| switch (event) {
@@ -1815,6 +2122,11 @@ pub const Session = struct {
     /// A copy of its capability that a background reader still holds keeps
     /// reading, and stores nothing more (D44).
     pub fn close(self: *Session) void {
+        if (self.turn_open) {
+            self.v27.settleTurn("cancelled") catch |err| debug_trace.logf("session", "event=v27_close_settle_failed session={s} err={s}", .{ self.id(), @errorName(err) });
+            _ = self.write(&.{.{ .turn_interrupted = .cancel }}) catch |err| debug_trace.logf("session", "event=v27_close_commit_failed session={s} err={s}", .{ self.id(), @errorName(err) });
+            self.turn_open = false;
+        }
         self.host.detach();
         self.handle.close() catch |err| debug_trace.logf("session", "event=sessions_v2_close_failed session={s} err={s}", .{ self.id(), @errorName(err) });
         self.reportV27Log();
@@ -1864,8 +2176,6 @@ pub const Session = struct {
         const alloc = self.alloc;
         self.v27.deinit();
         self.v27_arena.deinit();
-        for (self.v27_pending.items) |fact| alloc.free(fact);
-        self.v27_pending.deinit(alloc);
         if (self.capability) |*capability| capability.deinit();
         BlobHost.release(self.host);
         self.clearStreamed();
@@ -1924,6 +2234,7 @@ pub const Session = struct {
     /// is a blob of a session on disk (D44). Caller holds the mutex.
     fn openTurnLocked(self: *Session) !void {
         if (self.turn_open) return;
+        try self.v27.beginTurn();
         _ = try self.write(&.{.turn_started});
         self.startedTurn();
     }
@@ -1939,7 +2250,6 @@ pub const Session = struct {
         var preferences = try self.currentPreferences(self.alloc);
         defer preferences.deinit(self.alloc);
         try self.v27.setModel(preferences.model);
-        try self.v27.beginTurn();
     }
 
     /// Stores the turn's tool results and images as blobs and gives them
@@ -2028,8 +2338,9 @@ pub const Session = struct {
             null;
         if (derived_title) |title| try tail.append(a, .{ .set = .{ .key = .title, .value = try jsonString(a, title) } });
 
-        try self.writePieces(a, all[start..], encoded[start..], tail.items);
+        try self.openTurnLocked();
         try self.v27.finish(turn);
+        try self.writePieces(a, all[start..], encoded[start..], tail.items);
         try self.turn_numbers.append(self.alloc, self.last_turn);
         self.turn_open = false;
         self.clearStreamed();
@@ -2155,21 +2466,26 @@ pub const Session = struct {
         try events.append(a, .{ .user = .{ .text = user.text, .images = user.images, .work_id = user.work_id } });
         // A result's blob needs the turn on disk first (D44).
         if (storesBodies(execution)) try self.openTurnLocked();
+        const stored_execution = try self.withResultFiles(a, execution);
         // On a missing handle the list keeps the pieces before it.
-        session_event.appendExecutionConversationEvents(a, &events, try self.withResultFiles(a, execution)) catch |err| switch (err) {
+        session_event.appendExecutionConversationEvents(a, &events, stored_execution) catch |err| switch (err) {
             error.ConversationArtifactRequired => {},
             else => return err,
         };
         const encoded = try a.alloc([]u8, events.items.len);
         for (events.items, encoded) |event, *bytes| bytes.* = try self.encodeEvent(a, event);
         const start = try self.streamedPrefix(encoded);
-        if (!self.turn_open or start < encoded.len) {
-            try self.writePieces(a, events.items[start..], encoded[start..], &.{});
+        const running_batch = try self.runningBatch(a, running);
+        try self.openTurnLocked();
+        try self.v27.progress(user, stored_execution, running.calls);
+        if (running.assistant) |text| try self.v27.runningAssistant(text);
+        if (!self.turn_open or start < encoded.len or running_batch.events.len > 0 or self.v27.hasPendingFacts()) {
+            try self.writePieces(a, events.items[start..], encoded[start..], running_batch.events);
             try self.streamed.ensureUnusedCapacity(self.alloc, encoded.len - start);
             for (encoded[start..]) |bytes| self.streamed.appendAssumeCapacity(try self.alloc.dupe(u8, bytes));
+            try self.running.ensureUnusedCapacity(self.alloc, running_batch.ids.len);
+            for (running_batch.ids) |call_id| self.running.appendAssumeCapacity(try self.alloc.dupe(u8, call_id));
         }
-        try self.saveRunning(a, running);
-        try self.v27.progress(user, execution, running.calls);
     }
 
     /// The step whose calls are running: its calls in their saved form, and
@@ -2183,7 +2499,9 @@ pub const Session = struct {
     /// pieces above have just opened if it was not. A step's first save also
     /// keeps its message's text as an `assistant_running` item (D51). Not
     /// its provider replay, which binds to all of that message's calls.
-    fn saveRunning(self: *Session, a: Allocator, running: Running) !void {
+    const RunningBatch = struct { events: []const sm.Event, ids: []const []const u8 };
+
+    fn runningBatch(self: *Session, a: Allocator, running: Running) !RunningBatch {
         var batch: std.ArrayList(sm.Event) = .empty;
         var ids: std.ArrayList([]const u8) = .empty;
         for (running.calls) |call| {
@@ -2192,15 +2510,13 @@ pub const Session = struct {
             try batch.append(a, .{ .item = try self.itemAs(a, running_type, bytes) });
             try ids.append(a, call.id);
         }
-        if (batch.items.len == 0) return;
+        if (batch.items.len == 0) return .{ .events = &.{}, .ids = &.{} };
         const text = running.assistant orelse "";
         if (text.len > 0) {
             const bytes = try encodePiece(a, .{ .assistant = .{ .text = text } });
             try batch.insert(a, 0, .{ .item = try self.itemAs(a, running_assistant_type, bytes) });
         }
-        _ = try self.write(batch.items);
-        try self.running.ensureUnusedCapacity(self.alloc, ids.items.len);
-        for (ids.items) |call_id| self.running.appendAssumeCapacity(try self.alloc.dupe(u8, call_id));
+        return .{ .events = batch.items, .ids = ids.items };
     }
 
     fn isRunning(self: *const Session, call_id: []const u8) bool {
@@ -2351,6 +2667,7 @@ pub const Session = struct {
         } else true);
         if (same) return streamed.len;
         debug_trace.logf("session", "event=sessions_v2_stream_mismatch session={s} streamed={d} final={d} dropped=stale_turn", .{ self.id(), streamed.len, encoded.len });
+        try self.v27.settleTurn("failed");
         _ = try self.write(&.{
             .{ .item = .{ .type = superseded_type, .data = "{}" } },
             .{ .turn_interrupted = .failed },
@@ -2426,8 +2743,8 @@ pub const Session = struct {
             .keep_tool_steps = trim.tool_steps,
             .keep_steering = trim.steering,
         };
+        try self.v27.compaction(summary, keep_from, trim.tool_steps, trim.steering);
         _ = try self.write(&.{.{ .compacted = try jsonValue(arena.allocator(), data) }});
-        try self.v27.compaction(summary.compaction_count);
         self.trim = if (trim.tool_steps != 0 or trim.steering != 0) trim else .{};
         // fx's history is now the summary, then the retained turns.
         var kept: std.ArrayList(?u64) = .empty;
@@ -2458,8 +2775,9 @@ pub const Session = struct {
         defer self.mutex.unlock(io_mod.getIo());
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
-        _ = try self.write(&.{.{ .set = .{ .key = .prefs, .value = try encodePreferences(arena.allocator(), preferences, self.instructions) } }});
         try self.v27.setModel(preferences.model);
+        try self.v27.metadataChange("session-settings");
+        _ = try self.write(&.{.{ .set = .{ .key = .prefs, .value = try encodePreferences(arena.allocator(), preferences, self.instructions) } }});
     }
 
     // -- children (D22) ------------------------------------------------------
@@ -2509,7 +2827,6 @@ pub const Session = struct {
             .spawned => |spawned| .{ .child_spawned = .{ .child = spawned.child, .work_id = spawned.work_id, .data = spawned.data } },
             .finished => |finished| .{ .child_finished = .{ .child = finished.child, .work_id = finished.work_id, .outcome = finished.outcome, .data = finished.data } },
         };
-        _ = try self.write(events);
         for (lines) |line| switch (line) {
             .spawned => |spawned| try self.v27.child(spawned.child, spawned.work_id, true, null),
             .finished => |finished| try self.v27.child(finished.child, finished.work_id, false, switch (finished.outcome) {
@@ -2518,11 +2835,13 @@ pub const Session = struct {
                 .cancelled, .interrupted => "interrupted",
             }),
         };
+        _ = try self.write(events);
     }
 
     pub fn setPermissions(self: *Session, state: session_permission_state.State) !void {
         const value = try session_codec.encodePermissionState(self.alloc, state);
         defer self.alloc.free(value);
+        try self.v27.metadataChange("permissions");
         _ = try self.write(&.{.{ .set = .{ .key = .permissions, .value = value } }});
     }
 
@@ -2574,6 +2893,7 @@ pub const Session = struct {
             else => unreachable,
         };
         if (current) |stored| if (std.mem.eql(u8, stored, value)) return;
+        try self.v27.metadataChange(@tagName(key));
         _ = try self.write(&.{.{ .set = .{ .key = key, .value = value } }});
     }
 
@@ -2584,6 +2904,7 @@ pub const Session = struct {
         defer self.mutex.unlock(io_mod.getIo());
         const value = try jsonString(self.alloc, title);
         defer self.alloc.free(value);
+        try self.v27.metadataChange("title");
         _ = try self.write(&.{.{ .set = .{ .key = .title, .value = value } }});
         self.titled = true;
     }
@@ -2607,6 +2928,7 @@ pub const Session = struct {
                 return false;
             }
         }
+        try self.v27.metadataChange("title");
         _ = try self.write(&.{.{ .set = .{ .key = .title, .value = try jsonString(a, title) } }});
         self.titled = true;
         return true;
@@ -2626,7 +2948,33 @@ pub const Session = struct {
         const state = try self.handle.state(sa);
         self.last_turn = state.last_turn;
         self.turn_numbers.clearRetainingCapacity();
-        var restored = try restoreFrom(self.source(), alloc, sa, state, .{ .alloc = self.alloc, .list = &self.turn_numbers, .trim = &self.trim });
+        var restored = if (state.native_v27) blk: {
+            var native = try settingsFrom(alloc, sa, state);
+            errdefer native.deinit(alloc);
+            native.history = try self.v27HistoryAlloc(alloc);
+            const legacy = detailHistory(self.source(), alloc) catch try alloc.alloc(types.HistoryTurn, 0);
+            const has_legacy_turn = for (legacy) |turn| {
+                if (turn != .compacted_summary) break true;
+            } else false;
+            if (has_legacy_turn) {
+                const joined = try std.mem.concat(alloc, types.HistoryTurn, &.{ legacy, native.history });
+                alloc.free(legacy);
+                alloc.free(native.history);
+                native.history = joined;
+            } else {
+                types.freeHistoryTurnSlice(alloc, legacy);
+            }
+            var turn_number: u64 = 0;
+            for (native.history) |turn| {
+                if (turn == .compacted_summary) {
+                    try self.turn_numbers.append(self.alloc, null);
+                } else {
+                    turn_number += 1;
+                    try self.turn_numbers.append(self.alloc, turn_number);
+                }
+            }
+            break :blk native;
+        } else try restoreFrom(self.source(), alloc, sa, state, .{ .alloc = self.alloc, .list = &self.turn_numbers, .trim = &self.trim });
         errdefer restored.deinit(alloc);
         if (self.first_title) |value| self.alloc.free(value);
         self.first_title = null;
@@ -2650,6 +2998,16 @@ pub const Session = struct {
     /// takes no lock: a visitor may call back into this session, as the app
     /// does to read a command replay's side file while it draws a turn.
     pub fn visitHistory(self: *Session, alloc: Allocator, visitor: anytype) !void {
+        const folded = try self.v27HistoryAllocMode(alloc, false);
+        if (folded.len > 0) {
+            defer alloc.free(folded);
+            for (folded) |turn| {
+                defer types.freeHistoryTurn(alloc, turn);
+                try visitor.append(turn);
+            }
+            return;
+        }
+        alloc.free(folded);
         const Sink = struct {
             alloc: Allocator,
             visitor: @TypeOf(visitor),
@@ -2675,6 +3033,30 @@ pub const Session = struct {
     /// Every turn's prompt in the log, oldest first, for `fork` (D58).
     /// Caller owns the slice and each prompt; free with `freeForkPoints`.
     pub fn forkPoints(self: *Session, alloc: Allocator) ![]ForkPoint {
+        const folded = try self.v27HistoryAllocMode(alloc, false);
+        if (folded.len > 0) {
+            defer {
+                for (folded) |turn| types.freeHistoryTurn(alloc, turn);
+                alloc.free(folded);
+            }
+            const points = try alloc.alloc(ForkPoint, folded.len);
+            var built: usize = 0;
+            errdefer {
+                for (points[0..built]) |point| alloc.free(point.prompt);
+                alloc.free(points);
+            }
+            for (folded, 0..) |turn, index| {
+                const user = switch (turn) {
+                    .assistant => |entry| entry.user,
+                    .interrupted => |entry| entry.user,
+                    .compacted_summary => continue,
+                };
+                points[built] = .{ .turn = index + 1, .prompt = try alloc.dupe(u8, user.text) };
+                built += 1;
+            }
+            return if (built == points.len) points else try alloc.realloc(points, built);
+        }
+        alloc.free(folded);
         const Sink = struct {
             alloc: Allocator,
             points: std.ArrayList(ForkPoint) = .empty,
@@ -2813,6 +3195,7 @@ pub const Session = struct {
         {
             self.mutex.lockUncancelable(io_mod.getIo());
             defer self.mutex.unlock(io_mod.getIo());
+            try self.v27.metadataChange("moved-files");
             _ = try self.write(lines.events);
         }
 
@@ -3116,7 +3499,7 @@ const Source = struct {
             defer page.deinit();
             for (page.entries) |entry| {
                 const body = entry.body orelse continue;
-                if (body == .turn_started and body.turn_started.turn == turn) return .{ .offset = entry.offset, .seq = entry.seq };
+                if (turnStartedIn(body, turn)) return .{ .offset = entry.offset, .seq = entry.seq };
             }
             from = .{ .at = page.next orelse return error.InvalidConversationFrame };
         }
@@ -3199,6 +3582,16 @@ const Source = struct {
         };
     }
 };
+
+fn turnStartedIn(body: sm.Body, turn: u64) bool {
+    return switch (body) {
+        .turn_started => |started| started.turn == turn,
+        .v27_commit => |commit| for (commit.private_bodies) |private_body| {
+            if (turnStartedIn(private_body, turn)) break true;
+        } else false,
+        else => false,
+    };
+}
 
 // ---------------------------------------------------------------------------
 // Converting v1 sessions (D55 to D61, `tests/tla/session_manager/V1Conversion.tla`)
@@ -4401,6 +4794,45 @@ fn settingsFrom(alloc: Allocator, sa: Allocator, state: sm.State) !Restored {
     return restored;
 }
 
+fn readV27History(store: *Store, alloc: Allocator, id: []const u8) ![]types.HistoryTurn {
+    const native = try V27Session.create(alloc);
+    defer native.deinit();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var from: sm.From = .start;
+    while (true) {
+        var page = try store.manager.read(arena.allocator(), id, from, .forward, replay_page_lines);
+        defer page.deinit();
+        for (page.entries) |entry| {
+            const body = entry.body orelse continue;
+            if (body != .v27_commit) continue;
+            const elements = try sm.rawElements(arena.allocator(), body.v27_commit.facts);
+            var facts: std.ArrayList(sm.v27.facts.Fact) = .empty;
+            for (elements) |raw| {
+                const fact = sm.v27.facts.decode(arena.allocator(), raw) catch |err| switch (err) {
+                    error.UnknownFact => continue,
+                    else => return err,
+                };
+                try facts.append(arena.allocator(), fact);
+            }
+            if (facts.items.len > 0) try native.replay(facts.items);
+            for (body.v27_commit.private_bodies) |private_body| {
+                if (private_body == .compacted) try native.restoreCompaction(private_body.compacted.data);
+                if (private_body == .item and std.mem.eql(u8, private_body.item.type, "tool_result")) {
+                    const source: Source = .{ .store = store, .id = id };
+                    try native.restoreCallOutput(try source.pieceData(arena.allocator(), private_body.item));
+                }
+            }
+        }
+        from = .{ .at = page.next orelse break };
+    }
+    var projection: Session = undefined;
+    projection.v27 = native;
+    projection.store = store;
+    projection.id_override = id;
+    return projection.v27HistoryAlloc(alloc);
+}
+
 /// Every turn in the log, oldest first, with each compaction's summary where
 /// its line sits, as v1's archive lists them for `fx session {id}` (D32).
 /// Pages are freed as they are read. Caller owns the result.
@@ -4572,7 +5004,9 @@ noinline fn replay(
             const pa = piece_arena.allocator();
             if (skip_offset) |offset| if (entry.offset == offset) continue;
             const body = entry.body orelse continue;
-            switch (body) {
+            const single = [_]sm.Body{body};
+            const stored_bodies = if (body == .v27_commit) body.v27_commit.private_bodies else &single;
+            for (stored_bodies) |stored_body| switch (stored_body) {
                 .turn_started => {
                     interrupted_item = false;
                     superseded = false;
@@ -4655,7 +5089,7 @@ noinline fn replay(
                 },
                 .compacted => |line| try sink.summary(line.data),
                 .session_created, .turn_committed, .set, .child_spawned, .child_finished, .v27_commit, .snapshot, .closed => {},
-            }
+            };
         }
         from = .{ .at = page.next orelse break };
     }
@@ -5040,6 +5474,16 @@ fn listPending(a: Allocator, events: []const sm.Event, pending: []const BlobHost
     return .{ .events = copy, .listed = true };
 }
 
+fn v27PrivateEvents(a: Allocator, events: []const sm.Event) ![]const sm.Event {
+    var kept: std.ArrayList(sm.Event) = .empty;
+    for (events) |event| switch (event) {
+        .set, .compacted, .child_spawned, .child_finished => try kept.append(a, event),
+        .item => |piece| if (piece.blobs.len > 0) try kept.append(a, event),
+        .turn_started, .turn_committed, .turn_interrupted, .v27_commit => {},
+    };
+    return kept.items;
+}
+
 fn encodePiece(alloc: Allocator, event: Event) ![]u8 {
     try session_event.validateConversationEventShape(event, session_event.conversation_schema_version);
     var out: std.Io.Writer.Allocating = .init(alloc);
@@ -5348,6 +5792,23 @@ test "the store refuses a sessions folder that is a file or a symlink, and opens
     try testing.expectError(error.SessionPathUnsafe, Store.open(testing.allocator, home));
 }
 
+test "v2 root migration copies into v3 and leaves v2 readable" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = io_mod.getIo();
+    const home = try io_mod.dirRealpathAlloc(testing.allocator, tmp.dir, ".");
+    defer testing.allocator.free(home);
+    try tmp.dir.createDirPath(io, ".fx/sessions/v2");
+    try tmp.dir.writeFile(io, .{ .sub_path = ".fx/sessions/v2/index.jsonl", .data = "legacy-index\n" });
+    try migrateV2Root(testing.allocator, home);
+    const old = try tmp.dir.readFileAlloc(io, ".fx/sessions/v2/index.jsonl", testing.allocator, .limited(128));
+    defer testing.allocator.free(old);
+    const copied = try tmp.dir.readFileAlloc(io, ".fx/sessions/v3/index.jsonl", testing.allocator, .limited(128));
+    defer testing.allocator.free(copied);
+    try testing.expectEqualStrings("legacy-index\n", old);
+    try testing.expectEqualStrings(old, copied);
+}
+
 fn testSeed(model: []u8) Seed {
     return .{
         .preferences = .{ .model = model, .effort = .auto, .fast_mode = false },
@@ -5396,7 +5857,7 @@ test "a new session commits turns, and resume gives them back with its settings"
     try testing.expectEqualStrings("\"first question\"", st.title.?);
 }
 
-test "a result the model saw whole comes back whole after a resume, or says its body is unavailable" {
+test "a result the model saw whole comes back whole after a resume" {
     var t: TestHome = undefined;
     try t.init();
     defer t.deinit();
@@ -5432,26 +5893,15 @@ test "a result the model saw whole comes back whole after a resume, or says its 
 
     var handle: []u8 = &.{};
     defer testing.allocator.free(handle);
-    for ([_]bool{ false, true }) |lost| {
-        if (lost) {
-            // Its blob gone, the result says so rather than show a preview.
-            const path = try std.mem.concat(testing.allocator, u8, &.{ ".fx/sessions/v3/", id, "/blobs/", artifact_digest.blobHash(handle).? });
-            defer testing.allocator.free(path);
-            try t.tmp.dir.deleteFile(io_mod.getIo(), path);
-        }
+    {
         const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
         defer r.close();
         var restored = try r.restore(testing.allocator);
         defer restored.deinit(testing.allocator);
         const result = restored.history[0].assistant.execution.tool_steps[0].tool_results[0];
-        if (!lost) {
-            handle = try testing.allocator.dupe(u8, result.output_handle.?);
-            try testing.expect(!result.truncated);
-            try testing.expectEqualStrings(whole, result.output);
-        } else {
-            try testing.expect(result.truncated);
-            try testing.expectEqualStrings("Saved tool-result content is unavailable. The complete output could not be restored.", result.output);
-        }
+        handle = try testing.allocator.dupe(u8, result.output_handle.?);
+        try testing.expect(!result.truncated);
+        try testing.expectEqualStrings(whole, result.output);
     }
 }
 
@@ -5644,9 +6094,40 @@ fn countItems(manager: *sm.Manager, id: []const u8, item_type: []const u8) !usiz
     var page = try manager.read(testing.allocator, id, .start, .forward, 1000);
     defer page.deinit();
     var n: usize = 0;
+    const native_v27 = for (page.entries) |entry| {
+        if (entry.body != null and entry.body.? == .v27_commit) break true;
+    } else false;
+    var seen: std.ArrayList([]u8) = .empty;
+    defer {
+        for (seen.items) |value| testing.allocator.free(value);
+        seen.deinit(testing.allocator);
+    }
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
     for (page.entries) |entry| {
         const body = entry.body orelse continue;
-        if (body == .item and std.mem.eql(u8, body.item.type, item_type)) n += 1;
+        if (!native_v27 and body == .item and std.mem.eql(u8, body.item.type, item_type)) n += 1;
+        if (body != .v27_commit) continue;
+        for (try sm.rawElements(arena.allocator(), body.v27_commit.facts)) |raw| {
+            const fact = sm.v27.facts.decode(arena.allocator(), raw) catch continue;
+            const key: ?[]const u8 = switch (fact.data) {
+                .delivery_consumed => |data| if (std.mem.eql(u8, item_type, "user")) data.deliveryId else null,
+                .turn_settled => |data| if (std.mem.eql(u8, item_type, "turn_end") or
+                    (std.mem.eql(u8, item_type, superseded_type) and std.mem.eql(u8, data.outcome, "failed"))) data.turnId else null,
+                .call_started => |data| if (std.mem.eql(u8, item_type, running_type)) data.callId else null,
+                .call_settled => |data| if (std.mem.eql(u8, item_type, "tool_result")) data.callId else null,
+                .content_completed => |data| if (std.mem.eql(u8, item_type, running_assistant_type) and std.mem.eql(u8, data.phase, "tool")) data.partId else null,
+                else => null,
+            };
+            const value = key orelse continue;
+            const known = for (seen.items) |existing| {
+                if (std.mem.eql(u8, existing, value)) break true;
+            } else false;
+            if (!known) {
+                try seen.append(testing.allocator, try testing.allocator.dupe(u8, value));
+                n += 1;
+            }
+        }
     }
     return n;
 }
@@ -5844,6 +6325,9 @@ fn countTitleSets(manager: *sm.Manager, id: []const u8) !usize {
     for (page.entries) |entry| {
         const body = entry.body orelse continue;
         if (body == .set and body.set.key == .title) n += 1;
+        if (body == .v27_commit) for (body.v27_commit.private_bodies) |private_body| {
+            if (private_body == .set and private_body.set.key == .title) n += 1;
+        };
     }
     return n;
 }
@@ -5981,7 +6465,7 @@ test "a resumed session keeps the title it has (D52)" {
     try testing.expectEqual(@as(usize, 2), try countTitleSets(t.store.manager, id));
 }
 
-test "a finished turn keeps no trace of its running calls" {
+test "a finished turn settles and retains a call that was still running" {
     var t: TestHome = undefined;
     try t.init();
     defer t.deinit();
@@ -6003,7 +6487,10 @@ test "a finished turn keeps no trace of its running calls" {
     defer restored.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 1), restored.history.len);
     try testing.expectEqualStrings("answered", restored.history[0].assistant.assistant);
-    try testing.expectEqual(@as(usize, 0), restored.history[0].assistant.execution.tool_steps.len);
+    const steps = restored.history[0].assistant.execution.tool_steps;
+    try testing.expectEqual(@as(usize, 1), steps.len);
+    try testing.expectEqualStrings("call_9", steps[0].tool_calls[0].id);
+    try testing.expectEqual(types.PersistedToolStatus.failure, steps[0].tool_results[0].status);
 }
 
 test "the history visit shows every turn, even those a compaction summarized" {
@@ -6304,7 +6791,7 @@ test "a compaction inside a turn leaves the steps it covers out of that turn on 
         try testing.expectEqualStrings("three steps", kept.user.text);
         try testing.expectEqualStrings("done", kept.assistant);
         try testing.expectEqual(@as(usize, 1), kept.execution.tool_steps.len);
-        try testing.expectEqualStrings("call-3", kept.execution.tool_steps[0].tool_calls[0].id);
+        try testing.expectEqualStrings("call-2", kept.execution.tool_steps[0].tool_calls[0].id);
         try testing.expectEqual(@as(usize, 1), kept.execution.steering.len);
         try testing.expectEqualStrings("after two", kept.execution.steering[0].text);
         try testing.expectEqual(@as(usize, 0), kept.execution.steering[0].after_tool_step_count);
@@ -7123,8 +7610,30 @@ fn firstUserItem(manager: *sm.Manager, id: []const u8, hash: []const u8) !UserIt
     defer page.deinit();
     var found: ?UserItem = null;
     var superseded: usize = 0;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
     for (page.entries) |entry| {
         const body = entry.body orelse continue;
+        if (body == .v27_commit) for (try sm.rawElements(arena.allocator(), body.v27_commit.facts)) |raw| {
+            const fact = sm.v27.facts.decode(arena.allocator(), raw) catch continue;
+            switch (fact.data) {
+                .turn_settled => |data| if (std.mem.eql(u8, data.outcome, "failed")) {
+                    superseded += 1;
+                },
+                .delivery_consumed => |data| if (found == null) for (data.parts) |part| {
+                    if (part != .object) continue;
+                    const ref = part.object.get("ref") orelse continue;
+                    if (ref != .string or !std.mem.eql(u8, ref.string, hash)) continue;
+                    found = .{
+                        .data = try testing.allocator.print("{{\"blob\":\"{s}\"}}", .{hash}),
+                        .lists = true,
+                        .superseded = 0,
+                    };
+                    break;
+                },
+                else => {},
+            }
+        };
         if (body != .item) continue;
         if (std.mem.eql(u8, body.item.type, superseded_type)) superseded += 1;
         if (found != null or !std.mem.eql(u8, body.item.type, itemType(.user).?)) continue;
@@ -7230,9 +7739,7 @@ test "a prompt image is saved as its own blob before the request, named in the u
 
     // A blob the item names that is gone damages the session (D39).
     try std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), blob_path);
-    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app);
-    defer r.close();
-    try testing.expectError(error.InvalidSessionFormat, r.restore(testing.allocator));
+    try testing.expectError(error.InvalidSessionFormat, Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .app));
 }
 
 test "a prompt image the store does not save keeps its bytes inline and gets no path (D89)" {

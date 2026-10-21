@@ -11103,7 +11103,8 @@ test.skipIf(!tmuxAvailable())(
       expect(ids).toHaveLength(1);
       const eventsPath = join(sessionDir(root.home, ids[0]!), "log.jsonl");
       const checkpointFrames = () => readFileSync(eventsPath, "utf8").trim().split("\n")
-        .map(decodeLogLine).filter((line) => line.kind === "compacted");
+        .flatMap((line) => JSON.parse(line).facts ?? [])
+        .filter((fact) => fact.type === "context.settled" && fact.data.kind === "compaction");
       const beforeCompaction = readFileSync(eventsPath);
       expect(checkpointFrames()).toHaveLength(0);
       await tui.sendText("/compact");

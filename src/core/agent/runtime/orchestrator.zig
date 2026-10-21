@@ -3974,6 +3974,11 @@ fn streamMainCompletion(
     return result;
 }
 
+fn recordModelLifecycle(deps: *const AgentRuntimeDeps, event: runtime_deps.ModelLifecycleEvent) !void {
+    const record = deps.record_model_lifecycle orelse return;
+    try record(deps.ctx, event);
+}
+
 fn persistRecoveryCheckpoint(
     deps: *const AgentRuntimeDeps,
     finalization: *const TurnFinalizationGuard,
@@ -7814,6 +7819,12 @@ fn processQueuedPromptLoop(
                 );
             }
 
+            try recordModelLifecycle(deps, .{ .requested = .{ .model = gateway_model } });
+            if (semantic_attempt > 0) {
+                const diagnostic = if (latest_recovery_diagnostic) |*value| value.view() else "retry";
+                try recordModelLifecycle(deps, .{ .retried = .{ .attempt = @intCast(semantic_attempt - 1), .code = diagnostic, .message = diagnostic } });
+            }
+            try recordModelLifecycle(deps, .{ .started = .{ .attempt = @intCast(semantic_attempt) } });
             const gateway_wait_started_ms = io_mod.milliTimestamp();
             var gateway_delivery = runtime_gateway_step.DeliveryCertainty.init();
             var gateway_attempt_evidence: runtime_gateway_step.AttemptEvidence = .{};
@@ -8280,6 +8291,8 @@ fn processQueuedPromptLoop(
                     model_request.credential.direct.secret_bytes = active_api_key;
                     model_request.delivery = &replay_delivery;
                     model_request.attempt_evidence = &replay_evidence;
+                    try recordModelLifecycle(deps, .{ .retried = .{ .attempt = @intCast(semantic_attempt), .code = "authentication", .message = "Authentication refreshed before replay." } });
+                    try recordModelLifecycle(deps, .{ .started = .{ .attempt = @intCast(semantic_attempt + 1) } });
                     const replay_wait_started_ms = io_mod.milliTimestamp();
                     stream_result = try streamMainCompletion(deps, arena, model_request);
                     pushNetworkRecord(deps, job.provider, gateway_model, replay_wait_started_ms, &stream_result);
@@ -10146,6 +10159,11 @@ fn processQueuedPromptLoop(
                 provider_replay,
         );
         try appendRunningToolCalls(deps, finalization, job, within_turn_suffix.items, effective_tool_calls);
+        try recordModelLifecycle(deps, .{ .settled = .{
+            .outcome = "completed",
+            .finish_reason = if (completion.finish_reason) |reason| @tagName(reason) else null,
+            .usage = completion.usage,
+        } });
 
         const step_has_content = !terminal_provider_completion and completion.content != null and completion.content.?.len > 0;
         if (step_has_content) {
