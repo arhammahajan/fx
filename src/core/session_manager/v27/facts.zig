@@ -64,7 +64,7 @@ pub const SessionEnded = struct { outcome: []const u8, cause: ?Cause = null, @"e
 pub const DeliveryAdmitted = struct { deliveryId: []const u8, principal: ?std.json.Value = null, source: ?std.json.Value = null, clientContext: ?std.json.Value = null };
 pub const DeliveryConsumed = struct { deliveryId: []const u8, turnId: []const u8, parts: []const std.json.Value, history: ?[]const std.json.Value = null };
 pub const DeliverySettled = struct { deliveryId: []const u8, outcome: []const u8, turnId: ?[]const u8 = null, reason: ?[]const u8 = null };
-pub const TurnStarted = struct { turnId: []const u8, cause: Cause, follows: ?[]const u8, trace: ?std.json.Value = null };
+pub const TurnStarted = struct { turnId: []const u8, cause: Cause, follows: std.json.Value, trace: ?std.json.Value = null };
 pub const Awaiting = struct { interactionId: []const u8 };
 pub const TurnPaused = struct { turnId: []const u8, awaiting: []const Awaiting };
 pub const TurnSettled = struct { turnId: []const u8, outcome: []const u8, reply: ?[]const []const u8 = null, cause: ?Cause = null, @"error": ?ErrorInfo = null };

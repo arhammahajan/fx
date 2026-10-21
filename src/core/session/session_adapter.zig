@@ -61,6 +61,7 @@ const model_provider = @import("../config/model_provider.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const history_range = @import("../shared/history_range.zig");
 const v27_shadow = @import("v27_shadow.zig");
+const V27Shadow = v27_shadow.Shadow(sm.v27);
 
 const Allocator = std.mem.Allocator;
 const Event = session_event.ConversationEvent;
@@ -1250,7 +1251,7 @@ pub const Session = struct {
     /// A conversion's import: the original time of the batches it writes
     /// next (D59). Null for every other session.
     import_ts: ?u64 = null,
-    v27: ?*v27_shadow.Shadow = null,
+    v27: ?*V27Shadow = null,
 
     pub fn create(alloc: Allocator, store: *Store, workspace: []const u8, host: Host, seed: Seed) !*Session {
         // Every v2 write needs a writable open, and both start here or in
@@ -1459,7 +1460,7 @@ pub const Session = struct {
         if (self.v27 != null or !std.mem.eql(u8, io_mod.getenv("FX_SESSION_V27_SHADOW") orelse "", "1")) return;
         const folder = try self.folderPath(self.alloc);
         defer self.alloc.free(folder);
-        self.v27 = v27_shadow.Shadow.create(self.alloc, folder) catch |err| {
+        self.v27 = V27Shadow.create(self.alloc, folder) catch |err| {
             debug_trace.logf("session", "event=v27_shadow_open_deferred session={s} err={s}", .{ self.id(), @errorName(err) });
             return;
         };

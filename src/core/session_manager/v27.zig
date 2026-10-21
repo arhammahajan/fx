@@ -6,6 +6,9 @@ pub const cascade = @import("v27/cascade.zig");
 pub const scope = @import("v27/scope.zig");
 pub const checker = @import("v27/checker.zig");
 pub const writer = @import("v27/writer.zig");
+pub const tables = @import("v27/tables.zig");
+pub const fold = @import("v27/fold.zig");
+pub const selectors = @import("v27/selectors.zig");
 
 test {
     _ = catalog;
@@ -16,4 +19,7 @@ test {
     _ = scope;
     _ = checker;
     _ = writer;
+    _ = tables;
+    _ = fold;
+    _ = selectors;
 }

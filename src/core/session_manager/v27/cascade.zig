@@ -162,7 +162,7 @@ test "turn cancellation closes leaves before owners and deliveries after" {
     const opening = [_]facts.Fact{
         facts.sessionStarted(.{}),
         facts.deliveryAdmitted(.{ .deliveryId = "d" }),
-        facts.turnStarted(.{ .turnId = "t", .cause = .{ .deliveryId = "d" }, .follows = null }),
+        facts.turnStarted(.{ .turnId = "t", .cause = .{ .deliveryId = "d" }, .follows = .null }),
         facts.deliveryConsumed(.{ .deliveryId = "d", .turnId = "t", .parts = empty_parts }),
         facts.modelRequested(.{ .runId = "r", .owner = .{ .turnId = "t" } }),
         facts.callRequested(.{ .callId = "c", .owner = .{ .runId = "r" }, .capability = .{ .kind = "tool", .name = "deploy" } }),
