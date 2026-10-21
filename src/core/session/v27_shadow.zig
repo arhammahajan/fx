@@ -8,8 +8,10 @@ pub fn Shadow(comptime v27: type) type {
         const Self = @This();
 
         alloc: std.mem.Allocator,
-        file: std.Io.File,
+        file: ?std.Io.File = null,
+        report_file: ?std.Io.File = null,
         state: v27.tree.OpenState = .{},
+        view: v27.tables.SessionView = .{},
         owned_ids: std.ArrayList([]u8) = .empty,
         turn_number: u64 = 0,
         turn_id: ?[]const u8 = null,
@@ -17,23 +19,40 @@ pub fn Shadow(comptime v27: type) type {
         run_id: ?[]const u8 = null,
         next_part: u64 = 0,
 
-        pub fn create(alloc: std.mem.Allocator, session_folder: []const u8) !*Self {
-            const path = try std.Io.Dir.path.join(alloc, &.{ session_folder, "stream.v27.ndjson" });
-            defer alloc.free(path);
+        pub fn createMemory(alloc: std.mem.Allocator) !*Self {
             const self = try alloc.create(Self);
             errdefer alloc.destroy(self);
-            self.* = .{
-                .alloc = alloc,
-                .file = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), path, .{ .truncate = true }),
-            };
-            errdefer self.file.close(io_mod.getIo());
+            self.* = .{ .alloc = alloc };
             try self.write(&.{facts.sessionStarted(.{})});
             return self;
         }
 
+        pub fn enableFiles(self: *Self, session_folder: []const u8) !void {
+            if (self.file != null) return;
+            const path = try std.Io.Dir.path.join(self.alloc, &.{ session_folder, "stream.v27.ndjson" });
+            defer self.alloc.free(path);
+            self.file = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), path, .{ .truncate = true });
+            errdefer {
+                self.file.?.close(io_mod.getIo());
+                self.file = null;
+            }
+            if (io_mod.getenv("FX_SESSION_V27_REPORT_DIR")) |report_dir| {
+                const report_name = try self.alloc.print("{s}.ndjson", .{std.Io.Dir.path.basename(session_folder)});
+                defer self.alloc.free(report_name);
+                const report_path = try std.Io.Dir.path.join(self.alloc, &.{ report_dir, report_name });
+                defer self.alloc.free(report_path);
+                self.report_file = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), report_path, .{ .truncate = true });
+            }
+            const opening = "{\"at\":\"1970-01-01T00:00:00.000Z\",\"facts\":[{\"type\":\"session.started\",\"data\":{}}]}\n";
+            try self.file.?.writeStreamingAll(io_mod.getIo(), opening);
+            if (self.report_file) |file| try file.writeStreamingAll(io_mod.getIo(), opening);
+        }
+
         pub fn deinit(self: *Self) void {
-            self.file.close(io_mod.getIo());
+            if (self.file) |file| file.close(io_mod.getIo());
+            if (self.report_file) |file| file.close(io_mod.getIo());
             self.state.deinit(self.alloc);
+            self.view.deinit(self.alloc);
             for (self.owned_ids.items) |owned| self.alloc.free(owned);
             self.owned_ids.deinit(self.alloc);
             const alloc = self.alloc;
@@ -139,9 +158,9 @@ pub fn Shadow(comptime v27: type) type {
             const call_id = try self.copyId(work_id);
             const task_id = try self.idWithSuffix("task", work_id);
             if (started) {
-                try self.beginTurn();
+                try self.startModel();
                 try self.write(&.{
-                    facts.callRequested(.{ .callId = call_id, .owner = .{ .turnId = self.turn_id.? }, .capability = .{ .kind = "agent", .name = "subagent" } }),
+                    facts.callRequested(.{ .callId = call_id, .owner = .{ .runId = self.run_id.? }, .capability = .{ .kind = "agent", .name = "subagent" } }),
                     facts.taskStarted(.{ .taskId = task_id, .startedBy = .{ .callId = call_id }, .kind = "agent", .name = "subagent" }),
                     facts.childOpened(.{ .sessionId = session_id, .owner = .{ .taskId = task_id }, .name = "subagent", .stream = session_id }),
                     facts.callStarted(.{ .callId = call_id, .taskId = task_id }),
@@ -162,12 +181,14 @@ pub fn Shadow(comptime v27: type) type {
             var committed: std.ArrayList(facts.Fact) = .empty;
             defer committed.deinit(self.alloc);
             try v27.cascade.apply(self.alloc, &self.state, input, &committed);
+            try v27.fold.foldCommit(self.alloc, &self.view, committed.items, self.view.position, .complete);
             var encoded: std.Io.Writer.Allocating = .init(self.alloc);
             defer encoded.deinit();
             try encoded.writer.writeAll("{\"at\":\"1970-01-01T00:00:00.000Z\",\"facts\":");
             try std.json.Stringify.value(committed.items, .{ .emit_null_optional_fields = false }, &encoded.writer);
             try encoded.writer.writeAll("}\n");
-            try self.file.writeStreamingAll(io_mod.getIo(), encoded.written());
+            if (self.file) |file| try file.writeStreamingAll(io_mod.getIo(), encoded.written());
+            if (self.report_file) |file| try file.writeStreamingAll(io_mod.getIo(), encoded.written());
         }
 
         fn id(self: *Self, prefix: []const u8, number: u64) ![]const u8 {

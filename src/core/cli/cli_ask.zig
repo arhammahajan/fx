@@ -1968,7 +1968,8 @@ fn takePromptRunResult(ctx: *AskContext, alloc: Allocator) !PromptRunResult {
     writeShellSnapshotNotice(ctx);
     const assistant_output = try alloc.dupe(u8, ctx.assistant_output.items);
     errdefer alloc.free(assistant_output);
-    const final_output: []u8 = if (ctx.final_output.items.len > 0)
+    const folded_reply = if (ctx.v2) |v2| try v2.v27ReplyAlloc(alloc) else null;
+    const final_output: []u8 = folded_reply orelse if (ctx.final_output.items.len > 0)
         try alloc.dupe(u8, ctx.final_output.items)
     else
         @constCast(&.{});
@@ -1992,7 +1993,18 @@ fn takePromptRunResult(ctx: *AskContext, alloc: Allocator) !PromptRunResult {
         try alloc.dupe(u8, "");
     errdefer if (session_id.len > 0) alloc.free(session_id);
 
-    const tool_calls = try takeToolCallRecords(ctx, alloc);
+    const tool_calls = if (ctx.v2) |v2| blk: {
+        if (try v2.v27ToolSummaries(alloc)) |summaries| {
+            const records = alloc.alloc(ToolCallRecord, summaries.len) catch |err| {
+                session_adapter.freeV27ToolSummaries(alloc, summaries);
+                return err;
+            };
+            for (summaries, records) |summary, *record| record.* = .{ .name = summary.name, .status = summary.status };
+            alloc.free(summaries);
+            break :blk records;
+        }
+        break :blk try takeToolCallRecords(ctx, alloc);
+    } else try takeToolCallRecords(ctx, alloc);
 
     return .{
         .exit_code = if (ctx.failed) 1 else 0,

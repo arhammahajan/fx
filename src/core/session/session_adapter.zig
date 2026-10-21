@@ -157,6 +157,16 @@ pub const V27CallProjection = struct {
     }
 };
 
+pub const V27ToolSummary = struct { name: []u8, status: []u8 };
+
+pub fn freeV27ToolSummaries(alloc: Allocator, summaries: []V27ToolSummary) void {
+    for (summaries) |summary| {
+        alloc.free(summary.name);
+        alloc.free(summary.status);
+    }
+    alloc.free(summaries);
+}
+
 /// One child as its parent's log folds it (D22). Owns its strings.
 pub const Child = struct {
     id: []u8,
@@ -1522,16 +1532,20 @@ pub const Session = struct {
         errdefer alloc.free(files_path);
         const host = try BlobHost.create(alloc, store, handle);
         errdefer BlobHost.release(host);
+        const v27 = try V27Shadow.createMemory(alloc);
+        errdefer v27.deinit();
         const self = try alloc.create(Session);
-        self.* = .{ .alloc = alloc, .store = store, .handle = handle, .files_path = files_path, .host = host, .fresh = fresh };
+        self.* = .{ .alloc = alloc, .store = store, .handle = handle, .files_path = files_path, .host = host, .fresh = fresh, .v27 = v27 };
         return self;
     }
 
     fn ensureV27Shadow(self: *Session) !void {
-        if (self.v27 != null or !std.mem.eql(u8, io_mod.getenv("FX_SESSION_V27_SHADOW") orelse "", "1")) return;
+        if (!std.mem.eql(u8, io_mod.getenv("FX_SESSION_V27_SHADOW") orelse "", "1")) return;
+        const shadow = self.v27 orelse return;
+        if (shadow.file != null) return;
         const folder = try self.folderPath(self.alloc);
         defer self.alloc.free(folder);
-        self.v27 = V27Shadow.create(self.alloc, folder) catch |err| {
+        shadow.enableFiles(folder) catch |err| {
             debug_trace.logf("session", "event=v27_shadow_open_deferred session={s} err={s}", .{ self.id(), @errorName(err) });
             return;
         };
@@ -1539,6 +1553,49 @@ pub const Session = struct {
 
     pub fn id(self: *const Session) []const u8 {
         return self.handle.id();
+    }
+
+    /// The latest public reply from the v27 fold. Caller owns the result.
+    pub fn v27ReplyAlloc(self: *Session, alloc: Allocator) !?[]u8 {
+        const shadow = self.v27 orelse return null;
+        const turn_id = shadow.view.session.latest_turn_id orelse return null;
+        const ids = sm.v27.selectors.reply(&shadow.view, turn_id);
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(alloc);
+        for (ids) |part_id| {
+            const part = shadow.view.parts.get(part_id) orelse continue;
+            const value = part.value orelse continue;
+            const text = switch (value) {
+                .string => |text| text,
+                else => continue,
+            };
+            if (out.items.len > 0) try out.appendSlice(alloc, "\n");
+            try out.appendSlice(alloc, text);
+        }
+        return if (out.items.len == 0) null else try out.toOwnedSlice(alloc);
+    }
+
+    /// Tool names and terminal states from v27 call rows. Caller owns.
+    pub fn v27ToolSummaries(self: *Session, alloc: Allocator) !?[]V27ToolSummary {
+        const shadow = self.v27 orelse return null;
+        var out: std.ArrayList(V27ToolSummary) = .empty;
+        errdefer {
+            for (out.items) |summary| {
+                alloc.free(summary.name);
+                alloc.free(summary.status);
+            }
+            out.deinit(alloc);
+        }
+        for (shadow.state.entities.items) |entity| {
+            if (entity.ref.family != .call) continue;
+            const row = shadow.view.calls.get(entity.ref.id) orelse continue;
+            const name = try alloc.dupe(u8, sm.v27.selectors.callLabel(row));
+            errdefer alloc.free(name);
+            const state = sm.v27.selectors.callState(row);
+            const status = try alloc.dupe(u8, if (std.mem.eql(u8, state, "completed")) "success" else if (std.mem.eql(u8, row.status, "settled")) "error" else "pending");
+            try out.append(alloc, .{ .name = name, .status = status });
+        }
+        return try out.toOwnedSlice(alloc);
     }
 
     /// Appends through the manager; a host session also traces the turn and
