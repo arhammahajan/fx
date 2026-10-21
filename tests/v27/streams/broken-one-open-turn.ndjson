@@ -1,0 +1,3 @@
+{"at":"2026-10-09T00:00:00.000Z","facts":[{"type":"session.started","data":{}}]}
+{"at":"2026-10-09T00:00:00.000Z","facts":[{"type":"turn.started","data":{"cause":{"hook":"h"},"follows":null,"turnId":"turn_0"},"scope":{"turnId":"turn_0"}}]}
+{"at":"2026-10-09T00:00:00.000Z","facts":[{"type":"turn.started","data":{"cause":{"hook":"h"},"follows":"turn_0","turnId":"turn_1"},"scope":{"turnId":"turn_1"}}]}

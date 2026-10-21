@@ -1,0 +1,137 @@
+{
+  "call.requested": {
+    "family": "call",
+    "idField": "callId",
+    "role": "introduces"
+  },
+  "call.settled": {
+    "family": "call",
+    "idField": "callId",
+    "role": "terminal"
+  },
+  "call.started": {
+    "family": "call",
+    "idField": "callId",
+    "role": "updates"
+  },
+  "child.opened": {
+    "family": "child",
+    "idField": "sessionId",
+    "role": "introduces"
+  },
+  "content.completed": {
+    "family": "content",
+    "idField": "partId",
+    "role": "complete"
+  },
+  "context.settled": {
+    "family": "context",
+    "idField": "changeId",
+    "role": "terminal"
+  },
+  "context.started": {
+    "family": "context",
+    "idField": "changeId",
+    "role": "introduces"
+  },
+  "delivery.admitted": {
+    "family": "delivery",
+    "idField": "deliveryId",
+    "role": "introduces"
+  },
+  "delivery.consumed": {
+    "family": "delivery",
+    "idField": "deliveryId",
+    "role": "updates"
+  },
+  "delivery.settled": {
+    "family": "delivery",
+    "idField": "deliveryId",
+    "role": "terminal"
+  },
+  "interaction.opened": {
+    "family": "interaction",
+    "idField": "interactionId",
+    "role": "introduces"
+  },
+  "interaction.settled": {
+    "family": "interaction",
+    "idField": "interactionId",
+    "role": "terminal"
+  },
+  "model.requested": {
+    "family": "model",
+    "idField": "runId",
+    "role": "introduces"
+  },
+  "model.retried": {
+    "family": "model",
+    "idField": "runId",
+    "role": "updates"
+  },
+  "model.settled": {
+    "family": "model",
+    "idField": "runId",
+    "role": "terminal"
+  },
+  "model.started": {
+    "family": "model",
+    "idField": "runId",
+    "role": "updates"
+  },
+  "response.admitted": {
+    "family": "response",
+    "idField": "responseId",
+    "role": "updates"
+  },
+  "response.settled": {
+    "family": "response",
+    "idField": "responseId",
+    "role": "terminal"
+  },
+  "response.submitted": {
+    "family": "response",
+    "idField": "responseId",
+    "role": "introduces"
+  },
+  "session.ended": {
+    "family": "session",
+    "idField": "",
+    "role": "terminal"
+  },
+  "session.started": {
+    "family": "session",
+    "idField": "",
+    "role": "introduces"
+  },
+  "task.ended": {
+    "family": "task",
+    "idField": "taskId",
+    "role": "terminal"
+  },
+  "task.started": {
+    "family": "task",
+    "idField": "taskId",
+    "role": "introduces"
+  },
+  "turn.paused": {
+    "family": "turn",
+    "idField": "turnId",
+    "role": "updates"
+  },
+  "turn.settled": {
+    "family": "turn",
+    "idField": "turnId",
+    "role": "terminal"
+  },
+  "turn.started": {
+    "family": "turn",
+    "idField": "turnId",
+    "role": "introduces"
+  },
+  "usage.recorded": {
+    "family": "usage",
+    "idField": "",
+    "role": "record"
+  }
+}

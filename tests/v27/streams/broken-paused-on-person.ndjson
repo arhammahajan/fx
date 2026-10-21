@@ -1,0 +1,3 @@
+{"at":"2026-10-09T00:00:00.000Z","facts":[{"type":"session.started","data":{}},{"type":"delivery.admitted","data":{"deliveryId":"d_0"}}]}
+{"at":"2026-10-09T00:00:00.000Z","facts":[{"type":"turn.started","data":{"cause":{"deliveryId":"d_0"},"follows":null,"turnId":"turn_0"},"scope":{"turnId":"turn_0"}},{"type":"delivery.consumed","data":{"deliveryId":"d_0","parts":[],"turnId":"turn_0"},"scope":{"turnId":"turn_0"}}]}
+{"at":"2026-10-09T00:00:00.000Z","facts":[{"type":"turn.paused","data":{"awaiting":[{"interactionId":"i_9"}],"turnId":"turn_0"},"scope":{"turnId":"turn_0"}}]}

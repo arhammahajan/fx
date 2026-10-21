@@ -55,6 +55,14 @@ jobs:
       - name: Check indexer boundary
         run: ./scripts/check-indexer-boundary.sh
 
+      - name: Check eve v27 fixture streams
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+
+      - name: Validate eve v27 fixture streams
+        run: tests/v27/check-all.sh
+
       - name: Test CI and release scripts
         run: python3 -m unittest scripts.tests.test_macos_signing scripts.tests.test_signed_macos scripts.tests.test_detect_macos_need -q
 
