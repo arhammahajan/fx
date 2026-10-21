@@ -1,0 +1,123 @@
+const std = @import("std");
+const sm = @import("session_manager");
+const io_mod = @import("../shared/io.zig");
+
+const v27 = sm.v27;
+const facts = v27.facts;
+
+pub const Shadow = struct {
+    alloc: std.mem.Allocator,
+    file: std.Io.File,
+    state: v27.tree.OpenState = .{},
+    owned_ids: std.ArrayList([]u8) = .empty,
+    turn_number: u64 = 0,
+    turn_id: ?[]const u8 = null,
+    delivery_id: ?[]const u8 = null,
+
+    pub fn create(alloc: std.mem.Allocator, session_folder: []const u8) !*Shadow {
+        const path = try std.Io.Dir.path.join(alloc, &.{ session_folder, "stream.v27.ndjson" });
+        defer alloc.free(path);
+        const self = try alloc.create(Shadow);
+        errdefer alloc.destroy(self);
+        self.* = .{
+            .alloc = alloc,
+            .file = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), path, .{ .truncate = true }),
+        };
+        errdefer self.file.close(io_mod.getIo());
+        try self.write(&.{facts.sessionStarted(.{})});
+        return self;
+    }
+
+    pub fn deinit(self: *Shadow) void {
+        self.file.close(io_mod.getIo());
+        self.state.deinit(self.alloc);
+        for (self.owned_ids.items) |owned| self.alloc.free(owned);
+        self.owned_ids.deinit(self.alloc);
+        const alloc = self.alloc;
+        self.* = undefined;
+        alloc.destroy(self);
+    }
+
+    pub fn beginTurn(self: *Shadow) !void {
+        if (self.turn_id != null) return;
+        self.turn_number += 1;
+        self.delivery_id = try self.id("delivery", self.turn_number);
+        self.turn_id = try self.id("turn", self.turn_number);
+        const turn_id = self.turn_id.?;
+        const delivery_id = self.delivery_id.?;
+        const parts: []const std.json.Value = &.{};
+        try self.write(&.{
+            facts.deliveryAdmitted(.{ .deliveryId = delivery_id }),
+            facts.turnStarted(.{ .turnId = turn_id, .cause = .{ .deliveryId = delivery_id }, .follows = null }),
+            facts.deliveryConsumed(.{ .deliveryId = delivery_id, .turnId = turn_id, .parts = parts }),
+        });
+    }
+
+    pub fn settleTurn(self: *Shadow, outcome: []const u8) !void {
+        try self.beginTurn();
+        try self.write(&.{facts.turnSettled(.{ .turnId = self.turn_id.?, .outcome = outcome })});
+        self.turn_id = null;
+        self.delivery_id = null;
+    }
+
+    pub fn compaction(self: *Shadow, count: u64) !void {
+        const change_id = try self.id("change", count);
+        try self.write(&.{
+            facts.contextStarted(.{ .changeId = change_id, .kind = "compaction" }),
+            facts.contextSettled(.{ .changeId = change_id, .kind = "compaction", .outcome = "completed" }),
+        });
+    }
+
+    pub fn child(self: *Shadow, session_id: []const u8, work_id: []const u8, started: bool, completed: bool) !void {
+        const call_id = try self.copyId(work_id);
+        const task_id = try self.idWithSuffix("task", work_id);
+        if (started) {
+            try self.beginTurn();
+            try self.write(&.{
+                facts.callRequested(.{ .callId = call_id, .owner = .{ .turnId = self.turn_id.? }, .capability = .{ .kind = "agent", .name = "subagent" } }),
+                facts.taskStarted(.{ .taskId = task_id, .startedBy = .{ .callId = call_id }, .kind = "agent", .name = "subagent" }),
+                facts.childOpened(.{ .sessionId = session_id, .owner = .{ .taskId = task_id }, .name = "subagent", .stream = session_id }),
+                facts.callStarted(.{ .callId = call_id, .taskId = task_id }),
+            });
+        }
+        if (completed) try self.write(&.{
+            facts.callSettled(.{ .callId = call_id, .outcome = "completed" }),
+            facts.taskEnded(.{ .taskId = task_id, .outcome = "completed" }),
+        });
+    }
+
+    pub fn end(self: *Shadow) !void {
+        if (self.state.session_ended) return;
+        try self.write(&.{facts.sessionEnded(.{ .outcome = "completed" })});
+    }
+
+    pub fn write(self: *Shadow, input: []const facts.Fact) !void {
+        var committed: std.ArrayList(facts.Fact) = .empty;
+        defer committed.deinit(self.alloc);
+        try v27.cascade.apply(self.alloc, &self.state, input, &committed);
+        var encoded: std.Io.Writer.Allocating = .init(self.alloc);
+        defer encoded.deinit();
+        try encoded.writer.writeAll("{\"at\":\"1970-01-01T00:00:00.000Z\",\"facts\":");
+        try std.json.Stringify.value(committed.items, .{ .emit_null_optional_fields = false }, &encoded.writer);
+        try encoded.writer.writeAll("}\n");
+        try self.file.writeStreamingAll(io_mod.getIo(), encoded.written());
+    }
+
+    fn id(self: *Shadow, prefix: []const u8, number: u64) ![]const u8 {
+        const value = try self.alloc.print("{s}_{d}", .{ prefix, number });
+        try self.owned_ids.append(self.alloc, value);
+        return value;
+    }
+
+    fn idWithSuffix(self: *Shadow, prefix: []const u8, suffix: []const u8) ![]const u8 {
+        const value = try self.alloc.print("{s}_{s}", .{ prefix, suffix });
+        try self.owned_ids.append(self.alloc, value);
+        return value;
+    }
+
+    fn copyId(self: *Shadow, source: []const u8) ![]const u8 {
+        const value = try self.alloc.dupe(u8, source);
+        try self.owned_ids.append(self.alloc, value);
+        return value;
+    }
+};

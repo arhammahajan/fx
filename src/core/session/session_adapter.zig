@@ -60,6 +60,7 @@ const session_permission_state = @import("../permissions/session_permission_stat
 const model_provider = @import("../config/model_provider.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const history_range = @import("../shared/history_range.zig");
+const v27_shadow = @import("v27_shadow.zig");
 
 const Allocator = std.mem.Allocator;
 const Event = session_event.ConversationEvent;
@@ -1249,6 +1250,7 @@ pub const Session = struct {
     /// A conversion's import: the original time of the batches it writes
     /// next (D59). Null for every other session.
     import_ts: ?u64 = null,
+    v27: ?*v27_shadow.Shadow = null,
 
     pub fn create(alloc: Allocator, store: *Store, workspace: []const u8, host: Host, seed: Seed) !*Session {
         // Every v2 write needs a writable open, and both start here or in
@@ -1260,6 +1262,7 @@ pub const Session = struct {
         const self = try init(alloc, store, handle, true);
         errdefer self.destroyInner();
         try self.appendSeed(seed);
+        try self.ensureV27Shadow();
         traceWiring("Open", self.id(), "", self.store.pid);
         return self;
     }
@@ -1319,6 +1322,7 @@ pub const Session = struct {
                 defer preferences.deinit(alloc);
                 try self.replaceInstructions(preferences, seed.instructions);
             }
+            try self.ensureV27Shadow();
             return self;
         } else |err| switch (err) {
             error.NotFound => {},
@@ -1331,6 +1335,7 @@ pub const Session = struct {
         self.root = false;
         if (seed.instructions.len > 0) self.instructions = try alloc.dupe(u8, seed.instructions);
         try self.appendSeed(seed);
+        try self.ensureV27Shadow();
         return self;
     }
 
@@ -1435,6 +1440,7 @@ pub const Session = struct {
         defer state.deinit(alloc);
         self.last_turn = state.last_turn;
         if (clean) cleanLeftovers(store, alloc, self.id(), &state);
+        try self.ensureV27Shadow();
         traceWiring("Open", self.id(), "", self.store.pid);
         return self;
     }
@@ -1447,6 +1453,13 @@ pub const Session = struct {
         const self = try alloc.create(Session);
         self.* = .{ .alloc = alloc, .store = store, .handle = handle, .files_path = files_path, .host = host, .fresh = fresh };
         return self;
+    }
+
+    fn ensureV27Shadow(self: *Session) !void {
+        if (self.v27 != null or !std.mem.eql(u8, io_mod.getenv("FX_SESSION_V27_SHADOW") orelse "", "1")) return;
+        const folder = try self.folderPath(self.alloc);
+        defer self.alloc.free(folder);
+        self.v27 = try v27_shadow.Shadow.create(self.alloc, folder);
     }
 
     pub fn id(self: *const Session) []const u8 {
@@ -1521,6 +1534,7 @@ pub const Session = struct {
     /// A copy of its capability that a background reader still holds keeps
     /// reading, and stores nothing more (D44).
     pub fn close(self: *Session) void {
+        if (self.v27) |shadow| shadow.end() catch |err| debug_trace.logf("session", "event=v27_shadow_close_failed session={s} err={s}", .{ self.id(), @errorName(err) });
         self.host.detach();
         self.handle.close() catch |err| debug_trace.logf("session", "event=sessions_v2_close_failed session={s} err={s}", .{ self.id(), @errorName(err) });
         if (self.root) traceWiring("Close", self.id(), "", self.store.pid);
@@ -1551,6 +1565,7 @@ pub const Session = struct {
 
     fn destroyInner(self: *Session) void {
         const alloc = self.alloc;
+        if (self.v27) |shadow| shadow.deinit();
         if (self.capability) |*capability| capability.deinit();
         BlobHost.release(self.host);
         self.clearStreamed();
@@ -1621,6 +1636,7 @@ pub const Session = struct {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
         try self.openTurnLocked();
+        if (self.v27) |shadow| try shadow.beginTurn();
     }
 
     /// Stores the turn's tool results and images as blobs and gives them
@@ -1710,6 +1726,14 @@ pub const Session = struct {
         if (derived_title) |title| try tail.append(a, .{ .set = .{ .key = .title, .value = try jsonString(a, title) } });
 
         try self.writePieces(a, all[start..], encoded[start..], tail.items);
+        if (self.v27) |shadow| try shadow.settleTurn(switch (end) {
+            .turn_completed => "completed",
+            .interrupted => |interruption| switch (interruption.reason) {
+                .cancelled => "cancelled",
+                .failed => "failed",
+            },
+            else => unreachable,
+        });
         try self.turn_numbers.append(self.alloc, self.last_turn);
         self.turn_open = false;
         self.clearStreamed();
@@ -2106,6 +2130,7 @@ pub const Session = struct {
             .keep_steering = trim.steering,
         };
         _ = try self.write(&.{.{ .compacted = try jsonValue(arena.allocator(), data) }});
+        if (self.v27) |shadow| try shadow.compaction(summary.compaction_count);
         self.trim = if (trim.tool_steps != 0 or trim.steering != 0) trim else .{};
         // fx's history is now the summary, then the retained turns.
         var kept: std.ArrayList(?u64) = .empty;
@@ -2183,6 +2208,10 @@ pub const Session = struct {
             .finished => |finished| .{ .child_finished = .{ .child = finished.child, .work_id = finished.work_id, .outcome = finished.outcome, .data = finished.data } },
         };
         _ = try self.write(events);
+        if (self.v27) |shadow| for (lines) |line| switch (line) {
+            .spawned => |spawned| try shadow.child(spawned.child, spawned.work_id, true, false),
+            .finished => |finished| try shadow.child(finished.child, finished.work_id, false, true),
+        };
     }
 
     pub fn setPermissions(self: *Session, state: session_permission_state.State) !void {

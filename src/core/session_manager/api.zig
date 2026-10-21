@@ -58,6 +58,7 @@ pub const newId = schema.newId;
 /// Largest `data` or `value` accepted in one event; the adapter moves
 /// bodies above its own, smaller threshold into blobs.
 pub const max_value_bytes: usize = log_mod.max_line_bytes - 64 * 1024;
+pub const v27 = @import("v27.zig");
 const max_text_bytes = 4096;
 
 /// An I/O failure with its OS cause when known, `Io` otherwise (D29).
