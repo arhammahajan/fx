@@ -6096,7 +6096,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           expect(replies.get(stage)).toMatchObject({ ok: true, result: marker + "_" + stage });
           expect(childRequests.get(stage)).toBe(1);
           // Every piece of work went to the same child, and this one finished.
-          expect(new Set(childLines(home, parentId).filter((line) => line.kind === "child_spawned").map((line) => line.child))).toEqual(new Set([childId]));
+          expect(new Set(childLines(home, parentId).filter((line) => (line.private?.[0]?.data?.record ?? line.legacy_kind ?? line.kind) === "child_spawned").map((line) => line.child))).toEqual(new Set([childId]));
           expect(work()).toMatchObject({ child: childId, outcome: "ok" });
         }
         expect(work().spawns).toBe(4);

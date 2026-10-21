@@ -232,8 +232,68 @@ pub fn encodeAlloc(alloc: std.mem.Allocator, fact: Fact) ![]u8 {
     return std.json.Stringify.valueAlloc(alloc, fact, .{ .emit_null_optional_fields = false });
 }
 
+/// Decodes one persisted fact. Returned slices and JSON values belong to
+/// `arena` and remain valid for its lifetime.
+pub fn decode(arena: std.mem.Allocator, raw: []const u8) !Fact {
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, raw, .{ .allocate = .alloc_always });
+    const object = switch (parsed) {
+        .object => |value| value,
+        else => return error.BadFact,
+    };
+    const type_value = object.get("type") orelse return error.BadFact;
+    const type_name = switch (type_value) {
+        .string => |value| value,
+        else => return error.BadFact,
+    };
+    const fact_type = catalog.FactType.parse(type_name) orelse return error.UnknownFact;
+    const data_value = object.get("data") orelse return error.BadFact;
+    const data: Data = switch (fact_type) {
+        .call_requested => .{ .call_requested = try std.json.parseFromValueLeaky(CallRequested, arena, data_value, .{}) },
+        .call_settled => .{ .call_settled = try std.json.parseFromValueLeaky(CallSettled, arena, data_value, .{}) },
+        .call_started => .{ .call_started = try std.json.parseFromValueLeaky(CallStarted, arena, data_value, .{}) },
+        .child_opened => .{ .child_opened = try std.json.parseFromValueLeaky(ChildOpened, arena, data_value, .{}) },
+        .content_completed => .{ .content_completed = try std.json.parseFromValueLeaky(ContentCompleted, arena, data_value, .{}) },
+        .context_settled => .{ .context_settled = try std.json.parseFromValueLeaky(ContextSettled, arena, data_value, .{}) },
+        .context_started => .{ .context_started = try std.json.parseFromValueLeaky(ContextStarted, arena, data_value, .{}) },
+        .delivery_admitted => .{ .delivery_admitted = try std.json.parseFromValueLeaky(DeliveryAdmitted, arena, data_value, .{}) },
+        .delivery_consumed => .{ .delivery_consumed = try std.json.parseFromValueLeaky(DeliveryConsumed, arena, data_value, .{}) },
+        .delivery_settled => .{ .delivery_settled = try std.json.parseFromValueLeaky(DeliverySettled, arena, data_value, .{}) },
+        .interaction_opened => .{ .interaction_opened = try std.json.parseFromValueLeaky(InteractionOpened, arena, data_value, .{}) },
+        .interaction_settled => .{ .interaction_settled = try std.json.parseFromValueLeaky(InteractionSettled, arena, data_value, .{}) },
+        .model_requested => .{ .model_requested = try std.json.parseFromValueLeaky(ModelRequested, arena, data_value, .{}) },
+        .model_retried => .{ .model_retried = try std.json.parseFromValueLeaky(ModelRetried, arena, data_value, .{}) },
+        .model_settled => .{ .model_settled = try std.json.parseFromValueLeaky(ModelSettled, arena, data_value, .{}) },
+        .model_started => .{ .model_started = try std.json.parseFromValueLeaky(ModelStarted, arena, data_value, .{}) },
+        .response_admitted => .{ .response_admitted = try std.json.parseFromValueLeaky(ResponseAdmitted, arena, data_value, .{}) },
+        .response_settled => .{ .response_settled = try std.json.parseFromValueLeaky(ResponseSettled, arena, data_value, .{}) },
+        .response_submitted => .{ .response_submitted = try std.json.parseFromValueLeaky(ResponseSubmitted, arena, data_value, .{}) },
+        .session_ended => .{ .session_ended = try std.json.parseFromValueLeaky(SessionEnded, arena, data_value, .{}) },
+        .session_started => .{ .session_started = try std.json.parseFromValueLeaky(SessionStarted, arena, data_value, .{}) },
+        .task_ended => .{ .task_ended = try std.json.parseFromValueLeaky(TaskEnded, arena, data_value, .{}) },
+        .task_started => .{ .task_started = try std.json.parseFromValueLeaky(TaskStarted, arena, data_value, .{}) },
+        .turn_paused => .{ .turn_paused = try std.json.parseFromValueLeaky(TurnPaused, arena, data_value, .{}) },
+        .turn_settled => .{ .turn_settled = try std.json.parseFromValueLeaky(TurnSettled, arena, data_value, .{}) },
+        .turn_started => .{ .turn_started = try std.json.parseFromValueLeaky(TurnStarted, arena, data_value, .{}) },
+        .usage_recorded => .{ .usage_recorded = try std.json.parseFromValueLeaky(UsageRecorded, arena, data_value, .{}) },
+    };
+    const scope = if (object.get("scope")) |value| try std.json.parseFromValueLeaky(Scope, arena, value, .{}) else null;
+    return .{ .scope = scope, .data = data };
+}
+
 test "fact builders use eve names and omit absent fields" {
     const encoded = try encodeAlloc(std.testing.allocator, modelSettled(.{ .runId = "run_0", .outcome = "completed" }));
     defer std.testing.allocator.free(encoded);
     try std.testing.expectEqualStrings("{\"type\":\"model.settled\",\"data\":{\"runId\":\"run_0\",\"outcome\":\"completed\"}}", encoded);
+}
+
+test "decoded facts do not borrow their input" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source = "{\"type\":\"model.started\",\"data\":{\"runId\":\"run_0\",\"modelId\":\"provider/model\",\"attempt\":0}}";
+    var raw: [source.len]u8 = undefined;
+    @memcpy(&raw, source);
+    const decoded = try decode(arena.allocator(), &raw);
+    @memset(&raw, 'x');
+    try std.testing.expectEqualStrings("run_0", decoded.data.model_started.runId);
+    try std.testing.expectEqualStrings("provider/model", decoded.data.model_started.modelId);
 }

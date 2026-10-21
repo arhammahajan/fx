@@ -39,7 +39,7 @@ import {
   type FooterBlock,
 } from "./tui-render-assertions";
 import { readTapeFrames, stdoutFrames } from "./render-lab/tape";
-import { logLines, onlySessionId, sessionDir } from "./saved-sessions";
+import { decodeLogLine, logLines, onlySessionId, sessionDir } from "./saved-sessions";
 
 const SKIP = !tmuxAvailable();
 const TIMEOUT = 30_000;
@@ -2177,7 +2177,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
               expect(pane).toContain(fullFooter);
               const text = readFileSync(eventsPath, "utf8");
               // A concurrent append may end mid-record; only parse terminated lines.
-              const records = text.split("\n").slice(0, -1).map(line => JSON.parse(line));
+              const records = text.split("\n").slice(0, -1).map(decodeLogLine);
               const assistantIndex = records.findIndex(record =>
                 record.kind === "item" && record.type === "assistant" && record.data?.text === laterResponse
               );
@@ -2250,7 +2250,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
           });
           check("persisted assistant paragraphs", () => {
             const responses = logLines(home, onlySessionId(home))
-              .filter((line: any) => line.kind === "item" && line.type === "assistant")
+              .filter((line: any) => (line.private?.[0]?.data?.record ?? line.legacy_kind ?? line.kind) === "item" && line.type === "assistant")
               .map((line: any) => line.data.text);
             expect(responses).toEqual([oldResponse, laterResponse]);
           });

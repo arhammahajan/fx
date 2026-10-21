@@ -29,7 +29,7 @@ import {
 } from "./conditional-guidance-oracle";
 import { expectPermissionModeContext } from "./permission-mode-context";
 import { paddedPng, pngPixelSize, solidPng } from "./fixtures/image-encoding";
-import { copyV1Fixture, logLines, savedSessionIds, savedText, sessionDir } from "./saved-sessions";
+import { copyV1Fixture, decodeLogLine, logLines, savedSessionIds, savedText, sessionDir } from "./saved-sessions";
 import {
   canonicalSubagentIdForStore,
   FAKE_GATEWAY_MODEL,
@@ -1555,7 +1555,7 @@ describe("acp: model-independent", () => {
 
         // The generated title is saved with the session.
         const titled = savedSessionIds(root.home).filter((id) => logLines(root.home, id)
-          .some((line: any) => line.kind === "set" && line.key === "title" && JSON.stringify(line.value).includes("ACP Generated Title")));
+          .some((line: any) => (line.private?.[0]?.data?.record ?? line.legacy_kind ?? line.kind) === "set" && line.key === "title" && JSON.stringify(line.value).includes("ACP Generated Title")));
         expect(titled).toHaveLength(1);
         expect(client.stderr).toBe("");
       } finally {
@@ -3719,11 +3719,11 @@ describe("acp: model-independent", () => {
         expect(client.stderr).toBe("");
         await client.close();
 
-        // v2 keeps the prompt as one setting in the session's own log
+        // v3 keeps the prompt as one private entry in the session's own log
         // (D46): nothing beside the log can go bad on its own.
-        const log = readFileSync(join(root.home, ".fx", "sessions", "v2", sessionId, "log.jsonl"), "utf8");
-        const prompts = log.trimEnd().split("\n").map((line) => JSON.parse(line))
-          .filter((line) => line.kind === "set" && line.key === "client_prompt");
+        const log = readFileSync(join(root.home, ".fx", "sessions", "v3", sessionId, "log.jsonl"), "utf8");
+        const prompts = log.trimEnd().split("\n").map(decodeLogLine)
+          .filter((line) => (line.private?.[0]?.data?.record ?? line.legacy_kind ?? line.kind) === "set" && line.key === "client_prompt");
         expect(prompts).toHaveLength(1);
         expect(JSON.stringify(prompts[0].value)).toContain(marker);
         expect(existsSync(join(root.home, ".fx", "session-files"))).toBe(false);
@@ -11103,7 +11103,7 @@ test.skipIf(!tmuxAvailable())(
       expect(ids).toHaveLength(1);
       const eventsPath = join(sessionDir(root.home, ids[0]!), "log.jsonl");
       const checkpointFrames = () => readFileSync(eventsPath, "utf8").trim().split("\n")
-        .map((line) => JSON.parse(line)).filter((line) => line.kind === "compacted");
+        .map(decodeLogLine).filter((line) => line.kind === "compacted");
       const beforeCompaction = readFileSync(eventsPath);
       expect(checkpointFrames()).toHaveLength(0);
       await tui.sendText("/compact");

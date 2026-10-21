@@ -1121,7 +1121,7 @@ describe("session recovery", () => {
         }
         // Only the new store's folder may appear beside the untouched session,
         // and it holds no session.
-        expect(readdirSync(join(fixture.home, ".fx", "sessions")).filter((name) => name !== "v2"))
+        expect(readdirSync(join(fixture.home, ".fx", "sessions")).filter((name) => name !== "v3"))
           .toEqual([id]);
         expect(existsSync(storeRoot(fixture.home)) ? savedSessionIds(fixture.home) : []).toEqual([]);
       } finally {

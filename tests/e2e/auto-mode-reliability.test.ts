@@ -243,7 +243,7 @@ describe("lean auto mode reliability", () => {
       expect(readFileSync(plan, "utf8")).toBe("48 runs\n");
       const sessionId = JSON.parse(result.stdout).session_id;
       const held = (logLines(root.home, sessionId) as any[])
-        .find((line) => line.kind === "item" && line.type === "tool_result" && line.data?.call_id === "edit_plan").data;
+        .find((line) => (line.private?.[0]?.data?.record ?? line.legacy_kind ?? line.kind) === "item" && line.type === "tool_result" && line.data?.call_id === "edit_plan").data;
       expect(held.review_feedback).toBe(true);
       const resumed = await runFx(
         ["ask", "--auto", "--quiet", "--json", "--resume-id", sessionId, "Summarize the previous result without tools."],

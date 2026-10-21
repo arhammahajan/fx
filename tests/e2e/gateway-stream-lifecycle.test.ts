@@ -31,7 +31,7 @@ import {
   type GatewayRequest,
 } from "./conditional-guidance-oracle";
 import { expectPermissionModeContext } from "./permission-mode-context";
-import { childLines, childWork, compactionRecordPath, copyV1Fixture, logLines, onlySessionId, rootSessionIds, savedSession, savedSessionIds, savedToolCallIds, savedText, savedToolResults, sessionDir } from "./saved-sessions";
+import { childLines, childWork, compactionRecordPath, copyV1Fixture, decodeLogLine, logLines, onlySessionId, rootSessionIds, savedSession, savedSessionIds, savedToolCallIds, savedText, savedToolResults, sessionDir } from "./saved-sessions";
 import { stdoutFrames } from "./render-lab/tape";
 import {
   fakeGatewayFinalText,
@@ -174,7 +174,7 @@ for (const action of ["run", "message"] as const) {
       const saved = await savedSession(root.home, parent());
       expect(JSON.stringify(saved.history).split("STEERING_FIRST").length - 1).toBe(1);
       const results = logLines(root.home, parent()).filter((line: any) =>
-        line.kind === "item" && line.type === "tool_result" && JSON.stringify(line).includes("steering-delegation"));
+        (line.private?.[0]?.data?.record ?? line.legacy_kind ?? line.kind) === "item" && line.type === "tool_result" && JSON.stringify(line).includes("steering-delegation"));
       expect(results).toHaveLength(1);
       const trace = readFileSync(join(root.root, "trace.log"), "utf8");
       expect(trace).toContain("event=steering_wait_yielded ");
@@ -203,7 +203,7 @@ function compactionLogPath(root: FixtureRoot): string {
 }
 
 function compactionCount(log: string): number {
-  return log.split("\n").slice(0, -1).filter((line) => JSON.parse(line).kind === "compacted").length;
+  return log.split("\n").slice(0, -1).filter((line) => decodeLogLine(line).kind === "compacted").length;
 }
 
 // Automatic compaction first asks right after the conversation, which keeps
@@ -3871,7 +3871,7 @@ describe("gateway stream lifecycle", () => {
       const logAfterResume = readFileSync(logPath);
       expect(logAfterResume.subarray(0, logBeforeResume.length)).toEqual(logBeforeResume);
       const appendedKinds = logAfterResume.subarray(logBeforeResume.length).toString("utf8")
-        .trim().split("\n").map((line) => JSON.parse(line).kind);
+        .trim().split("\n").map((line) => decodeLogLine(line).kind);
       expect(appendedKinds).toContain("turn_committed");
     } finally {
       gateway.stop();
@@ -6441,7 +6441,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         );
         expect(beforeResume.code).toBe(0);
         // Nothing outside the store.
-        expect(readdirSync(join(root.home, ".fx", "sessions"))).toEqual(["v2"]);
+        expect(readdirSync(join(root.home, ".fx", "sessions"))).toEqual(["v3"]);
         const canonical = JSON.parse(beforeResume.stdout) as {
           history_len: number;
           history: Array<{
@@ -8238,7 +8238,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(failedWork?.outcome).toBe("failed");
       expect(failedCause).toContain(`HTTP ${status}`);
       // One child, whose every piece of work the parent's log records.
-      const spawned = childLines(root.home, parentId).filter((line) => line.kind === "child_spawned");
+      const spawned = childLines(root.home, parentId).filter((line) => (line.private?.[0]?.data?.record ?? line.legacy_kind ?? line.kind) === "child_spawned");
       expect(new Set(spawned.map((line) => line.child))).toEqual(new Set([failedWork!.child]));
       expect(childRequests).toBe(withEffect ? 3 : 1);
       expect(gateway.requestCount()).toBe(withEffect ? 6 : 3);
@@ -8547,7 +8547,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const firstJson = parseAskJson(first.stdout);
       expect(firstJson.output).toContain("PARENT_FIRST_COMPLETE");
       // One child, named by the parent's log.
-      const children = new Set(childLines(root.home, firstJson.session_id).filter((line) => line.kind === "child_spawned").map((line) => line.child));
+      const children = new Set(childLines(root.home, firstJson.session_id).filter((line) => (line.private?.[0]?.data?.record ?? line.legacy_kind ?? line.kind) === "child_spawned").map((line) => line.child));
       expect(children.size).toBe(1);
       const internalChildId = [...children][0]!;
 
@@ -8705,7 +8705,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const parentId = roots[0]!;
       const childId = sessionIds.find((id) => id !== parentId);
       expect(childId).toBeDefined();
-      expect(childLines(root.home, parentId).filter((line) => line.kind === "child_spawned").map((line) => line.child)).toEqual([childId]);
+      expect(childLines(root.home, parentId).filter((line) => (line.private?.[0]?.data?.record ?? line.legacy_kind ?? line.kind) === "child_spawned").map((line) => line.child)).toEqual([childId]);
       expect(latestId).toBe(parentId!);
       const listed = await runFx(["sessions", "--json"], {
         cwd: root.workspace,

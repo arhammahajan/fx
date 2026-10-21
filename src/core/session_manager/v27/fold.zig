@@ -36,7 +36,7 @@ pub fn foldFact(alloc: std.mem.Allocator, view: *tables.SessionView, fact: facts
             if (data.turnId) |id| row.turn_id = id;
         },
         .turn_started => |data| {
-            try view.turns.put(alloc, data.turnId, .{ .turn_id = data.turnId, .status = "running", .follows = switch (data.follows) {
+            try view.turns.put(alloc, data.turnId, .{ .turn_id = data.turnId, .status = "running", .delivery_id = data.cause.deliveryId, .follows = switch (data.follows) {
                 .string => |value| value,
                 else => null,
             } });

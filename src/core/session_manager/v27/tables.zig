@@ -9,7 +9,7 @@ pub const SessionRow = struct {
 };
 
 pub const DeliveryRow = struct { delivery_id: []const u8, status: []const u8, turn_id: ?[]const u8 = null, outcome: ?[]const u8 = null };
-pub const TurnRow = struct { turn_id: []const u8, status: []const u8, follows: ?[]const u8 = null, outcome: ?[]const u8 = null, reply: []const []const u8 = &.{}, runs: u64 = 0 };
+pub const TurnRow = struct { turn_id: []const u8, status: []const u8, delivery_id: ?[]const u8 = null, follows: ?[]const u8 = null, outcome: ?[]const u8 = null, reply: []const []const u8 = &.{}, runs: u64 = 0 };
 pub const RunRow = struct { run_id: []const u8, owner: facts.Owner, status: []const u8, model_id: ?[]const u8 = null, attempt: ?u32 = null, outcome: ?[]const u8 = null, finish_reason: ?[]const u8 = null, step: u64 = 0 };
 pub const PartRow = struct { part_id: []const u8, run_id: []const u8, kind: []const u8, phase: []const u8, value: ?std.json.Value = null, interrupted: bool = false };
 pub const CallRow = struct { call_id: []const u8, owner: facts.Owner, capability: facts.Capability, status: []const u8, task_id: ?[]const u8 = null, outcome: ?[]const u8 = null, output: ?std.json.Value = null, label: ?[]const u8 = null, reason: ?[]const u8 = null };

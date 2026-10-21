@@ -14,7 +14,7 @@ function fixture(label: string) {
   const root = mkdtempSync(join(artifacts, label + "-"));
   const home = join(root, "home"), workspace = join(root, "workspace"), trace = join(root, "wiring.log");
   mkdirSync(home, { mode: 0o700 }); mkdirSync(workspace, { mode: 0o700 });
-  const sessionsRoot = join(home, ".fx/sessions/v2");
+  const sessionsRoot = join(home, ".fx/sessions/v3");
   const outcomes: Outcome[] = [];
   const active = new Set<ChildProcess>();
   const environment = (gateway: any) => ({

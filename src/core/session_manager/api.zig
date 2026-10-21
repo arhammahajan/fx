@@ -55,6 +55,7 @@ pub const BlobHash = [schema.blob_hash_len]u8;
 pub const max_blob_bytes = session_mod.max_blob_bytes;
 pub const new_id_len = schema.new_id_len;
 pub const newId = schema.newId;
+pub const rawElements = schema.rawElements;
 /// Largest `data` or `value` accepted in one event; the adapter moves
 /// bodies above its own, smaller threshold into blobs.
 pub const max_value_bytes: usize = log_mod.max_line_bytes - 64 * 1024;
@@ -78,7 +79,7 @@ pub const RebuildError = error{ Busy, OutOfMemory } || storage.IoFault;
 pub const Backend = enum { posix };
 
 pub const InitOptions = struct {
-    /// The sessions root, `~/.fx/sessions/v2` in fx (D19); created on first
+    /// The sessions root, `~/.fx/sessions/v3` in fx (D19); created on first
     /// use, with any missing parent folders, all `0700`.
     root: []const u8,
     backend: Backend = .posix,
@@ -714,6 +715,12 @@ fn checkEvents(gpa: std.mem.Allocator, events: []const Event, import: bool) Appe
             try checkWorkId(c.work_id);
             if (c.outcome == .lost and !import) return error.InvalidArgument;
             if (c.data) |data| try checkChildData(gpa, data);
+        },
+        .v27_commit => |facts| {
+            try checkJson(gpa, facts);
+            const parsed = std.json.parseFromSlice(std.json.Value, gpa, facts, .{}) catch return error.InvalidArgument;
+            defer parsed.deinit();
+            if (parsed.value != .array or parsed.value.array.items.len == 0) return error.InvalidArgument;
         },
     };
 }
@@ -1727,7 +1734,7 @@ const api_tests = struct {
         var path: [300]u8 = undefined;
         const bytes = try dir.readFileAlloc(io, try std.mem.print(&path, "{s}/log.jsonl", .{id}), gpa, .limited(1 << 20));
         defer gpa.free(bytes);
-        try testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\"kind\":\"item\",\"turn\":1,\"type\":\"steering\""));
+        try testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\"record\":\"item\",\"body\":{\"turn\":1,\"type\":\"steering\""));
     }
 
     test "the conversation language is listed, follows changes, survives rebuild and resume" {

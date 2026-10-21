@@ -26,7 +26,7 @@ function fixture(label: string) {
   const home = join(root, "home"), workspace = join(root, "workspace"), trace = join(root, "wiring.log");
   mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
   mkdirSync(workspace, { mode: 0o700 });
-  const sessionsRoot = join(home, ".fx/sessions/v2");
+  const sessionsRoot = join(home, ".fx/sessions/v3");
   let reply: Reply = () => fakeGatewayFinalText("UNSCRIPTED");
   const gateway = startDynamicFakeGateway(body => reply(body));
   const processes: Process[] = [];

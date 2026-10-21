@@ -224,7 +224,7 @@ pub const Line = struct {
 /// before `fork_seq` belong to the source and are skipped.
 pub fn apply(gpa: std.mem.Allocator, state: *State, fork_seq: u64, line: Line) error{OutOfMemory}!void {
     switch (line.body) {
-        .session_created, .item, .snapshot, .closed => {},
+        .session_created, .item, .v27_commit, .snapshot, .closed => {},
         .turn_started => |t| {
             state.open_turn = t.turn;
             state.last_turn = @max(state.last_turn, t.turn);
@@ -269,6 +269,7 @@ pub const Event = union(enum) {
     set: schema.Body.Setting,
     child_spawned: schema.Body.WorkItem,
     child_finished: schema.Body.Finished,
+    v27_commit: []const u8,
 };
 
 /// One completed piece of a turn: fx's data, and the blobs it refers to.
@@ -325,6 +326,7 @@ pub fn plan(state: *const State, events: []const Event, out: []schema.Body) Tran
                 if (!std.mem.eql(u8, open, c.work_id)) return error.InvalidTransition;
                 break :blk .{ .child_finished = c };
             },
+            .v27_commit => |facts| .{ .v27_commit = .{ .facts = facts } },
         };
     }
 }
@@ -515,7 +517,7 @@ fn specValid(open: bool, event: Event) ?bool {
     return switch (event) {
         .turn_started => !open,
         .item, .turn_committed, .turn_interrupted => open,
-        .compacted, .set => true,
+        .compacted, .set, .v27_commit => true,
         .child_spawned, .child_finished => null, // not in TurnLifecycle
     };
 }

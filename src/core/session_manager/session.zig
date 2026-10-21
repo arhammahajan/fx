@@ -399,7 +399,7 @@ pub const Session = struct {
     /// Before the first turn, a batch without `turn_started` may only hold
     /// settings; they wait in memory, already framed (seq 2 onward).
     fn hold(session: *Session, bodies: []const schema.Body, ts: u64) AppendError!void {
-        for (bodies) |body| if (body != .set) return error.InvalidTransition;
+        for (bodies) |body| if (body != .set and body != .v27_commit) return error.InvalidTransition;
         const gpa = session.env.gpa;
         const start = session.held.items.len;
         errdefer session.held.shrinkRetainingCapacity(start);
@@ -802,7 +802,7 @@ pub const Session = struct {
         const gpa = session.env.gpa;
         var fields: std.ArrayList(u8) = .empty;
         defer fields.deinit(gpa);
-        try schema.appendBody(gpa, &fields, body);
+        try schema.appendStoredBody(gpa, &fields, body);
         log_mod.appendLine(gpa, out, seq, ts, std.meta.activeTag(body), fields.items) catch |err| switch (err) {
             error.TooLarge => return error.TooLarge,
             error.OutOfMemory => return error.OutOfMemory,
@@ -1081,6 +1081,10 @@ fn hasTurnStart(bodies: []const schema.Body) bool {
 fn needsSync(bodies: []const schema.Body) bool {
     for (bodies) |body| switch (body) {
         .turn_committed, .turn_interrupted, .child_spawned, .child_finished => return true,
+        // A running call may have side effects before its result is stored.
+        // Make its start durable so resume reports that it may have run.
+        .item => |piece| if (std.mem.eql(u8, piece.type, "tool_running")) return true,
+        .v27_commit => |commit| if (std.mem.find(u8, commit.facts, "\"type\":\"call.started\"") != null) return true,
         // Usage is durable before fx clears its usage-recovery marker
         // (`tests/tla/session_manager/Wiring.tla` UsageNeverSilent).
         // fx removes the side folder only once the move is durable (D47).
@@ -1210,6 +1214,12 @@ fn openParts(env: *const Env, options: ResumeOptions) OpenError!Parts {
     errdefer s.closeFile(lock);
     if (!env.isPlanted(.skip_flock)) try acquireLock(env, lock, options.lock_wait_ms orelse env.options.lock_wait_ms);
 
+    migrateLegacyLog(gpa, s, dir) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.Corrupt => error.Corrupt,
+        else => |io_err| storage.ioFault(io_err),
+    };
+
     var opened = Log.open(gpa, s, dir, "log.jsonl", .read_write, .{}) catch |err| return switch (err) {
         error.NotFound => error.Corrupt,
         error.OutOfMemory => error.OutOfMemory,
@@ -1257,6 +1267,62 @@ fn openParts(env: *const Env, options: ResumeOptions) OpenError!Parts {
     return .{ .dir = dir, .lock = lock, .log = opened.log, .loaded = loaded };
 }
 
+/// Reframes a pre-v3 log under the writer lock, then atomically publishes it.
+/// The source remains authoritative until the replacement is synced and
+/// renamed, so a failed migration leaves the old session resumable.
+fn migrateLegacyLog(gpa: std.mem.Allocator, s: storage.Storage, dir: storage.Dir) (storage.Error || error{ OutOfMemory, Corrupt })!void {
+    const source = try s.openFile(dir, "log.jsonl", .read_only);
+    var source_open = true;
+    defer if (source_open) s.closeFile(source);
+    const len = try s.length(source);
+    var reader = log_mod.ForwardReader.init(gpa, s, source, 0, len, 1);
+    defer reader.deinit();
+    const first = (try reader.next()) orelse return error.Corrupt;
+    if (first.header.v >= 3) return;
+
+    s.deleteFile(dir, "log.v3.tmp") catch |err| switch (err) {
+        error.NotFound => {},
+        else => return err,
+    };
+    const target = try s.createFile(dir, "log.v3.tmp");
+    var target_open = true;
+    defer if (target_open) s.closeFile(target);
+    errdefer s.deleteFile(dir, "log.v3.tmp") catch {};
+
+    reader.deinit();
+    reader = log_mod.ForwardReader.init(gpa, s, source, 0, len, 1);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var encoded: std.ArrayList(u8) = .empty;
+    defer encoded.deinit(gpa);
+    var offset: u64 = 0;
+    while (try reader.next()) |line| {
+        const kind = line.header.kind orelse return error.Corrupt;
+        const body = schema.parseLineBody(arena.allocator(), kind, line.bytes) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.BadBody => return error.Corrupt,
+        };
+        var fields: std.ArrayList(u8) = .empty;
+        defer fields.deinit(gpa);
+        try schema.appendStoredBody(gpa, &fields, body);
+        log_mod.appendLine(gpa, &encoded, line.header.seq, line.header.ts_ms, kind, fields.items) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.TooLarge => return error.Corrupt,
+        };
+        try s.writeAt(target, encoded.items, offset);
+        offset += encoded.items.len;
+        encoded.clearRetainingCapacity();
+        _ = arena.reset(.retain_capacity);
+    }
+    try s.sync(target);
+    s.closeFile(target);
+    target_open = false;
+    s.closeFile(source);
+    source_open = false;
+    try s.rename(dir, "log.v3.tmp", dir, "log.jsonl");
+    try s.syncDir(dir);
+}
+
 fn acquireLock(env: *const Env, lock: storage.File, wait_ms: u64) OpenError!void {
     const io = env.s.io;
     const step_ms: u64 = 10;
@@ -1296,7 +1362,7 @@ fn loadFolded(env: *const Env, arena_state: *std.heap.ArenaAllocator, file: stor
         return mapRead(err);
     }) orelse return error.Corrupt;
     if (line1.header.kind != .session_created) return error.Corrupt;
-    const created = schema.parseBody(arena, .session_created, line1.body()) catch return error.Corrupt;
+    const created = schema.parseLineBody(arena, .session_created, line1.bytes) catch return error.Corrupt;
     var identity = try Identity.fromCreated(gpa, created.session_created);
     errdefer identity.deinit(gpa);
     const line1_end = line1.offset + line1.bytes.len;
@@ -1312,8 +1378,13 @@ fn loadFolded(env: *const Env, arena_state: *std.heap.ArenaAllocator, file: stor
         }) |line| {
             if (line.offset < line1_end) break;
             if (line.header.kind != .snapshot) continue;
-            const body = schema.parseBody(arena, .snapshot, line.body()) catch return error.Corrupt;
-            snapshot = .{ .seq = line.header.seq, .end = line.offset + line.bytes.len, .state = body.snapshot.state, .ts_ms = line.header.ts_ms };
+            const body = schema.parseLineBody(arena, .snapshot, line.bytes) catch return error.Corrupt;
+            snapshot = .{
+                .seq = line.header.seq,
+                .end = line.offset + line.bytes.len,
+                .state = try arena.dupe(u8, body.snapshot.state),
+                .ts_ms = line.header.ts_ms,
+            };
             break;
         }
     }
@@ -1352,7 +1423,7 @@ fn loadFolded(env: *const Env, arena_state: *std.heap.ArenaAllocator, file: stor
             state.clean_exit = false;
             continue;
         };
-        const body = schema.parseBody(line_arena.allocator(), kind, line.body()) catch return error.Corrupt;
+        const body = schema.parseLineBody(line_arena.allocator(), kind, line.bytes) catch return error.Corrupt;
         try fold.apply(gpa, &state, fork_seq, .{ .seq = line.header.seq, .offset = line.offset, .body = body });
     }
     return .{
@@ -1608,7 +1679,14 @@ fn copyEntry(arena: std.mem.Allocator, line: log_mod.Line) error{OutOfMemory}!En
     @memcpy(bytes, line.bytes);
     // The reader checked the line; only the header's name moves.
     var header = line.header;
-    header.kind_name = bytes[@intFromPtr(header.kind_name.ptr) - @intFromPtr(line.bytes.ptr) ..][0..header.kind_name.len];
+    const name_at = @intFromPtr(header.kind_name.ptr);
+    const line_at = @intFromPtr(line.bytes.ptr);
+    header.kind_name = if (name_at >= line_at and name_at + header.kind_name.len <= line_at + line.bytes.len)
+        bytes[name_at - line_at ..][0..header.kind_name.len]
+    else if (header.kind) |kind|
+        @tagName(kind)
+    else
+        header.kind_name;
     const kind = header.kind;
     const body: ?schema.Body = if (kind) |k|
         schema.parseLineBody(arena, k, bytes) catch |err| switch (err) {
@@ -1785,7 +1863,7 @@ fn findForkPoint(env: *const Env, source: []const u8, src: storage.File, end: u6
             .turn_started => turn_seen = true,
             .item, .set => {
                 _ = arena.reset(.retain_capacity);
-                const body = schema.parseBody(arena.allocator(), kind, line.body()) catch return error.Corrupt;
+                const body = schema.parseLineBody(arena.allocator(), kind, line.bytes) catch return error.Corrupt;
                 var whole = true;
                 for (body.blobRefs()) |hash| {
                     if (!try blobIsWhole(env, source, hash)) whole = false;
@@ -1794,7 +1872,7 @@ fn findForkPoint(env: *const Env, source: []const u8, src: storage.File, end: u6
             },
             .turn_committed, .turn_interrupted => {
                 _ = arena.reset(.retain_capacity);
-                const body = schema.parseBody(arena.allocator(), kind, line.body()) catch return error.Corrupt;
+                const body = schema.parseLineBody(arena.allocator(), kind, line.bytes) catch return error.Corrupt;
                 const turn = switch (body) {
                     .turn_committed => |t| t.turn,
                     .turn_interrupted => |t| t.turn,
@@ -1840,7 +1918,7 @@ fn copyFolded(session: *Session, copied: []const u8, fork_seq: u64) AppendError!
         const line = session.batch.items[start..];
         const header = log_mod.checkLine(line) catch |io_err| return storage.ioFault(io_err);
         if (header.kind) |kind| {
-            const body = schema.parseBody(arena.allocator(), kind, log_mod.lineBody(line, header)) catch |io_err| return storage.ioFault(io_err);
+            const body = schema.parseLineBody(arena.allocator(), kind, line) catch |io_err| return storage.ioFault(io_err);
             try fold.apply(gpa, &session.state, fork_seq, .{ .seq = header.seq, .offset = start, .body = body });
             if (kind == .snapshot) session.snapshot_base = session.batch.items.len;
         } else {
@@ -1955,7 +2033,7 @@ fn collectChildren(env: *const Env, dir: storage.Dir, out: *std.ArrayList([]u8))
         }) orelse break;
         if (line.header.kind != .child_spawned) continue;
         _ = arena.reset(.retain_capacity);
-        const body = schema.parseBody(arena.allocator(), .child_spawned, line.body()) catch continue;
+        const body = schema.parseLineBody(arena.allocator(), .child_spawned, line.bytes) catch continue;
         const child = body.child_spawned.child;
         for (out.items) |known| {
             if (std.mem.eql(u8, known, child)) break;
@@ -2009,7 +2087,7 @@ pub fn verifySession(env: *const Env, id_: []const u8) OpenError!Verified {
         result.lines += 1;
         _ = arena.reset(.retain_capacity);
         const kind = line.header.kind orelse continue;
-        const body = schema.parseBody(arena.allocator(), kind, line.body()) catch {
+        const body = schema.parseLineBody(arena.allocator(), kind, line.bytes) catch {
             result.damaged_at = line.offset;
             break;
         };
@@ -2906,7 +2984,7 @@ const session_model_tests = struct {
                 continue;
             };
             const body: ?schema.Body = if (header.kind) |k|
-                schema.parseBody(arena, k, log_mod.lineBody(line, header)) catch null
+                schema.parseLineBody(arena, k, line) catch null
             else
                 null;
             try out.append(arena, .{ .seq = header.seq, .kind = header.kind, .body = body });

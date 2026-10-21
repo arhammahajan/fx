@@ -1,8 +1,9 @@
 //! The line envelope owned by the manager.
 //!
 //! Every line starts with the same header, in this exact order:
-//!   {"v":1,"seq":7,"ts":1727400000000,"kind":"turn_committed"
-//! Kind fields follow, then `,"crc":"........"}` and a newline (log.zig).
+//!   {"v":3,"seq":7,"ts":1727400000000,"kind":"commit","pos":6
+//! Facts and private entries follow, then `,"crc":"........"}` and a newline
+//! (`log.zig`). Snapshots carry `kind: "snapshot"`, `pos`, `fold`, and `state`.
 //! Because the manager writes the header in one canonical form, it is parsed
 //! positionally: no JSON parser runs on the hot path.
 
@@ -10,10 +11,10 @@ const std = @import("std");
 
 /// The format version this manager writes and fully understands. A line
 /// with a newer `v` makes the session read-only.
-pub const version: u32 = 1;
+pub const version: u32 = 3;
 
-/// Every kind the manager knows. The manager owns this set; fx content
-/// lives inside `data` and `value` fields and is never interpreted here.
+/// Internal bodies decoded from durable lines. Compatibility transitions live
+/// in private entries, while public behavior lives in facts.
 pub const Kind = enum {
     session_created,
     turn_started,
@@ -24,6 +25,7 @@ pub const Kind = enum {
     set,
     child_spawned,
     child_finished,
+    v27_commit,
     snapshot,
     closed,
 };
@@ -38,6 +40,8 @@ pub const Header = struct {
     kind: ?Kind,
     /// Bytes of the line taken by the header, through the kind's closing quote.
     len: usize,
+    /// v27 position carried by v3. Legacy lines use `seq - 1`.
+    pos: u64,
 };
 
 pub const HeaderError = error{BadHeader};
@@ -52,9 +56,11 @@ pub fn appendHeader(
     ts_ms: u64,
     kind: Kind,
 ) error{OutOfMemory}!void {
-    try out.print(gpa, "{{\"v\":{d},\"seq\":{d},\"ts\":{d},\"kind\":\"{s}\"", .{
-        version, seq, ts_ms, @tagName(kind),
-    });
+    if (kind == .snapshot) {
+        try out.print(gpa, "{{\"v\":3,\"seq\":{d},\"ts\":{d},\"kind\":\"snapshot\",\"pos\":{d},\"fold\":1", .{ seq, ts_ms, seq - 1 });
+    } else {
+        try out.print(gpa, "{{\"v\":3,\"seq\":{d},\"ts\":{d},\"kind\":\"commit\",\"pos\":{d}", .{ seq, ts_ms, seq - 1 });
+    }
 }
 
 /// Parses the header at the start of `line`. Strict: the exact field order,
@@ -75,6 +81,24 @@ pub fn parseHeader(line: []const u8) HeaderError!Header {
     try p.literal("\"");
     if (v == 0 or seq == 0) return error.BadHeader;
     if (name.len == 0 or name.len > max_kind_name_bytes) return error.BadHeader;
+    if (v >= 3) {
+        try p.literal(",\"pos\":");
+        const pos = try p.uint(u64);
+        if (std.mem.eql(u8, name, "snapshot")) {
+            try p.literal(",\"fold\":1");
+            return .{ .v = v, .seq = seq, .ts_ms = ts_ms, .kind_name = "snapshot", .kind = .snapshot, .len = p.at, .pos = pos };
+        }
+        if (!std.mem.eql(u8, name, "commit")) return error.BadHeader;
+        const private_at = std.mem.findPos(u8, line, p.at, ",\"private\":[") orelse return error.BadHeader;
+        const record_prefix = "\"record\":\"";
+        const record_at = std.mem.findPos(u8, line, private_at, record_prefix) orelse return error.BadHeader;
+        const record_start = record_at + record_prefix.len;
+        var record_end = record_start;
+        while (record_end < line.len and isKindChar(line[record_end])) record_end += 1;
+        if (record_end == record_start or record_end >= line.len or line[record_end] != '"') return error.BadHeader;
+        const record = line[record_start..record_end];
+        return .{ .v = v, .seq = seq, .ts_ms = ts_ms, .kind_name = record, .kind = std.meta.stringToEnum(Kind, record), .len = p.at, .pos = pos };
+    }
     return .{
         .v = v,
         .seq = seq,
@@ -82,11 +106,12 @@ pub fn parseHeader(line: []const u8) HeaderError!Header {
         .kind_name = name,
         .kind = std.meta.stringToEnum(Kind, name),
         .len = p.at,
+        .pos = seq - 1,
     };
 }
 
 fn isKindChar(c: u8) bool {
-    return (c >= 'a' and c <= 'z') or c == '_';
+    return (c >= 'a' and c <= 'z') or (c >= '0' and c <= '9') or c == '_';
 }
 
 // ---------------------------------------------------------------------------
@@ -124,6 +149,7 @@ pub const Body = union(Kind) {
     set: Setting,
     child_spawned: WorkItem,
     child_finished: Finished,
+    v27_commit: V27Commit,
     snapshot: Snapshot,
     closed: void,
 
@@ -166,6 +192,7 @@ pub const Body = union(Kind) {
     /// `data` is fx's raw JSON about the child or the work (D22).
     pub const WorkItem = struct { child: []const u8, work_id: []const u8, data: ?[]const u8 = null };
     pub const Finished = struct { child: []const u8, work_id: []const u8, outcome: Outcome, data: ?[]const u8 = null };
+    pub const V27Commit = struct { facts: []const u8 };
     pub const Snapshot = struct { covers_seq: u64, state: []const u8, compaction_offset: ?u64 };
 };
 
@@ -218,6 +245,7 @@ pub fn appendBody(gpa: std.mem.Allocator, out: *std.ArrayList(u8), body: Body) e
             try w.string("outcome", @tagName(c.outcome));
             if (c.data) |data| try w.raw("data", data);
         },
+        .v27_commit => |commit| try w.raw("facts", commit.facts),
         .snapshot => |s| {
             try w.number("covers_seq", s.covers_seq);
             try w.raw("state", s.state);
@@ -225,6 +253,45 @@ pub fn appendBody(gpa: std.mem.Allocator, out: *std.ArrayList(u8), body: Body) e
         },
         .closed => {},
     }
+}
+
+/// Appends the durable v3 fields for an internal transition. Public history
+/// is facts only; compatibility state is confined to a private entry.
+pub fn appendStoredBody(gpa: std.mem.Allocator, out: *std.ArrayList(u8), body: Body) error{OutOfMemory}!void {
+    if (body == .snapshot) return appendBody(gpa, out, body);
+    var legacy: std.ArrayList(u8) = .empty;
+    defer legacy.deinit(gpa);
+    try appendBody(gpa, &legacy, body);
+    try out.appendSlice(gpa, ",\"facts\":");
+    switch (body) {
+        .v27_commit => |commit| try out.appendSlice(gpa, commit.facts),
+        .session_created => try out.appendSlice(gpa, "[{\"type\":\"session.started\",\"data\":{}}]"),
+        else => try out.print(gpa, "[{{\"type\":\"fx.{s}\",\"data\":{{}}}}]", .{@tagName(std.meta.activeTag(body))}),
+    }
+    try out.appendSlice(gpa, ",\"private\":[{");
+    const private_kind: []const u8 = switch (body) {
+        .set => |setting| switch (setting.key) {
+            .prefs => "prefs",
+            .title => "title",
+            .permissions => "permissions",
+            .workspace => "workspace",
+            .language => "language",
+            .client_prompt => "client_prompt",
+            .tool_identities => "tool_identities",
+            .moved_files => "moved_files",
+            .compaction_records => "compaction_records",
+            .usage, .v1_source => "model_context",
+        },
+        .compacted => "compaction_records",
+        else => "model_context",
+    };
+    try out.appendSlice(gpa, "\"kind\":");
+    try appendJsonString(gpa, out, private_kind);
+    try out.appendSlice(gpa, ",\"data\":{\"record\":");
+    try appendJsonString(gpa, out, @tagName(std.meta.activeTag(body)));
+    try out.appendSlice(gpa, ",\"body\":{");
+    if (body != .v27_commit and legacy.items.len > 0) try out.appendSlice(gpa, legacy.items[1..]);
+    try out.appendSlice(gpa, "}}}]");
 }
 
 pub const BodyError = error{ BadBody, OutOfMemory };
@@ -240,7 +307,17 @@ pub fn parseBody(arena: std.mem.Allocator, kind: Kind, fields: []const u8) BodyE
 /// than copied; the header and `crc` fields are never body field names.
 pub fn parseLineBody(arena: std.mem.Allocator, kind: Kind, line: []const u8) BodyError!Body {
     if (line.len == 0 or line[line.len - 1] != '\n') return error.BadBody;
-    return bodyOf(kind, try Fields.parseObject(arena, line[0 .. line.len - 1]));
+    const outer = try Fields.parseObject(arena, line[0 .. line.len - 1]);
+    if (kind == .snapshot) return bodyOf(kind, outer);
+    if (kind == .v27_commit) return .{ .v27_commit = .{ .facts = try outer.rawReq("facts") } };
+    if (outer.raw("private")) |private| {
+        const entries = try rawElements(arena, private);
+        if (entries.len == 0) return error.BadBody;
+        const entry = try Fields.parseObject(arena, entries[0]);
+        const data = try Fields.parseObject(arena, try entry.rawReq("data"));
+        return bodyOf(kind, try Fields.parseObject(arena, try data.rawReq("body")));
+    }
+    return bodyOf(kind, outer);
 }
 
 fn bodyOf(kind: Kind, f: Fields) BodyError!Body {
@@ -282,6 +359,7 @@ fn bodyOf(kind: Kind, f: Fields) BodyError!Body {
             .outcome = try f.req(Outcome, "outcome"),
             .data = f.raw("data"),
         } },
+        .v27_commit => .{ .v27_commit = .{ .facts = try f.rawReq("facts") } },
         .snapshot => .{ .snapshot = .{
             .covers_seq = try f.req(u64, "covers_seq"),
             .state = try f.rawReq("state"),
@@ -652,17 +730,34 @@ test "header round trip" {
     defer out.deinit(testing.allocator);
     try appendHeader(testing.allocator, &out, 7, 1727400000000, .turn_committed);
     try testing.expectEqualStrings(
-        "{\"v\":1,\"seq\":7,\"ts\":1727400000000,\"kind\":\"turn_committed\"",
+        "{\"v\":3,\"seq\":7,\"ts\":1727400000000,\"kind\":\"commit\",\"pos\":6",
         out.items,
     );
-    try out.appendSlice(testing.allocator, ",\"turn\":1");
+    try appendStoredBody(testing.allocator, &out, .{ .turn_committed = .{ .turn = 1 } });
     const h = try parseHeader(out.items);
-    try testing.expectEqual(@as(u32, 1), h.v);
+    try testing.expectEqual(@as(u32, 3), h.v);
     try testing.expectEqual(@as(u64, 7), h.seq);
     try testing.expectEqual(@as(u64, 1727400000000), h.ts_ms);
     try testing.expectEqual(Kind.turn_committed, h.kind.?);
     try testing.expectEqualStrings("turn_committed", h.kind_name);
-    try testing.expectEqualStrings(",\"turn\":1", out.items[h.len..]);
+    try testing.expect(std.mem.find(u8, out.items[h.len..], "\"record\":\"turn_committed\"") != null);
+}
+
+test "v27 commits store public facts outside their private compatibility record" {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try appendHeader(testing.allocator, &out, 2, 1727400000001, .v27_commit);
+    try appendStoredBody(testing.allocator, &out, .{ .v27_commit = .{ .facts = "[{\"type\":\"turn.started\",\"data\":{}}]" } });
+    try testing.expectEqualStrings(
+        "{\"v\":3,\"seq\":2,\"ts\":1727400000001,\"kind\":\"commit\",\"pos\":1,\"facts\":[{\"type\":\"turn.started\",\"data\":{}}],\"private\":[{\"kind\":\"model_context\",\"data\":{\"record\":\"v27_commit\",\"body\":{}}}]",
+        out.items,
+    );
+    try testing.expectEqual(Kind.v27_commit, (try parseHeader(out.items)).kind.?);
+    try out.appendSlice(testing.allocator, "}\n");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const body = try parseLineBody(arena.allocator(), .v27_commit, out.items);
+    try testing.expectEqualStrings("[{\"type\":\"turn.started\",\"data\":{}}]", body.v27_commit.facts);
 }
 
 test "unknown kinds parse with a null kind" {

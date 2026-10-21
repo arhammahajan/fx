@@ -553,7 +553,7 @@ fn formatUnexpectedError(buffer: []u8, err: anyerror) ![]const u8 {
 /// for any other error.
 fn v2StorageFaultMessage(err: anyerror) ?[]const u8 {
     return switch (err) {
-        error.AccessDenied => "fx: this session cannot be opened for writing: permission denied. Check the permissions under ~/.fx/sessions/v2, then resume again.\n",
+        error.AccessDenied => "fx: this session cannot be opened for writing: permission denied. Check the permissions under ~/.fx/sessions/v3, then resume again.\n",
         error.ReadOnlyFileSystem => "fx: this session cannot be opened for writing: the disk is read-only.\n",
         error.NoSpaceLeft => "fx: this session cannot be saved: the disk is full. Free some space, then resume again.\n",
         error.FileTooBig => "fx: this session cannot be saved: a file-size limit was reached.\n",
@@ -1436,7 +1436,7 @@ test "app entry names a v2 storage fault at startup, and v1 keeps the bare error
         init_error: anyerror,
         message: []const u8,
     }{
-        .{ .init_error = error.AccessDenied, .message = "fx: this session cannot be opened for writing: permission denied. Check the permissions under ~/.fx/sessions/v2, then resume again.\n" },
+        .{ .init_error = error.AccessDenied, .message = "fx: this session cannot be opened for writing: permission denied. Check the permissions under ~/.fx/sessions/v3, then resume again.\n" },
         .{ .init_error = error.ReadOnlyFileSystem, .message = "fx: this session cannot be opened for writing: the disk is read-only.\n" },
         .{ .init_error = error.NoSpaceLeft, .message = "fx: this session cannot be saved: the disk is full. Free some space, then resume again.\n" },
         .{ .init_error = error.FileTooBig, .message = "fx: this session cannot be saved: a file-size limit was reached.\n" },

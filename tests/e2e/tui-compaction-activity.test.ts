@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { onlySessionId, savedText, sessionDir } from "./saved-sessions";
+import { decodeLogLine, onlySessionId, savedText, sessionDir } from "./saved-sessions";
 
 // The shared tmux helper imports eval helpers; do not load repository dotenv files.
 process.env.FX_E2E_DISABLE_DOTENV = "1";
@@ -34,13 +34,13 @@ function shellQuote(value: string): string {
 /// A session log's conversation: what a close or a reopen leaves as it was,
 /// since the store adds only its own `closed` and `snapshot` lines then.
 function conversationLines(text: string): string[] {
-  return text.split("\n").filter(Boolean).filter((line) => !["closed", "snapshot"].includes(JSON.parse(line).kind));
+  return text.split("\n").filter(Boolean).filter((line) => !["closed", "snapshot"].includes(decodeLogLine(line).kind));
 }
 
 /// The compactions a session log holds.
 function checkpoints(bytes: Buffer): number {
   return bytes.toString().trim().split("\n").filter(Boolean)
-    .map((line) => JSON.parse(line)).filter((line) => line.kind === "compacted").length;
+    .map(decodeLogLine).filter((line) => line.kind === "compacted").length;
 }
 
 async function until(predicate: () => boolean, label: string, timeout = 20_000) {
@@ -474,7 +474,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         await terminal.waitForPane((pane) => hasEmptyComposer(pane) &&
           !/Compaction cancelled|Compacting|Thinking/.test(pane), 5000);
         const interruptions = () => f.savedEvents().trim().split("\n")
-          .map((line) => JSON.parse(line)).filter((line) => line.kind === "item" && line.type === "interruption");
+          .map(decodeLogLine).filter((line) => line.kind === "item" && line.type === "interruption");
         await until(() => interruptions().length === 1, "durable cancellation", 5000);
         expect(interruptions()[0].data.reason).toBe("cancelled");
         // An ordinary cancellation leaves its origin out, which reads as "turn".
@@ -691,7 +691,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       const log = join(sessionDir(home, onlySessionId(home)), "log.jsonl");
       await until(() => readFileSync(log, "utf8").includes("\"turn_committed\""), "saved turn", 10_000);
       const handoff = readFileSync(log, "utf8").trim().split("\n")
-        .map((line) => JSON.parse(line)).find((line) => line.kind === "compacted")?.data.summary ?? "";
+        .map(decodeLogLine).find((line) => line.kind === "compacted")?.data.summary ?? "";
       expect(handoff.startsWith("fx-compactor-v1\n")).toBe(true);
       const state = JSON.parse(handoff.slice("fx-compactor-v1\n".length));
       // Only the turn in progress was compacted; its steering is kept exactly.

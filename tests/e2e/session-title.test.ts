@@ -63,7 +63,7 @@ function baseEnv(root: FixtureRoot, gateway: { baseUrl: string; chatUrl: string 
 function sessionTitles(root: FixtureRoot): string[] {
   if (!existsSync(storeRoot(root.home))) return [];
   return rootSessionIds(root.home).flatMap((id) => {
-    const title = (logLines(root.home, id) as any[]).filter((line) => line.kind === "set" && line.key === "title").at(-1)?.value;
+    const title = (logLines(root.home, id) as any[]).filter((line) => (line.private?.[0]?.data?.record ?? line.legacy_kind ?? line.kind) === "set" && line.key === "title").at(-1)?.value;
     return typeof title === "string" ? [title] : [];
   });
 }

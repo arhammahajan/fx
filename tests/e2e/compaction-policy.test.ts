@@ -63,7 +63,7 @@ for (const userHeavy of [false, true]) test(`automatic compaction ${userHeavy ? 
     // The turn is only a user message and a final reply, which both stay, so
     // there is nothing for the model to summarize.
     expect(summaryCalls).toBe(0);
-    const checkpoints = logLines(home, seed.session_id).filter((line: any) => line.kind === "compacted");
+    const checkpoints = logLines(home, seed.session_id).filter((line: any) => (line.private?.[0]?.data?.record ?? line.legacy_kind ?? line.kind) === "compacted");
     expect(checkpoints.length).toBe(1);
     const saved: string = (checkpoints[0] as any).data.summary;
     expect(saved.startsWith(checkpointMarker)).toBe(true);

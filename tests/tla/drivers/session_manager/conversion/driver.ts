@@ -174,7 +174,7 @@ export function fixture(label: string, at?: string, models?: object[]) {
   // Real paths, as the fault compares them; the folders below home may not
   // exist yet.
   const v1Path = (id: string) => join(realpathSync(home), ".fx/sessions", id);
-  const stagingPath = (id: string) => join(realpathSync(home), ".fx/sessions/v2/.tmp", id);
+  const stagingPath = (id: string) => join(realpathSync(home), ".fx/sessions/v3/.tmp", id);
 
   return { root, home, workspace, v1Root, v2Root, runs, gateway, env, start, fx, v1Ask, fingerprint, apps, acps, faultPaths, v1Path, stagingPath,
     // What the host said in the last openVia: fx ask's output, ACP's load
@@ -724,7 +724,7 @@ export function olderRelease(ref: string): string {
 // Every v2 log a run left, converted ones included, through the saved-log
 // check (TurnLifecycle and Subagents under TLC); none may be unreadable.
 async function checkSavedLogs(root: string, label: string) {
-  const found = Bun.spawnSync(["find", root, "-type", "d", "-path", "*/.fx/sessions/v2"]).stdout.toString().split("\n")
+  const found = Bun.spawnSync(["find", root, "-type", "d", "-path", "*/.fx/sessions/v3"]).stdout.toString().split("\n")
     .filter(dir => dir && readdirSync(dir).some(name => existsSync(join(dir, name, "log.jsonl"))));
   if (!found.length) return;
   const child = Bun.spawn(["python3", savedLogsChecker, ...found], { stdout: "pipe", stderr: "pipe" });
@@ -748,4 +748,3 @@ export function scenario(name: string, body: (f: Fixture) => Promise<void>) {
     }
   }, Math.max(240_000, repetitions * 240_000));
 }
-

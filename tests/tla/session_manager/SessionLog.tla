@@ -1,6 +1,6 @@
 ---------------------------- MODULE SessionLog ----------------------------
 (***************************************************************************)
-(* Step: L1 log. One append-only log file.                                *)
+(* Step: L1 v3 commit and snapshot log. One append-only log file.         *)
 (*                                                                         *)
 (* Models write() into the page cache, fsync at a durability point, an fx *)
 (* crash (the kernel keeps every written byte), a machine crash (only the *)

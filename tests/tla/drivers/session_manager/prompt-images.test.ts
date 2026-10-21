@@ -43,7 +43,7 @@ function fixture(name: string) {
   mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
   mkdirSync(workspace, { mode: 0o700 });
   writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ permission: {} }));
-  const sessionsRoot = join(home, ".fx", "sessions", "v2");
+  const sessionsRoot = join(home, ".fx", "sessions", "v3");
   const requests: string[] = [];
   const server = Bun.serve({
     port: 0,

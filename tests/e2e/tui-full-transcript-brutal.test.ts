@@ -137,7 +137,7 @@ function committedAssistantOccurrences(home: string, assistant: string): number 
   if (!existsSync(storeRoot(home))) return 0;
   return savedSessionIds(home).reduce((count, id) =>
     count + logLines(home, id).filter((line: any) =>
-      line.kind === "item" && line.type === "assistant" && line.data?.text === assistant
+      (line.private?.[0]?.data?.record ?? line.legacy_kind ?? line.kind) === "item" && line.type === "assistant" && line.data?.text === assistant
     ).length, 0);
 }
 

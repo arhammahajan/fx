@@ -29,7 +29,7 @@ export async function savedSession(home: string, id: string): Promise<SavedSessi
 
 /// The folder holding every saved session.
 export function storeRoot(home: string): string {
-  return join(home, ".fx", "sessions", "v2");
+  return join(home, ".fx", "sessions", "v3");
 }
 
 /// One session's folder.
@@ -47,11 +47,23 @@ export function savedText(home: string, id: string): string {
 
 export type LogLine = { seq: number; kind: string; type?: string; reason?: string; key?: string };
 
+export function decodeLogLine(value: string | Record<string, any>): any {
+  const parsed = typeof value === "string" ? JSON.parse(value) : value;
+  const privateData = parsed.private?.[0]?.data;
+  const record = privateData?.record ?? parsed.legacy_kind ?? (parsed.kind === "commit" ? "v27_commit" : parsed.kind);
+  return {
+    ...parsed,
+    ...(privateData?.body ?? {}),
+    envelope_kind: parsed.kind,
+    kind: record,
+  };
+}
+
 /// Every complete line of a session's log. A line fx is still appending is
 /// left out, so a test may read the log while fx runs.
 function readLog(home: string, id: string): LogLine[] {
   const text = readFileSync(join(sessionDir(home, id), "log.jsonl"), "utf8");
-  return text.slice(0, text.lastIndexOf("\n") + 1).split("\n").filter(Boolean).map((line) => JSON.parse(line));
+  return text.slice(0, text.lastIndexOf("\n") + 1).split("\n").filter(Boolean).map(decodeLogLine);
 }
 
 /// Every line of a session's log. A streamed turn always matches its
@@ -79,7 +91,7 @@ export function onlySessionId(home: string): string {
 export function rootSessionIds(home: string): string[] {
   return savedSessionIds(home).filter((id) => {
     const first = readFileSync(join(sessionDir(home, id), "log.jsonl"), "utf8").split("\n", 1)[0]!;
-    return JSON.parse(first).role !== "child";
+    return decodeLogLine(first).role !== "child";
   });
 }
 

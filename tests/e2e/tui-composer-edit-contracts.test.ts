@@ -1026,7 +1026,7 @@ tmuxTest(
     });
     // The session keeps those bytes once, as the blob named by their hash.
     expect(savedPaths[1]).toBe(savedPaths[0]);
-    expect(savedPaths[0]!.startsWith(join(root!, "home", ".fx", "sessions", "v2"))).toBe(true);
+    expect(savedPaths[0]!.startsWith(join(root!, "home", ".fx", "sessions", "v3"))).toBe(true);
     expectCleanRuntime(active);
   },
   TIMEOUT,

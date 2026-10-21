@@ -20,7 +20,7 @@ import { FX_BIN, REPO_ROOT, runFx, providerVersionTestEnv } from "../evals/eval-
 import { fakeResponsesTitleDefault, TITLE_GENERATION_MARKER } from "./tmux-helpers";
 import { readTapeFrames } from "./render-lab/tape";
 import { equivalentPngEncodings, solidPng } from "./fixtures/image-encoding";
-import { rootSessionIds, savedText, sessionDir } from "./saved-sessions";
+import { decodeLogLine, rootSessionIds, savedText, sessionDir } from "./saved-sessions";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
@@ -6651,7 +6651,7 @@ tmuxTest(
     expect(gateway.requests[3].headers.get("authorization")).toBe(`Bearer ${ACQUIRED_LOGIN_TOKEN}`);
     expect(JSON.parse(gateway.requests[3].body).tools ?? []).toHaveLength(0);
     expect(readFileSync(historyPath, "utf8").startsWith(before)).toBe(true);
-    const records = readFileSync(historyPath, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    const records = readFileSync(historyPath, "utf8").trim().split("\n").map(decodeLogLine);
     expect(records.filter((record) => record.kind === "compacted")).toHaveLength(1);
     await session.sendKeys("C-u");
     await session.sendText("Continue after the manual compaction.");

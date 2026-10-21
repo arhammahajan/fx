@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import { findFooterBlocks, readTrace } from "./tui-render-assertions";
-import { savedSessionIds, sessionDir, storeRoot } from "./saved-sessions";
+import { decodeLogLine, savedSessionIds, sessionDir, storeRoot } from "./saved-sessions";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
@@ -621,7 +621,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
         .trim()
         .split("\n")
         .filter(Boolean)
-        .map((line) => JSON.parse(line))
+        .map(decodeLogLine)
         .filter((line) => line.kind === "turn_interrupted");
       expect(interruptedEvents).toHaveLength(1);
       for (const chunk of PARTIAL_CHUNKS) {

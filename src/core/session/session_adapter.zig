@@ -1,4 +1,4 @@
-//! The one door between fx and the session manager (sessions v2), fx's only
+//! The one door between fx and the native v27 session manager, fx's only
 //! session store.
 //!
 //! Hosts call this file; it is the only fx file that imports
@@ -7,7 +7,10 @@
 //! builder, so a session converted from v1 holds the same bytes for the same
 //! history as one fx started here.
 //!
-//! What goes where:
+//! Compatibility records below are private migration state. Public history
+//! is emitted only as v27 facts and every surface reads the v27 fold.
+//!
+//! What private migration state keeps:
 //! - each completed piece of a turn is one `item` whose `type` is the v1
 //!   piece kind and whose `data` is the v1 payload;
 //! - a turn ends with a `turn_end` item and `turn_committed`, or an
@@ -60,8 +63,8 @@ const session_permission_state = @import("../permissions/session_permission_stat
 const model_provider = @import("../config/model_provider.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const history_range = @import("../shared/history_range.zig");
-const v27_shadow = @import("v27_shadow.zig");
-const V27Shadow = v27_shadow.Shadow(sm.v27);
+const v27_session = @import("v27_session.zig");
+const V27Session = v27_session.Native(sm.v27);
 
 const Allocator = std.mem.Allocator;
 const Event = session_event.ConversationEvent;
@@ -83,11 +86,52 @@ const max_inline_piece_bytes: usize = 256 * 1024;
 /// Lines per page when replaying history.
 const replay_page_lines: usize = 256;
 
+test "native v27 state folds turns without a shadow file" {
+    const native = try V27Session.create(std.testing.allocator);
+    defer native.deinit();
+
+    try native.beginTurn();
+    try native.settleTurn("completed");
+
+    try std.testing.expectEqual(@as(u64, 1), native.view.session.turn_count);
+    try std.testing.expectEqualStrings("settled", native.view.turns.get("turn_1").?.status);
+}
+
+test "native v27 replay recovers an unfinished turn" {
+    const native = try V27Session.create(std.testing.allocator);
+    defer native.deinit();
+    const parts: []const std.json.Value = &.{};
+    const opening = [_]sm.v27.facts.Fact{
+        sm.v27.facts.deliveryAdmitted(.{ .deliveryId = "delivery_1" }),
+        sm.v27.facts.turnStarted(.{ .turnId = "turn_1", .cause = .{ .deliveryId = "delivery_1" }, .follows = .null }),
+        sm.v27.facts.deliveryConsumed(.{ .deliveryId = "delivery_1", .turnId = "turn_1", .parts = parts }),
+        sm.v27.facts.modelRequested(.{ .runId = "run_1", .owner = .{ .turnId = "turn_1" } }),
+        sm.v27.facts.modelStarted(.{ .runId = "run_1", .modelId = "fx/model", .attempt = 0 }),
+    };
+    try native.replay(&opening);
+    try std.testing.expectEqualStrings("turn_1", native.turn_id.?);
+    try native.recoverOpenTurns();
+    try std.testing.expect(native.turn_id == null);
+    try std.testing.expectEqualStrings("settled", native.view.turns.get("turn_1").?.status);
+    try std.testing.expectEqualStrings("settled", native.view.deliveries.get("delivery_1").?.status);
+}
+
+test "native v27 state releases every partial allocation" {
+    const Probe = struct {
+        fn run(alloc: Allocator) !void {
+            const native = try V27Session.create(alloc);
+            defer native.deinit();
+            try native.setModel("provider/model");
+            try native.progress(.{ .text = @constCast("hello") }, .{}, &.{});
+        }
+    };
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Probe.run, .{});
+}
+
 pub const Host = sm.Host;
 pub const ChildOutcome = sm.Outcome;
 
-/// The v27 call projection used by live and replay surfaces while v2 remains
-/// the durable source during the staged cutover.
+/// A small v27 projection used by ACP while its live call cards are in flight.
 pub const V27CallProjection = struct {
     view: sm.v27.tables.SessionView = .{},
     opened: bool = false,
@@ -222,7 +266,7 @@ fn processId() i64 {
 
 pub const Store = struct {
     manager: *sm.Manager,
-    /// `$HOME`, owned: the base of `~/.fx/sessions/v2` and of the side folders.
+    /// `$HOME`, owned: the base of `~/.fx/sessions/v3` and of the side folders.
     home: []u8,
     /// Read once, for the wiring trace: not a call per append.
     pid: i64,
@@ -258,9 +302,10 @@ pub const Store = struct {
             home,
             profile_paths.root_dir_name,
             profile_paths.sessions_dir_name,
-            session_layout.sessions_v2_dir,
+            session_layout.sessions_v3_dir,
         });
         defer alloc.free(root);
+        try migrateV2Root(alloc, owned_home);
         const manager = try sm.Manager.init(alloc, io_mod.getIo(), .{
             .root = root,
             .diagnostics = .{ .context = null, .emit = traceDiagnostic },
@@ -280,7 +325,7 @@ pub const Store = struct {
             else => return err,
         };
         defer parent.close();
-        for ([_][]const u8{ profile_paths.root_dir_name, profile_paths.sessions_dir_name, session_layout.sessions_v2_dir }) |name| {
+        for ([_][]const u8{ profile_paths.root_dir_name, profile_paths.sessions_dir_name, session_layout.sessions_v3_dir }) |name| {
             const next = (io_mod.openRealDirIfPresent(&parent, name) catch |err| switch (err) {
                 error.DurablePathUnsafe => return error.SessionPathUnsafe,
                 else => return err,
@@ -459,6 +504,38 @@ pub const Store = struct {
         }
     }
 };
+
+/// Moves the previous manager root into v3 before the manager opens it. The
+/// rename is atomic, so a crash leaves either complete root discoverable.
+fn migrateV2Root(alloc: Allocator, home: []const u8) !void {
+    const parent_path = try std.Io.Dir.path.join(alloc, &.{ home, profile_paths.root_dir_name, profile_paths.sessions_dir_name });
+    defer alloc.free(parent_path);
+    const old_path = try std.Io.Dir.path.join(alloc, &.{ parent_path, session_layout.sessions_v2_dir });
+    defer alloc.free(old_path);
+    const new_path = try std.Io.Dir.path.join(alloc, &.{ parent_path, session_layout.sessions_v3_dir });
+    defer alloc.free(new_path);
+
+    var old = std.Io.Dir.openDirAbsolute(io_mod.getIo(), old_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    old.close(io_mod.getIo());
+    if (std.Io.Dir.openDirAbsolute(io_mod.getIo(), new_path, .{})) |opened| {
+        var existing = opened;
+        existing.close(io_mod.getIo());
+        return;
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
+    try std.Io.Dir.renameAbsolute(old_path, new_path, io_mod.getIo());
+    var parent = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), parent_path, .{ .iterate = true });
+    defer parent.close(io_mod.getIo());
+    io_mod.syncVerifiedDir(parent) catch |err| switch (err) {
+        error.OperationUnsupported => {},
+        else => return err,
+    };
+}
 
 /// Every repair or drop the manager makes reaches the trace log.
 fn traceDiagnostic(_: ?*anyopaque, event: sm.Diagnostic) void {
@@ -1332,7 +1409,9 @@ pub const Session = struct {
     /// A conversion's import: the original time of the batches it writes
     /// next (D59). Null for every other session.
     import_ts: ?u64 = null,
-    v27: ?*V27Shadow = null,
+    v27: *V27Session,
+    v27_arena: std.heap.ArenaAllocator,
+    v27_pending: std.ArrayList([]u8) = .empty,
 
     pub fn create(alloc: Allocator, store: *Store, workspace: []const u8, host: Host, seed: Seed) !*Session {
         // Every v2 write needs a writable open, and both start here or in
@@ -1344,7 +1423,6 @@ pub const Session = struct {
         const self = try init(alloc, store, handle, true);
         errdefer self.destroyInner();
         try self.appendSeed(seed);
-        try self.ensureV27Shadow();
         traceWiring("Open", self.id(), "", self.store.pid);
         return self;
     }
@@ -1377,6 +1455,7 @@ pub const Session = struct {
             .{ .set = .{ .key = .permissions, .value = try session_codec.encodePermissionState(a, seed.permission_state) } },
             .{ .set = .{ .key = .language, .value = try jsonString(a, seed.language.view()) } },
         });
+        try self.v27.setModel(seed.preferences.model);
         self.language = try self.alloc.dupe(u8, seed.language.view());
     }
 
@@ -1398,13 +1477,14 @@ pub const Session = struct {
             self.last_turn = state.last_turn;
             // Every child starts with its preferences (`appendSeed`).
             const raw = state.prefs orelse return error.InvalidSessionFormat;
+            try self.restoreV27Model(raw);
+            try self.v27.recoverOpenTurns();
             self.instructions = try decodeInstructions(alloc, raw);
             if (seed.instructions.len > 0 and !std.mem.eql(u8, seed.instructions, self.childInstructions())) {
                 var preferences = try decodePreferences(alloc, raw);
                 defer preferences.deinit(alloc);
                 try self.replaceInstructions(preferences, seed.instructions);
             }
-            try self.ensureV27Shadow();
             return self;
         } else |err| switch (err) {
             error.NotFound => {},
@@ -1417,7 +1497,6 @@ pub const Session = struct {
         self.root = false;
         if (seed.instructions.len > 0) self.instructions = try alloc.dupe(u8, seed.instructions);
         try self.appendSeed(seed);
-        try self.ensureV27Shadow();
         return self;
     }
 
@@ -1427,6 +1506,12 @@ pub const Session = struct {
         defer scratch.deinit();
         const state = try self.handle.state(scratch.allocator());
         return decodePreferences(alloc, state.prefs orelse return error.InvalidSessionFormat);
+    }
+
+    fn restoreV27Model(self: *Session, raw: []const u8) !void {
+        var preferences = try decodePreferences(self.alloc, raw);
+        defer preferences.deinit(self.alloc);
+        try self.v27.setModel(preferences.model);
     }
 
     /// A child's instructions (D34), or empty. Borrowed until `close`.
@@ -1440,6 +1525,7 @@ pub const Session = struct {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         _ = try self.write(&.{.{ .set = .{ .key = .prefs, .value = try encodePreferences(arena.allocator(), preferences, owned) } }});
+        try self.v27.setModel(preferences.model);
         if (self.instructions) |old| self.alloc.free(old);
         self.instructions = owned;
     }
@@ -1521,8 +1607,9 @@ pub const Session = struct {
         var state = try handle.state(alloc);
         defer state.deinit(alloc);
         self.last_turn = state.last_turn;
+        if (state.prefs) |raw| try self.restoreV27Model(raw);
+        try self.v27.recoverOpenTurns();
         if (clean) cleanLeftovers(store, alloc, self.id(), &state);
-        try self.ensureV27Shadow();
         traceWiring("Open", self.id(), "", self.store.pid);
         return self;
     }
@@ -1532,23 +1619,79 @@ pub const Session = struct {
         errdefer alloc.free(files_path);
         const host = try BlobHost.create(alloc, store, handle);
         errdefer BlobHost.release(host);
-        const v27 = try V27Shadow.createMemory(alloc);
+        const v27 = try V27Session.create(alloc);
         errdefer v27.deinit();
+        var v27_arena = std.heap.ArenaAllocator.init(alloc);
+        errdefer v27_arena.deinit();
         const self = try alloc.create(Session);
-        self.* = .{ .alloc = alloc, .store = store, .handle = handle, .files_path = files_path, .host = host, .fresh = fresh, .v27 = v27 };
+        errdefer alloc.destroy(self);
+        self.* = .{ .alloc = alloc, .store = store, .handle = handle, .files_path = files_path, .host = host, .fresh = fresh, .v27 = v27, .v27_arena = v27_arena };
+        try self.replayV27Facts();
+        try v27.setSink(self, persistV27Facts);
         return self;
     }
 
-    fn ensureV27Shadow(self: *Session) !void {
-        if (!std.mem.eql(u8, io_mod.getenv("FX_SESSION_V27_SHADOW") orelse "", "1")) return;
-        const shadow = self.v27 orelse return;
-        if (shadow.file != null) return;
-        const folder = try self.folderPath(self.alloc);
-        defer self.alloc.free(folder);
-        shadow.enableFiles(folder) catch |err| {
-            debug_trace.logf("session", "event=v27_shadow_open_deferred session={s} err={s}", .{ self.id(), @errorName(err) });
-            return;
+    fn replayV27Facts(self: *Session) !void {
+        const arena = self.v27_arena.allocator();
+        var from: sm.From = .start;
+        while (true) {
+            var page = try self.handle.read(arena, from, .forward, replay_page_lines);
+            defer page.deinit();
+            for (page.entries) |entry| {
+                const body = entry.body orelse continue;
+                if (body != .v27_commit) continue;
+                const elements = try sm.rawElements(arena, body.v27_commit.facts);
+                var decoded: std.ArrayList(sm.v27.facts.Fact) = .empty;
+                for (elements) |raw| {
+                    const fact = sm.v27.facts.decode(arena, raw) catch |err| switch (err) {
+                        error.UnknownFact => continue,
+                        else => return err,
+                    };
+                    try decoded.append(arena, fact);
+                }
+                if (decoded.items.len > 0) try self.v27.replay(decoded.items);
+            }
+            from = .{ .at = page.next orelse break };
+        }
+    }
+
+    fn persistV27Facts(raw: *anyopaque, committed: []const sm.v27.facts.Fact) !void {
+        const self: *Session = @ptrCast(@alignCast(raw));
+        var pending: std.ArrayList([]u8) = .empty;
+        defer pending.deinit(self.alloc);
+        errdefer for (pending.items) |fact| self.alloc.free(fact);
+        try pending.ensureUnusedCapacity(self.alloc, committed.len);
+        for (committed) |fact| pending.appendAssumeCapacity(try sm.v27.facts.encodeAlloc(self.alloc, fact));
+        try self.v27_pending.ensureUnusedCapacity(self.alloc, committed.len);
+        self.v27_pending.appendSliceAssumeCapacity(pending.items);
+        pending.clearRetainingCapacity();
+        var flush = false;
+        for (committed) |fact| switch (fact.factType()) {
+            .delivery_consumed,
+            .call_started,
+            .call_settled,
+            .turn_settled,
+            .context_settled,
+            .session_ended,
+            => flush = true,
+            else => {},
         };
+        if (flush) try self.flushV27Facts();
+    }
+
+    fn flushV27Facts(self: *Session) !void {
+        if (self.v27_pending.items.len == 0) return;
+        var encoded: std.Io.Writer.Allocating = .init(self.alloc);
+        defer encoded.deinit();
+        try encoded.writer.writeByte('[');
+        for (self.v27_pending.items, 0..) |fact, index| {
+            if (index > 0) try encoded.writer.writeByte(',');
+            try encoded.writer.writeAll(fact);
+        }
+        try encoded.writer.writeByte(']');
+        _ = try self.handle.append(&.{.{ .v27_commit = encoded.written() }});
+        for (self.v27_pending.items) |fact| self.alloc.free(fact);
+        self.v27_pending.clearRetainingCapacity();
     }
 
     pub fn id(self: *const Session) []const u8 {
@@ -1557,13 +1700,13 @@ pub const Session = struct {
 
     /// The latest public reply from the v27 fold. Caller owns the result.
     pub fn v27ReplyAlloc(self: *Session, alloc: Allocator) !?[]u8 {
-        const shadow = self.v27 orelse return null;
-        const turn_id = shadow.view.session.latest_turn_id orelse return null;
-        const ids = sm.v27.selectors.reply(&shadow.view, turn_id);
+        const native = self.v27;
+        const turn_id = native.view.session.latest_turn_id orelse return null;
+        const ids = sm.v27.selectors.reply(&native.view, turn_id);
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(alloc);
         for (ids) |part_id| {
-            const part = shadow.view.parts.get(part_id) orelse continue;
+            const part = native.view.parts.get(part_id) orelse continue;
             const value = part.value orelse continue;
             const text = switch (value) {
                 .string => |text| text,
@@ -1577,7 +1720,8 @@ pub const Session = struct {
 
     /// Tool names and terminal states from v27 call rows. Caller owns.
     pub fn v27ToolSummaries(self: *Session, alloc: Allocator) !?[]V27ToolSummary {
-        const shadow = self.v27 orelse return null;
+        const native = self.v27;
+        const latest_turn = native.view.session.latest_turn_id;
         var out: std.ArrayList(V27ToolSummary) = .empty;
         errdefer {
             for (out.items) |summary| {
@@ -1586,9 +1730,14 @@ pub const Session = struct {
             }
             out.deinit(alloc);
         }
-        for (shadow.state.entities.items) |entity| {
+        for (native.state.entities.items) |entity| {
             if (entity.ref.family != .call) continue;
-            const row = shadow.view.calls.get(entity.ref.id) orelse continue;
+            const row = native.view.calls.get(entity.ref.id) orelse continue;
+            if (latest_turn) |turn_id| {
+                const run_id = row.owner.runId orelse continue;
+                const run = native.view.runs.get(run_id) orelse continue;
+                if (run.owner.turnId == null or !std.mem.eql(u8, run.owner.turnId.?, turn_id)) continue;
+            }
             const name = try alloc.dupe(u8, sm.v27.selectors.callLabel(row));
             errdefer alloc.free(name);
             const state = sm.v27.selectors.callState(row);
@@ -1650,13 +1799,13 @@ pub const Session = struct {
         return self.last_turn > 0;
     }
 
-    /// The session's folder under `~/.fx/sessions/v2`, for display. Caller owns it.
+    /// The session's folder under `~/.fx/sessions/v3`, for display. Caller owns it.
     pub fn folderPath(self: *const Session, alloc: Allocator) ![]u8 {
         return std.Io.Dir.path.join(alloc, &.{
             self.store.home,
             profile_paths.root_dir_name,
             profile_paths.sessions_dir_name,
-            session_layout.sessions_v2_dir,
+            session_layout.sessions_v3_dir,
             self.id(),
         });
     }
@@ -1666,15 +1815,31 @@ pub const Session = struct {
     /// A copy of its capability that a background reader still holds keeps
     /// reading, and stores nothing more (D44).
     pub fn close(self: *Session) void {
-        if (self.v27) |shadow| shadow.end() catch |err| debug_trace.logf("session", "event=v27_shadow_close_failed session={s} err={s}", .{ self.id(), @errorName(err) });
         self.host.detach();
         self.handle.close() catch |err| debug_trace.logf("session", "event=sessions_v2_close_failed session={s} err={s}", .{ self.id(), @errorName(err) });
+        self.reportV27Log();
         if (self.root) traceWiring("Close", self.id(), "", self.store.pid);
         if (self.turn_open) debug_trace.logf("session", "event=sessions_v2_turn_closed_open session={s} streamed={d}", .{ self.id(), self.streamed.items.len });
         // Before `release`: the id lives in the handle.
         if (!self.saved()) self.removeUnsavedFiles();
         self.handle.release();
         self.destroyInner();
+    }
+
+    fn reportV27Log(self: *Session) void {
+        const report_dir = io_mod.getenv("FX_SESSION_V27_REPORT_DIR") orelse return;
+        if (!self.saved()) return;
+        const folder = self.folderPath(self.alloc) catch return;
+        defer self.alloc.free(folder);
+        const source_path = std.Io.Dir.path.join(self.alloc, &.{ folder, "log.jsonl" }) catch return;
+        defer self.alloc.free(source_path);
+        const name = self.alloc.print("{s}.ndjson", .{self.id()}) catch return;
+        defer self.alloc.free(name);
+        const destination = std.Io.Dir.path.join(self.alloc, &.{ report_dir, name }) catch return;
+        defer self.alloc.free(destination);
+        io_mod.copyFileAtomic(self.alloc, source_path, destination) catch |err| {
+            debug_trace.logf("session", "event=v27_report_failed session={s} err={s}", .{ self.id(), @errorName(err) });
+        };
     }
 
     /// A session that never reached the disk takes its terminal folder with
@@ -1697,7 +1862,10 @@ pub const Session = struct {
 
     fn destroyInner(self: *Session) void {
         const alloc = self.alloc;
-        if (self.v27) |shadow| shadow.deinit();
+        self.v27.deinit();
+        self.v27_arena.deinit();
+        for (self.v27_pending.items) |fact| alloc.free(fact);
+        self.v27_pending.deinit(alloc);
         if (self.capability) |*capability| capability.deinit();
         BlobHost.release(self.host);
         self.clearStreamed();
@@ -1768,8 +1936,10 @@ pub const Session = struct {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
         try self.openTurnLocked();
-        try self.ensureV27Shadow();
-        if (self.v27) |shadow| try shadow.beginTurn();
+        var preferences = try self.currentPreferences(self.alloc);
+        defer preferences.deinit(self.alloc);
+        try self.v27.setModel(preferences.model);
+        try self.v27.beginTurn();
     }
 
     /// Stores the turn's tool results and images as blobs and gives them
@@ -1859,8 +2029,7 @@ pub const Session = struct {
         if (derived_title) |title| try tail.append(a, .{ .set = .{ .key = .title, .value = try jsonString(a, title) } });
 
         try self.writePieces(a, all[start..], encoded[start..], tail.items);
-        try self.ensureV27Shadow();
-        if (self.v27) |shadow| try shadow.finish(turn);
+        try self.v27.finish(turn);
         try self.turn_numbers.append(self.alloc, self.last_turn);
         self.turn_open = false;
         self.clearStreamed();
@@ -2000,8 +2169,7 @@ pub const Session = struct {
             for (encoded[start..]) |bytes| self.streamed.appendAssumeCapacity(try self.alloc.dupe(u8, bytes));
         }
         try self.saveRunning(a, running);
-        try self.ensureV27Shadow();
-        if (self.v27) |shadow| try shadow.progress(execution, running.calls);
+        try self.v27.progress(user, execution, running.calls);
     }
 
     /// The step whose calls are running: its calls in their saved form, and
@@ -2259,7 +2427,7 @@ pub const Session = struct {
             .keep_steering = trim.steering,
         };
         _ = try self.write(&.{.{ .compacted = try jsonValue(arena.allocator(), data) }});
-        if (self.v27) |shadow| try shadow.compaction(summary.compaction_count);
+        try self.v27.compaction(summary.compaction_count);
         self.trim = if (trim.tool_steps != 0 or trim.steering != 0) trim else .{};
         // fx's history is now the summary, then the retained turns.
         var kept: std.ArrayList(?u64) = .empty;
@@ -2286,9 +2454,12 @@ pub const Session = struct {
     // -- settings ------------------------------------------------------------
 
     pub fn setPreferences(self: *Session, preferences: session_codec.DurableSessionPreferences) !void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         _ = try self.write(&.{.{ .set = .{ .key = .prefs, .value = try encodePreferences(arena.allocator(), preferences, self.instructions) } }});
+        try self.v27.setModel(preferences.model);
     }
 
     // -- children (D22) ------------------------------------------------------
@@ -2330,6 +2501,8 @@ pub const Session = struct {
     /// while that child has unfinished work, and a finish for other work.
     pub fn appendChildLines(self: *Session, lines: []const ChildLine) !void {
         if (lines.len == 0) return;
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
         const events = try self.alloc.alloc(sm.Event, lines.len);
         defer self.alloc.free(events);
         for (lines, events) |line, *event| event.* = switch (line) {
@@ -2337,9 +2510,13 @@ pub const Session = struct {
             .finished => |finished| .{ .child_finished = .{ .child = finished.child, .work_id = finished.work_id, .outcome = finished.outcome, .data = finished.data } },
         };
         _ = try self.write(events);
-        if (self.v27) |shadow| for (lines) |line| switch (line) {
-            .spawned => |spawned| try shadow.child(spawned.child, spawned.work_id, true, false),
-            .finished => |finished| try shadow.child(finished.child, finished.work_id, false, true),
+        for (lines) |line| switch (line) {
+            .spawned => |spawned| try self.v27.child(spawned.child, spawned.work_id, true, null),
+            .finished => |finished| try self.v27.child(finished.child, finished.work_id, false, switch (finished.outcome) {
+                .ok => "completed",
+                .failed, .lost => "failed",
+                .cancelled, .interrupted => "interrupted",
+            }),
         };
     }
 
@@ -4477,7 +4654,7 @@ noinline fn replay(
                     try sink.turn(try presentStoredResults(src, alloc, turn), ended.turn);
                 },
                 .compacted => |line| try sink.summary(line.data),
-                .session_created, .turn_committed, .set, .child_spawned, .child_finished, .snapshot, .closed => {},
+                .session_created, .turn_committed, .set, .child_spawned, .child_finished, .v27_commit, .snapshot, .closed => {},
             }
         }
         from = .{ .at = page.next orelse break };
@@ -5258,7 +5435,7 @@ test "a result the model saw whole comes back whole after a resume, or says its 
     for ([_]bool{ false, true }) |lost| {
         if (lost) {
             // Its blob gone, the result says so rather than show a preview.
-            const path = try std.mem.concat(testing.allocator, u8, &.{ ".fx/sessions/v2/", id, "/blobs/", artifact_digest.blobHash(handle).? });
+            const path = try std.mem.concat(testing.allocator, u8, &.{ ".fx/sessions/v3/", id, "/blobs/", artifact_digest.blobHash(handle).? });
             defer testing.allocator.free(path);
             try t.tmp.dir.deleteFile(io_mod.getIo(), path);
         }
@@ -6165,7 +6342,7 @@ test "resume refuses a session whose compaction line is damaged" {
     // One byte of the summary changes, so its line fails its check. Open
     // reads past it: a snapshot follows every compaction.
     const io = io_mod.getIo();
-    const log_path = try std.Io.Dir.path.join(testing.allocator, &.{ ".fx", "sessions", "v2", id, "log.jsonl" });
+    const log_path = try std.Io.Dir.path.join(testing.allocator, &.{ ".fx", "sessions", "v3", id, "log.jsonl" });
     defer testing.allocator.free(log_path);
     const bytes = try t.tmp.dir.readFileAlloc(io, log_path, testing.allocator, .limited(1 << 20));
     defer testing.allocator.free(bytes);
@@ -7137,7 +7314,7 @@ test "an image that arrives with another session's blob path is saved here or wr
     var digest_hex = std.fmt.bytesToHex(digest, .lower);
     const other_digest: [32]u8 = @splat(0xcd);
     var other_hex = std.fmt.bytesToHex(other_digest, .lower);
-    const elsewhere = "/Users/example/.fx/sessions/v2/other/blobs/elsewhere";
+    const elsewhere = "/Users/example/.fx/sessions/v3/other/blobs/elsewhere";
     const original = [_]types.ImageAttachment{
         .{ .id = 1, .path = @constCast("/Users/example/a.png"), .media_type = @constCast("image/png"), .snapshot_sha256 = &digest_hex, .inline_data = @constCast(&bytes), .blob_path = @constCast(elsewhere) },
         // No bytes here to save, only another session's blob.
@@ -7774,7 +7951,7 @@ test "an unreadable v1 session is refused with its file and reason, and nothing 
     try testing.expectEqualStrings(try std.mem.print(&buffer, "events.jsonl line {d} is not valid JSON", .{line}), t.store.conversionProblem().?);
     try testing.expectError(error.NotFound, t.store.manager.peek(alloc, v1_torn_id));
     // No staging left behind, if any was made.
-    if (t.tmp.dir.openDir(io_mod.getIo(), ".fx/sessions/v2/.tmp", .{ .iterate = true })) |opened_staging| {
+    if (t.tmp.dir.openDir(io_mod.getIo(), ".fx/sessions/v3/.tmp", .{ .iterate = true })) |opened_staging| {
         var staging = opened_staging;
         defer staging.close(io_mod.getIo());
         var it = staging.iterate();
@@ -8584,7 +8761,7 @@ test "fx sessions convert says when it can't read a kept v1 child's converted co
     try copy.restore(&v1, child);
     try v1.put(child, "subagent", "owner.json", owner);
     // The converted copy is damaged since.
-    var copied = try t.tmp.dir.openDir(io, try std.Io.Dir.path.join(v1.arena.allocator(), &.{ ".fx", "sessions", "v2", child }), .{});
+    var copied = try t.tmp.dir.openDir(io, try std.Io.Dir.path.join(v1.arena.allocator(), &.{ ".fx", "sessions", "v3", child }), .{});
     defer copied.close(io);
     try copied.writeFile(io, .{ .sub_path = "log.jsonl", .data = "not a log\n" });
 
@@ -8896,7 +9073,7 @@ test "the sweep drops what an earlier try staged for a child whose folder is gon
     _ = try staging.putBlob("staged before the folder went");
     staging.release();
     try t.tmp.dir.deleteTree(io_mod.getIo(), try v1.sessionPath(went, ""));
-    const staged = try std.Io.Dir.path.join(v1.arena.allocator(), &.{ ".fx", "sessions", "v2", ".tmp", went });
+    const staged = try std.Io.Dir.path.join(v1.arena.allocator(), &.{ ".fx", "sessions", "v3", ".tmp", went });
     _ = try t.tmp.dir.statFile(io_mod.getIo(), staged, .{});
 
     (try openConverted(&t, parent)).close();

@@ -12,7 +12,9 @@ fi
 
 cd "$(dirname "$0")" || exit 1
 
-tmux_root="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/fx-e2e-tmux"
+# tmux's Unix socket path is bounded on macOS. Test homes can use the runner
+# temp folder, but the socket root must remain short.
+tmux_root="/tmp/fx-e2e-tmux"
 status=0
 index=0
 
@@ -22,12 +24,12 @@ for test_file in "$@"; do
   mkdir -p "$tmux_dir"
   rm -rf "$v27_dir"
   mkdir -p "$v27_dir"
-  if ! FX_SESSION_V27_SHADOW=1 FX_SESSION_V27_REPORT_DIR="$v27_dir" TMUX_TMPDIR="$tmux_dir" bun test --max-concurrency 1 "./$test_file"; then
+  if ! FX_SESSION_V27_REPORT_DIR="$v27_dir" TMUX_TMPDIR="$tmux_dir" bun test --max-concurrency 1 "./$test_file"; then
     printf 'Retrying failed E2E file after resetting tmux: %s\n' "$test_file"
     TMUX_TMPDIR="$tmux_dir" tmux kill-server 2>/dev/null || true
     rm -rf "$v27_dir"
     mkdir -p "$v27_dir"
-    if FX_SESSION_V27_SHADOW=1 FX_SESSION_V27_REPORT_DIR="$v27_dir" TMUX_TMPDIR="$tmux_dir" bun test --max-concurrency 1 "./$test_file"; then
+    if FX_SESSION_V27_REPORT_DIR="$v27_dir" TMUX_TMPDIR="$tmux_dir" bun test --max-concurrency 1 "./$test_file"; then
       printf '::warning title=E2E passed only on retry::%s failed and then passed on retry. Investigate it as a possible race.\n' "$test_file"
     else
       status=1

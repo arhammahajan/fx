@@ -2,7 +2,7 @@
 (***************************************************************************)
 (* Step: L2 fold and resume.                                              *)
 (*                                                                         *)
-(* open(.resume) folds from the newest snapshot instead of line 1. This  *)
+(* open(.resume) folds v3 commits from the newest fold snapshot. This    *)
 (* spec states the contract that makes that safe: resuming from the      *)
 (* newest snapshot gives exactly the state of a full replay, and the     *)
 (* snapshot lines themselves can be dropped without changing any state.  *)

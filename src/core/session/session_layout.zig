@@ -12,15 +12,16 @@ pub fn sessionDirPath(alloc: Allocator, sessions_dir: []const u8, session_id: []
     return std.Io.Dir.path.join(alloc, &.{ sessions_dir, session_id });
 }
 
-/// The sessions v2 root inside the v1 sessions folder. No v1 id can take
-/// this name in any case (macOS folders are case-insensitive by default),
-/// so every scan of the v1 folder skips it and no v1 path reaches it.
+/// The retired v2 root and active v3 root inside the legacy sessions folder.
+/// No session id can take either name in any case.
 pub const sessions_v2_dir = "v2";
+pub const sessions_v3_dir = "v3";
 
 pub fn validateSessionId(session_id: []const u8) !void {
     if (session_id.len == 0 or session_id.len > 255 or
         std.mem.eql(u8, session_id, ".") or std.mem.eql(u8, session_id, "..") or
-        std.ascii.eqlIgnoreCase(session_id, sessions_v2_dir))
+        std.ascii.eqlIgnoreCase(session_id, sessions_v2_dir) or
+        std.ascii.eqlIgnoreCase(session_id, sessions_v3_dir))
     {
         return error.InvalidSessionId;
     }
@@ -119,8 +120,10 @@ test "session directory path rejects unsafe ids" {
     try std.testing.expect(std.mem.endsWith(u8, maximum, &max_id));
 }
 
-test "the sessions v2 root is never a v1 session id" {
+test "session store roots are never session ids" {
     try std.testing.expectError(error.InvalidSessionId, validateSessionId(sessions_v2_dir));
     try std.testing.expectError(error.InvalidSessionId, validateSessionId("V2"));
+    try std.testing.expectError(error.InvalidSessionId, validateSessionId(sessions_v3_dir));
+    try std.testing.expectError(error.InvalidSessionId, validateSessionId("V3"));
     try validateSessionId("v2x");
 }

@@ -35,7 +35,7 @@ import {
   tmuxAvailable,
 } from "./tmux-helpers";
 import { readTapeFrames } from "./render-lab/tape";
-import { commandReplays, logLines, onlySessionId, savedSessionIds, savedText, sessionDir, storeRoot } from "./saved-sessions";
+import { commandReplays, decodeLogLine, logLines, onlySessionId, savedSessionIds, savedText, sessionDir, storeRoot } from "./saved-sessions";
 
 const TIMEOUT = 30_000;
 const UPGRADE_TIMEOUT = TIMEOUT * 2;
@@ -84,7 +84,7 @@ function logOf(home: string, id: string): string {
 
 /// Session `id`'s items, each as `{ [type]: data }`.
 function savedItems(home: string, id: string): any[] {
-  return logLines(home, id).filter((line: any) => line.kind === "item").map((line: any) => ({ [line.type]: line.data }));
+  return logLines(home, id).filter((line: any) => (line.private?.[0]?.data?.record ?? line.legacy_kind ?? line.kind) === "item").map((line: any) => ({ [line.type]: line.data }));
 }
 
 function shellQuote(value: string): string {
@@ -949,7 +949,7 @@ test.skipIf(!tmuxAvailable())(
         expect(gateway.requests[index]!.body).toContain("INTERNAL_CALL_506");
         // The legacy session converted on its first open and its v1 folder went
         // (D55, D60); its checkpoint is the log's one compaction.
-        const compactions = (logLines(home, sessionId) as any[]).filter((line) => line.kind === "compacted").map((line) => line.data.summary);
+        const compactions = (logLines(home, sessionId) as any[]).filter((line) => (line.private?.[0]?.data?.record ?? line.legacy_kind ?? line.kind) === "compacted").map((line) => line.data.summary);
         expect(compactions).toEqual([summary]);
         expect(existsSync(sessionDir)).toBe(false);
         const replay = await runFx(["replay", tapePath, "--frames"], { cwd: workspace, env: { HOME: home } });
@@ -7394,7 +7394,7 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForPane((pane) => hasEmptyComposer(pane) && !/Preparing compaction|Compacting|Stopping compaction/.test(pane), TIMEOUT);
       const compacted = readFileSync(historyPath, "utf8");
       expect(compacted.startsWith(before)).toBe(true);
-      const records = compacted.trim().split("\n").map((line) => JSON.parse(line));
+      const records = compacted.trim().split("\n").map(decodeLogLine);
       expect(records.filter((record) => record.kind === "compacted")).toHaveLength(1);
       expect(await active.captureFullScrollback()).not.toContain("Context compacted.");
       // Plain turns have nothing to summarize, but the earlier message may set

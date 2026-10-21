@@ -84,6 +84,9 @@ pub fn appendLine(
     errdefer out.shrinkRetainingCapacity(start);
     try schema.appendHeader(gpa, out, seq, ts_ms, kind);
     try out.appendSlice(gpa, body);
+    if (kind != .snapshot and std.mem.find(u8, body, "\"record\":\"") == null) {
+        try out.print(gpa, ",\"private\":[{{\"kind\":\"model_context\",\"data\":{{\"record\":\"{s}\",\"body\":{{}}}}}}]", .{@tagName(kind)});
+    }
     try sealFrame(gpa, out, start);
 }
 
@@ -322,7 +325,8 @@ pub const Log = struct {
 
     /// Appends a batch of complete lines framed by `appendLine`, with seqs
     /// starting at `next_seq`. Release builds write the batch with one call.
-    /// A failed write leaves the log down: the next open repairs the tail.
+    /// A failed write leaves the log down. Close tries to cut its partial
+    /// tail; the next open still repairs it when that truncation fails.
     pub fn append(log: *Log, batch: []const u8, line_count: u64) AppendError!void {
         if (log.status != .open or log.access != .read_write) return error.NotWritable;
         std.debug.assert(batch.len > 0 and batch[batch.len - 1] == '\n');
@@ -357,6 +361,7 @@ pub const Log = struct {
     }
 
     pub fn close(log: *Log) void {
+        if (log.status == .down and log.access == .read_write) log.s.setLength(log.file, log.end) catch {};
         log.s.closeFile(log.file);
         log.status = .down;
     }
@@ -681,7 +686,7 @@ test "a framed line checks, and its body comes back" {
     try frameOne(&out, 3, .turn_committed, ",\"turn\":2");
     const h = try checkLine(out.items);
     try testing.expectEqual(@as(u64, 3), h.seq);
-    try testing.expectEqualStrings(",\"turn\":2", lineBody(out.items, h));
+    try testing.expect(std.mem.startsWith(u8, lineBody(out.items, h), ",\"turn\":2"));
     try testing.expect(std.mem.endsWith(u8, out.items, "\"}\n"));
     // The line is still valid JSON.
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out.items, .{});

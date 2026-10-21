@@ -11,6 +11,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { decodeLogLine } from "./saved-sessions";
 import {
   fakeGatewayFinalText,
   fakeGatewaySse,
@@ -975,8 +976,8 @@ describe("ultrafast fake Gateway", () => {
           expect(body).toContain("ULTRA_CHILD_1");
         }
         expect(childBodies[2]).toContain("ULTRA_CHILD_2");
-        const log = readFileSync(join(root.home, ".fx", "sessions", "v2", sessionId!, "log.jsonl"), "utf8")
-          .trimEnd().split("\n").map((line) => JSON.parse(line));
+        const log = readFileSync(join(root.home, ".fx", "sessions", "v3", sessionId!, "log.jsonl"), "utf8")
+          .trimEnd().split("\n").map(decodeLogLine);
         const spawned = log.filter((line) => line.kind === "child_spawned");
         expect(spawned).toHaveLength(3);
         expect(new Set(spawned.map((line) => line.child)).size).toBe(1);

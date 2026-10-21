@@ -279,7 +279,7 @@ async function seedRealSession(paths: Paths, config: Config): Promise<IndexedSum
     origin_workspace_root: created.workspace,
     conversation_language: "en",
     title: REAL_TITLE,
-    history_len: lines.filter((line) => line.kind === "turn_committed" || line.kind === "turn_interrupted").length,
+    history_len: lines.filter((line) => (line.private?.[0]?.data?.record ?? line.legacy_kind ?? line.kind) === "turn_committed" || (line.private?.[0]?.data?.record ?? line.legacy_kind ?? line.kind) === "turn_interrupted").length,
     display_metadata_present: true,
     preview: `${REAL_TITLE}\n50K chat and large tools`,
   };
