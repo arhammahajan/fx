@@ -2378,6 +2378,112 @@ test "cancelling a request wins over its body stall window" {
     try std.testing.expect(body.elapsed_ms < 2_000);
 }
 
+/// TCP keepalive for every watched connection. The gateway sends nothing while
+/// a model thinks, so silence alone cannot tell a thinking model from a
+/// connection whose server end is gone, and the stall window waits ten
+/// minutes. A live peer's kernel answers keepalive probes, so they leave a
+/// thinking model alone and turn a dead connection into a failed read: a reset
+/// at the first probe after the network returns, or `ConnectionTimedOut` once
+/// every probe goes unanswered. Both are retried like any dropped stream.
+const dead_peer_probe = struct {
+    /// Silence before the first probe.
+    const idle_s: c_int = 15;
+    /// Time between probes, and the longest a reset waits after the network
+    /// returns.
+    const interval_s: c_int = 5;
+    /// Unanswered probes before the read fails: 15 s + 6 x 5 s = 45 s.
+    const count: c_int = 6;
+};
+
+const SocketOption = struct { level: i32, name: u32, value: c_int };
+
+/// The socket options that turn on dead-peer probes for the target OS. Other
+/// targets get none and keep only the stall window.
+const dead_peer_probe_options: []const SocketOption = switch (builtin.target.os.tag) {
+    .macos => &.{
+        .{ .level = std.posix.SOL.SOCKET, .name = std.posix.SO.KEEPALIVE, .value = 1 },
+        .{ .level = std.posix.IPPROTO.TCP, .name = std.posix.TCP.KEEPALIVE, .value = dead_peer_probe.idle_s },
+        .{ .level = std.posix.IPPROTO.TCP, .name = std.posix.TCP.KEEPINTVL, .value = dead_peer_probe.interval_s },
+        .{ .level = std.posix.IPPROTO.TCP, .name = std.posix.TCP.KEEPCNT, .value = dead_peer_probe.count },
+    },
+    .linux => &.{
+        .{ .level = std.posix.SOL.SOCKET, .name = std.posix.SO.KEEPALIVE, .value = 1 },
+        .{ .level = std.posix.IPPROTO.TCP, .name = std.posix.TCP.KEEPIDLE, .value = dead_peer_probe.idle_s },
+        .{ .level = std.posix.IPPROTO.TCP, .name = std.posix.TCP.KEEPINTVL, .value = dead_peer_probe.interval_s },
+        .{ .level = std.posix.IPPROTO.TCP, .name = std.posix.TCP.KEEPCNT, .value = dead_peer_probe.count },
+    },
+    else => &.{},
+};
+
+const DeadPeerProbeRefusal = struct { name: u32, errno: std.posix.E };
+
+/// Applies `dead_peer_probe_options` to a socket. Returns the first option the
+/// kernel refused, or null; after a refusal the connection keeps only the
+/// stall window, as before. Calls the system directly because
+/// `std.posix.setsockopt` treats `EINVAL` as unreachable, and macOS returns
+/// `EINVAL` for a socket whose peer already reset it.
+fn enableDeadPeerProbes(handle: std.posix.socket_t) ?DeadPeerProbeRefusal {
+    inline for (dead_peer_probe_options) |option| {
+        const value: c_int = option.value;
+        const bytes = std.mem.asBytes(&value);
+        while (true) switch (std.posix.errno(std.posix.system.setsockopt(
+            handle,
+            option.level,
+            option.name,
+            bytes.ptr,
+            @intCast(bytes.len),
+        ))) {
+            .SUCCESS => break,
+            .INTR => continue,
+            else => |errno| return .{ .name = option.name, .errno = errno },
+        };
+    }
+    return null;
+}
+
+test "dead-peer probes report a dead connection long before the stall window" {
+    const bound_ms = (dead_peer_probe.idle_s + dead_peer_probe.interval_s * dead_peer_probe.count) * std.time.ms_per_s;
+    try std.testing.expect(bound_ms < agent_stream_stall_timeout_ms);
+}
+
+test "a watched model connection probes for a dead peer" {
+    if (dead_peer_probe_options.len == 0) return error.SkipZigTest;
+    var server: SilentBodyServer = .{ .server = undefined, .events = 0, .gap_ms = 0, .close = false };
+    try server.start();
+    defer server.stop();
+    const zio = io_mod.getIo();
+    const address = std.Io.net.IpAddress{ .ip4 = .loopback(server.server.socket.address.getPort()) };
+    var stream = try address.connect(zio, .{ .mode = .stream });
+    defer stream.close(zio);
+    var cancel = std.atomic.Value(bool).init(false);
+    var watch: ConnectionWatch = .init(.{ .patient = true, .stall_timeout_ms = ConnectionWatch.bodyStallTimeoutMs(null) });
+    defer watch.stop();
+    try watch.start(&cancel, null, stream);
+    inline for (dead_peer_probe_options) |option| {
+        var value: c_int = 0;
+        var len: std.posix.socklen_t = @sizeOf(c_int);
+        try std.testing.expectEqual(std.posix.E.SUCCESS, std.posix.errno(std.posix.system.getsockopt(
+            stream.socket.handle,
+            option.level,
+            option.name,
+            std.mem.asBytes(&value).ptr,
+            &len,
+        )));
+        // BSD reports a set flag as its bit, not as 1.
+        if (option.value == 1) try std.testing.expect(value != 0) else try std.testing.expectEqual(option.value, value);
+    }
+}
+
+test "a refused probe option is reported instead of failing the request" {
+    if (dead_peer_probe_options.len == 0) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(std.testing.io, "not-a-socket", .{});
+    defer file.close(std.testing.io);
+    const refusal = enableDeadPeerProbes(file.handle) orelse return error.TestExpectedRefusal;
+    try std.testing.expectEqual(std.posix.E.NOTSOCK, refusal.errno);
+}
+
 fn spawn_gateway_cancel_watcher(
     done: *std.atomic.Value(bool),
     cancel_flag: *std.atomic.Value(bool),
@@ -2388,6 +2494,9 @@ fn spawn_gateway_cancel_watcher(
 ) !std.Thread {
     if (builtin.is_test) {
         if (test_cancel_watcher_spawn_error) |err| return err;
+    }
+    if (enableDeadPeerProbes(stream.socket.handle)) |refusal| {
+        debug_trace.logf("gateway", "event=dead_peer_probe_unavailable option={d} errno={d}", .{ refusal.name, @backingInt(refusal.errno) });
     }
     return std.Thread.spawn(.{}, GatewayCancelWatcher.run, .{
         done,
