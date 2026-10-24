@@ -5,14 +5,12 @@ const auth_runtime = @import("../../core/auth/auth_runtime.zig");
 const activity_status = @import("../../core/output/activity_status.zig");
 const model_cache_runtime = @import("../../core/app/model_cache_runtime.zig");
 const app_mcp_runtime = @import("../../core/app/app_mcp_runtime.zig");
-const mcp_health = @import("../../core/mcp/health.zig");
-const mcp_menu_state = @import("../../core/mcp/menu_state.zig");
 const mcp_host_menu_presentation = @import("mcp_host_menu_presentation.zig");
-const mcp_runtime = @import("../../core/mcp/mcp_runtime.zig");
 const picker_state = @import("../../core/input/picker_state.zig");
 const session_adapter = @import("../../core/session/session_adapter.zig");
 const session_catalog = @import("../../core/session/session_catalog.zig");
 const session_store = @import("../../core/session/session_store.zig");
+const info_panel_presentation = @import("info_panel_presentation.zig");
 const usage_presentation = @import("usage_presentation.zig");
 const command_specs = @import("../../core/slash_commands/command_specs.zig");
 const settings_catalog = @import("../../core/config/settings_catalog.zig");
@@ -25,6 +23,7 @@ const file_index = @import("../../core/workspace/file_index.zig");
 const workspace_menu = @import("../../core/workspace/workspace_menu.zig");
 const activity_runtime = @import("../../core/output/activity_runtime.zig");
 const transcript_presentation = @import("../../core/output/transcript_presentation.zig");
+const info_panel = @import("../../core/input/info_panel.zig");
 const usage_menu = @import("../../core/session/usage_menu.zig");
 const core_input_runtime = @import("../../core/input/runtime.zig");
 const ui_render = @import("../render.zig");
@@ -100,120 +99,6 @@ pub const ModelMenuProjection = struct {
         return model_cache_runtime.modelMenuItemAt(self.items, self.providerFilter(), self.query, display_index);
     }
 };
-
-pub const McpMenuProjection = struct {
-    state: mcp_menu_state.State = .{},
-    servers: []const mcp_health.ServerSnapshot = &.{},
-    tools: []const []const u8 = &.{},
-    resources: []const mcp_runtime.ResourceSummary = &.{},
-    resource_templates: []const mcp_runtime.ResourceSummary = &.{},
-    prompts: []const mcp_runtime.PromptSummary = &.{},
-    configuration_issues: []const mcp_health.ConfigurationIssue = &.{},
-    preview: ?[]const u8 = null,
-    feedback: ?[]const u8 = null,
-    add_name: []const u8 = "",
-    add_target: []const u8 = "",
-    add_arguments: []const u8 = "",
-    add_draft: []const u8 = "",
-    arguments: []const app_mcp_runtime.MenuArgumentField = &.{},
-    argument_draft: []const u8 = "",
-
-    pub fn itemCount(self: McpMenuProjection) usize {
-        return switch (self.state.section) {
-            .servers => self.servers.len,
-            .tools => countMatchingTools(self.tools, self.state.queryText()),
-            .resources => countMatchingResources(
-                self.resources,
-                self.resource_templates,
-                self.state.queryText(),
-            ),
-            .prompts => countMatchingPrompts(self.prompts, self.state.queryText()),
-        };
-    }
-
-    pub fn selectedServer(self: McpMenuProjection) ?*const mcp_health.ServerSnapshot {
-        if (self.state.selected_server_index >= self.servers.len) return null;
-        return &self.servers[self.state.selected_server_index];
-    }
-
-    pub fn resourceAt(self: McpMenuProjection, index: usize) ?*const mcp_runtime.ResourceSummary {
-        var matched: usize = 0;
-        const query = self.state.queryText();
-        for (self.resources) |*item| {
-            if (!resourceMatches(item.*, query)) continue;
-            if (matched == index) return item;
-            matched += 1;
-        }
-        for (self.resource_templates) |*item| {
-            if (!resourceMatches(item.*, query)) continue;
-            if (matched == index) return item;
-            matched += 1;
-        }
-        return null;
-    }
-
-    pub fn toolAt(self: McpMenuProjection, index: usize) ?[]const u8 {
-        var matched: usize = 0;
-        const query = self.state.queryText();
-        for (self.tools) |item| {
-            if (!matches(item, query)) continue;
-            if (matched == index) return item;
-            matched += 1;
-        }
-        return null;
-    }
-
-    pub fn promptAt(self: McpMenuProjection, index: usize) ?*const mcp_runtime.PromptSummary {
-        var matched: usize = 0;
-        const query = self.state.queryText();
-        for (self.prompts) |*item| {
-            if (!promptMatches(item.*, query)) continue;
-            if (matched == index) return item;
-            matched += 1;
-        }
-        return null;
-    }
-};
-
-fn matches(text: []const u8, query: []const u8) bool {
-    return mcp_menu_state.textMatchesQuery(text, query);
-}
-
-fn countMatchingTools(items: []const []const u8, query: []const u8) usize {
-    var count: usize = 0;
-    for (items) |item| count += @intFromBool(matches(item, query));
-    return count;
-}
-
-fn resourceMatches(item: mcp_runtime.ResourceSummary, query: []const u8) bool {
-    return matches(item.uri, query) or
-        matches(item.name, query) or
-        (item.title != null and matches(item.title.?, query)) or
-        (item.description != null and matches(item.description.?, query));
-}
-
-fn countMatchingResources(
-    resources: []const mcp_runtime.ResourceSummary,
-    templates: []const mcp_runtime.ResourceSummary,
-    query: []const u8,
-) usize {
-    var count: usize = 0;
-    for (resources) |item| count += @intFromBool(resourceMatches(item, query));
-    for (templates) |item| count += @intFromBool(resourceMatches(item, query));
-    return count;
-}
-
-fn promptMatches(item: mcp_runtime.PromptSummary, query: []const u8) bool {
-    return matches(item.name, query) or
-        (item.title != null and matches(item.title.?, query)) or
-        (item.description != null and matches(item.description.?, query));
-}
-
-fn countMatchingPrompts(items: []const mcp_runtime.PromptSummary, query: []const u8) usize {
-    var count: usize = 0;
-    for (items) |item| count += @intFromBool(promptMatches(item, query));
-    return count;
-}
 
 pub const SessionMenuProjection = struct {
     active: bool = false,
@@ -348,8 +233,30 @@ pub fn workspaceMenuProjection(
     };
 }
 
+/// A read-only panel such as `/status` opens: its title, its rows, how far
+/// they are scrolled, and whether they do not all fit, so its hint offers ↑↓.
+pub const InfoPanelProjection = struct {
+    active: bool = false,
+    title: []const u8 = "",
+    rows: []const info_panel.Row = &.{},
+    scroll: usize = 0,
+    overflows: bool = false,
+};
+
+pub fn infoPanelProjection(panel: *const info_panel.State, cols: u16, terminal_rows: u16) InfoPanelProjection {
+    var projection: InfoPanelProjection = .{
+        .active = panel.active,
+        .title = panel.title(),
+        .rows = panel.rows(),
+        .scroll = panel.scroll,
+    };
+    projection.overflows = info_panel_presentation.overflows(projection, cols, terminal_rows);
+    return projection;
+}
+
 pub const CompactCommandMenuProjection = union(enum) {
     statusline: StatuslineMenuProjection,
+    info_panel: InfoPanelProjection,
     usage: UsageMenuProjection,
     workspace: WorkspaceMenuProjection,
 };
@@ -467,7 +374,6 @@ pub const RenderContext = struct {
         .include_skip = false,
     },
     skills_menu: SkillsMenuProjection = .{},
-    mcp_menu: McpMenuProjection = .{},
     mcp_host_menu: mcp_host_menu_presentation.Projection = .{},
     help_menu: HelpMenuProjection = .{},
     settings_menu: SettingsMenuProjection = .{},
@@ -475,6 +381,7 @@ pub const RenderContext = struct {
     session_menu: SessionMenuProjection = .{},
     fork_menu: ForkMenuProjection = .{},
     statusline_menu: StatuslineMenuProjection = .{},
+    info_panel: InfoPanelProjection = .{},
     usage_menu: UsageMenuProjection = .{},
     workspace_menu: WorkspaceMenuProjection = .{},
     upgrade_status: []const u8 = "",
@@ -493,6 +400,7 @@ pub const RenderContext = struct {
 
 pub fn activeCompactCommandMenu(ctx: RenderContext) ?CompactCommandMenuProjection {
     if (ctx.statusline_menu.active) return .{ .statusline = ctx.statusline_menu };
+    if (ctx.info_panel.active) return .{ .info_panel = ctx.info_panel };
     if (ctx.usage_menu.active) return .{ .usage = ctx.usage_menu };
     if (ctx.workspace_menu.active) return .{ .workspace = ctx.workspace_menu };
     return null;

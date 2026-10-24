@@ -246,6 +246,10 @@ pub const ToolLifecycleEvent = union(enum) {
         activity_kind: ToolActivityKind,
         arguments_json: ?[]const u8 = null,
         place_after_current_transcript: bool = false,
+        /// The call's `ToolCall.resolved_display_target`, for hosts that
+        /// title a call when it starts. Borrowed for this push only; copies
+        /// omit it.
+        resolved_display_target: ?[]const u8 = null,
     },
     progress: struct {
         id: ToolLifecycleId,
@@ -333,6 +337,9 @@ pub const ModelRecoveryAction = enum {
     /// Silence detected; checking liveness before doing anything else.
     checking_liveness,
     paused,
+    /// The final reply finished before its turn was saved as done; recovery
+    /// delivers that saved reply without another model request.
+    delivering_response,
 };
 
 pub const ModelRecoveryRequiredAction = enum {
@@ -551,6 +558,7 @@ pub const RouteRecoveryStatus = struct {
             .waiting_for_connectivity => "waiting for connection",
             .checking_liveness => "checking the connection",
             .paused => "recovery paused",
+            .delivering_response => "delivering saved response",
         };
         // Connectivity waits and liveness probes are un-budgeted: no attempt
         // counter and no raw error names, just the honest current state.
@@ -953,6 +961,10 @@ pub const ToolCall = struct {
     provenance: ToolExecutionProvenance = .fx_local,
     /// Borrowed only for this action. Copies and durable/provider encodings omit it.
     resolved_skill: ?*const skill_contract.PreparedSkill = null,
+    /// What this action works on, resolved from earlier results, such as the
+    /// command whose saved output a `read_tool_result` call reads. Borrowed
+    /// only for this action. Copies and durable/provider encodings omit it.
+    resolved_display_target: ?[]const u8 = null,
 };
 
 pub const WebSearchProgress = union(enum) {
@@ -1306,11 +1318,23 @@ pub const ExecutionMemory = struct {
 
 /// Image bytes returned by a tool; never a grant to read a user file.
 pub const ToolImage = struct {
-    /// Owned encoded bytes; empty only when a valid source_ref is present.
+    /// Owned encoded bytes; empty only when a valid source_ref is present, or
+    /// when the session dropped the image (`droppedFromSession`).
     data: []u8,
     mime_type: []u8,
     /// Owned opaque host reference, never filesystem or network authority.
     source_ref: ?[]u8 = null,
+    /// The image's name in a libfx host's store, the lowercase hex SHA-256
+    /// of its decoded bytes, when the host stored them before it sent the
+    /// result. Writers that name stored images write this instead of `data`.
+    name: ?[64]u8 = null,
+
+    /// Whether the session no longer holds this image: a libfx session with
+    /// an image store keeps only its newest images, and an older one keeps
+    /// its name, without its bytes.
+    pub fn droppedFromSession(self: ToolImage) bool {
+        return self.data.len == 0 and self.name != null;
+    }
 };
 
 pub fn freeToolImages(alloc: std.mem.Allocator, images: []const ToolImage) void {
@@ -1342,6 +1366,7 @@ pub fn dupeToolImages(alloc: std.mem.Allocator, images: []const ToolImage) ![]To
             .data = data,
             .mime_type = mime_type,
             .source_ref = if (image.source_ref) |source_ref| try alloc.dupe(u8, source_ref) else null,
+            .name = image.name,
         };
         initialized += 1;
     }
@@ -1494,6 +1519,20 @@ pub const ImageAttachment = struct {
     inline_data: ?[]u8 = null,
     /// Owned opaque host reference, never filesystem or network authority.
     source_ref: ?[]u8 = null,
+    /// Owned path of the v2 session's blob that holds these bytes (D89),
+    /// which the model's note names so its tools can open the image. An
+    /// image saved as a blob keeps only this handle: readers load its bytes
+    /// from the blob when they need them, checked against its digest. The
+    /// session store owns the file: fx never writes or deletes through this
+    /// path.
+    blob_path: ?[]u8 = null,
+
+    /// Whether the session no longer holds this image: a libfx session with
+    /// an image store keeps only its newest images, and an older one keeps
+    /// its digest, which names it in the host's store, without its bytes.
+    pub fn droppedFromSession(self: ImageAttachment) bool {
+        return self.inline_data == null and self.snapshot_path == null and self.blob_path == null and self.snapshot_sha256 != null;
+    }
 };
 
 pub const UserTurn = struct {
@@ -3080,12 +3119,19 @@ test "dupeToolCall preserves argument integrity" {
     try std.testing.expectEqual(ToolArgumentIntegrity.malformed_json, copy.argument_integrity);
 }
 
-test "dupeToolCall drops action scoped skill bindings" {
+test "dupeToolCall drops action scoped bindings" {
     const skill: skill_contract.PreparedSkill = .{ .skill = .{ .name = "workflow", .description = "", .path = "/skills/workflow", .source = .global_fx } };
-    const source: ToolCall = .{ .id = "skill", .name = "skill", .arguments_json = "{\"location\":\"/skills/workflow\"}", .resolved_skill = &skill };
+    const source: ToolCall = .{
+        .id = "skill",
+        .name = "skill",
+        .arguments_json = "{\"location\":\"/skills/workflow\"}",
+        .resolved_skill = &skill,
+        .resolved_display_target = "more output from zig build test",
+    };
     const copy = try dupeToolCall(std.testing.allocator, source);
     defer freeToolCall(std.testing.allocator, copy);
     try std.testing.expect(copy.resolved_skill == null);
+    try std.testing.expect(copy.resolved_display_target == null);
     try std.testing.expectEqualStrings(source.arguments_json, copy.arguments_json);
 }
 
@@ -3216,13 +3262,13 @@ fn fuzzToolArgumentDiagnostic(_: void, smith: *std.testing.Smith) anyerror!void 
 
 test "fuzz tool argument diagnostic" {
     try std.testing.fuzz({}, fuzzToolArgumentDiagnostic, .{
-        .corpus = &.{
+        .corpus = &(@import("fuzz_seed").slices(.{
             "{\"request\":{\"task\":\"cut",
             "{\"a\":1,}",
             "{\"a\":1,\"a\":2}",
             "{\"t\":\"\xc3\xa9\xe2\x82",
             "\xff\x00{",
-        },
+        }) ++ @import("fuzz_corpus").tool_argument_diagnostic.*),
     });
 }
 
@@ -3263,45 +3309,57 @@ pub fn dupeImageAttachmentSlice(alloc: std.mem.Allocator, attachments: []const I
     }
 
     for (attachments, 0..) |attachment, i| {
-        const path = try alloc.dupe(u8, attachment.path);
-        errdefer alloc.free(path);
-
-        const media_type = try alloc.dupe(u8, attachment.media_type);
-        errdefer alloc.free(media_type);
-
-        const snapshot_path = if (attachment.snapshot_path) |value|
-            try alloc.dupe(u8, value)
-        else
-            null;
-        errdefer if (snapshot_path) |value| alloc.free(value);
-
-        const snapshot_sha256 = if (attachment.snapshot_sha256) |value|
-            try alloc.dupe(u8, value)
-        else
-            null;
-        errdefer if (snapshot_sha256) |value| alloc.free(value);
-
-        const inline_data = if (attachment.inline_data) |value|
-            try alloc.dupe(u8, value)
-        else
-            null;
-        errdefer if (inline_data) |value| alloc.free(value);
-        const source_ref = if (attachment.source_ref) |value|
-            try alloc.dupe(u8, value)
-        else
-            null;
-        copy[i] = .{
-            .id = attachment.id,
-            .path = path,
-            .media_type = media_type,
-            .snapshot_path = snapshot_path,
-            .snapshot_sha256 = snapshot_sha256,
-            .inline_data = inline_data,
-            .source_ref = source_ref,
-        };
+        copy[i] = try dupeImageAttachment(alloc, attachment);
         copied += 1;
     }
     return copy;
+}
+
+/// A copy of `attachment` that owns every field it has; free it with
+/// `freeImageAttachment`.
+pub fn dupeImageAttachment(alloc: std.mem.Allocator, attachment: ImageAttachment) !ImageAttachment {
+    const path = try alloc.dupe(u8, attachment.path);
+    errdefer alloc.free(path);
+
+    const media_type = try alloc.dupe(u8, attachment.media_type);
+    errdefer alloc.free(media_type);
+
+    const snapshot_path = if (attachment.snapshot_path) |value|
+        try alloc.dupe(u8, value)
+    else
+        null;
+    errdefer if (snapshot_path) |value| alloc.free(value);
+
+    const snapshot_sha256 = if (attachment.snapshot_sha256) |value|
+        try alloc.dupe(u8, value)
+    else
+        null;
+    errdefer if (snapshot_sha256) |value| alloc.free(value);
+
+    const inline_data = if (attachment.inline_data) |value|
+        try alloc.dupe(u8, value)
+    else
+        null;
+    errdefer if (inline_data) |value| alloc.free(value);
+    const source_ref = if (attachment.source_ref) |value|
+        try alloc.dupe(u8, value)
+    else
+        null;
+    errdefer if (source_ref) |value| alloc.free(value);
+    const blob_path = if (attachment.blob_path) |value|
+        try alloc.dupe(u8, value)
+    else
+        null;
+    return .{
+        .id = attachment.id,
+        .path = path,
+        .media_type = media_type,
+        .snapshot_path = snapshot_path,
+        .snapshot_sha256 = snapshot_sha256,
+        .inline_data = inline_data,
+        .source_ref = source_ref,
+        .blob_path = blob_path,
+    };
 }
 
 /// Frees the owned fields in one attachment; caller owns any containing storage.
@@ -3312,6 +3370,7 @@ pub fn freeImageAttachment(alloc: std.mem.Allocator, attachment: ImageAttachment
     if (attachment.snapshot_sha256) |sha256| alloc.free(sha256);
     if (attachment.inline_data) |data| alloc.free(data);
     if (attachment.source_ref) |source_ref| alloc.free(source_ref);
+    if (attachment.blob_path) |path| alloc.free(path);
 }
 
 pub fn freeImageAttachmentSlice(alloc: std.mem.Allocator, attachments: []ImageAttachment) void {
@@ -3603,6 +3662,29 @@ test "ImageAttachment helpers duplicate empty and populated slices" {
 
     freeImageAttachmentSlice(alloc, copy);
     freeImageAttachmentSlice(alloc, originals);
+}
+
+test "dupeImageAttachment frees path when media_type allocation fails" {
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 1 });
+    try std.testing.expectError(error.OutOfMemory, dupeImageAttachment(failing.allocator(), .{
+        .path = @constCast("/tmp/a.png"),
+        .media_type = @constCast("image/png"),
+    }));
+}
+
+test "dupeImageAttachment preserves stable image id" {
+    const alloc = std.testing.allocator;
+    const copy = try dupeImageAttachment(alloc, .{
+        .id = 41,
+        .path = @constCast("/tmp/a.png"),
+        .media_type = @constCast("image/png"),
+    });
+    defer {
+        alloc.free(copy.path);
+        alloc.free(copy.media_type);
+    }
+
+    try std.testing.expectEqual(@as(usize, 41), copy.id);
 }
 
 test "ImageAttachment source references clone independently and clean up allocation failures" {

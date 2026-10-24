@@ -5,10 +5,10 @@
 //
 //   node sdk/tests/test-durable-core.mjs [memory|local|world|queue]
 import { strict as assert } from "node:assert";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createDurableAgentFactory, foldSessionLog, memory, wakeHandler } from "../durable.js";
+import { createDurableAgentFactory, extendLogView, foldSessionLog, handoffEntries, memory, wakeHandler } from "../durable.js";
 import { world } from "../durable/world.mjs";
 
 const durabilityKind = process.argv[2] || "memory";
@@ -234,6 +234,12 @@ async function durabilityFor(options = {}) {
   if (durabilityKind === "memory") return memory(options);
   const dir = await mkdtemp(join(tmpdir(), "libfx-core-"));
   dirs.push(dir);
+  return durabilityAt(dir, options);
+}
+
+// A durability of this run's kind on `dir`: each call is another server on
+// the same store.
+async function durabilityAt(dir, options = {}) {
   // A queue-held lease needs a deadline: a function's, ten minutes away.
   if (durabilityKind === "queue") return (await queueWorldAt(dir, { queueLeases: true, maxDurationMs: 600_000, ...options })).durability;
   return durabilityKind === "world" ? appWorldAt(dir, options) : local({ dir, ...options });
@@ -964,6 +970,48 @@ if (durabilityKind === "queue") {
       await agent.close();
     }
   });
+
+  test("an image prompt run in the request reads its image from the store, and no queued copy holds it", async () => {
+    const internals = (agent) => agent[Symbol.for("libfx.durableInternals")];
+    for (const maxDurationMs of [60_000, 300]) {
+      const dir = await mkdtemp(join(tmpdir(), "libfx-in-request-image-"));
+      dirs.push(dir);
+      const waited = [];
+      const { durability, broker } = await queueWorldAt(dir, { queueLeases: true, runInRequest: true, maxDurationMs, reserveMs: 100, waitUntil: (work) => waited.push(work) });
+      const { agent, seen } = recordingAgent(durability);
+      const session = agent.session();
+      // With the short deadline, a step outlasts the request.
+      if (maxDurationMs < 1000) {
+        const slow = holdStep("image-1");
+        void slow.holding.then(() => setTimeout(slow.release, 600));
+      }
+      const messageId = `turn-image-${maxDurationMs}`;
+      const turn = session.prompt([{ type: "text", text: "look" }, image], { messageId });
+      assert.equal((await turn.result).stopReason, "end_turn");
+      assert.equal(waited.length, 1, "the request ran the turn");
+      assert.deepEqual(seen, [[{ type: "text", text: "look" }, image]], "with its image, read once");
+      const sent = broker.sent.filter((message) => message.payload?.input?.messageId === messageId);
+      assert.equal(sent[0].attempt, 0, "the backstop waited");
+      if (maxDurationMs < 1000) assert.ok(sent.length > 1, "a turn longer than the request went on in a fresh message");
+      for (const message of sent) {
+        const payload = JSON.stringify(message.payload);
+        assert.ok(!payload.includes(png), "a queued copy holds none of the image");
+      }
+      await waited[0];
+      for (let tries = 0; internals(agent).liveWorkers() > 0; tries += 1) {
+        assert.ok(tries < 200, "the request's worker never let go");
+        await sleep(10);
+      }
+      // The backstop, delivered at last, runs nothing.
+      broker.lapse(sent[0]);
+      for (let tries = 0; broker.held(() => true).some((message) => message.id === sent[0].id); tries += 1) {
+        assert.ok(tries < 200, "the backstop was never acknowledged");
+        await sleep(10);
+      }
+      assert.equal(seen.length, 1, "the backstop ran nothing");
+      await agent.close();
+    }
+  });
 }
 
 test("a reconnect reads the stream from its cursor's line, not its start", async () => {
@@ -1050,6 +1098,421 @@ test("each prompt's turn runs with its session object's settings, resumed or not
   assert.throws(() => strict.session(undefined, { model: "nope" }), /^TypeError: no such model$/);
   await strict.close();
   await agent.close();
+});
+
+// A real 1x1 PNG, as a caller would send it.
+const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jP0cAAAAASUVORK5CYII=";
+const pngBytes = Uint8Array.from(atob(png), (char) => char.charCodeAt(0));
+const image = { type: "image", data: png, mimeType: "image/png" };
+// An image block of its own: the PNG with byte `n` after it, so its name is
+// new and storing it writes it.
+const imageOf = (n) => ({ type: "image", data: Buffer.from([...pngBytes, n]).toString("base64"), mimeType: "image/png" });
+// An agent whose harness records each prompt input it is handed, and runs an
+// image prompt as the word "image"; with `refuseFirst`, its first prompt
+// throws, as a harness that cannot run a turn does.
+function recordingAgent(durability, { refuseFirst = false } = {}) {
+  const seen = [];
+  let refusals = refuseFirst ? 1 : 0;
+  const agent = createDurableAgentFactory({
+    harness: () => {
+      const base = scriptedHarness()();
+      return {
+        open: async (options) => {
+          const session = await base.open(options);
+          return {
+            ...session,
+            prompt: (input, opts) => {
+              seen.push(input);
+              if (refusals > 0) {
+                refusals -= 1;
+                throw new Error("the harness stopped");
+              }
+              return session.prompt(typeof input === "string" ? input : "image", opts);
+            },
+            get openTurn() { return session.openTurn; },
+          };
+        },
+      };
+    },
+    defaultDurability: async () => memory(),
+  })({ durability });
+  return { agent, seen };
+}
+const kinds = (seen) => seen.map((input) => (typeof input === "string" ? input : "image"));
+
+test("a durable prompt carries image data as base64: bytes and files throw from prompt(), and nothing is queued", async () => {
+  const { agent, seen } = recordingAgent(await durabilityFor());
+  const session = agent.session();
+  const refused = [
+    { type: "image", data: 42, mimeType: "image/png" },
+    { type: "image", data: new Uint8Array(pngBytes), mimeType: "image/png" },
+    { type: "image", data: new Uint8Array(pngBytes).buffer, mimeType: "image/png" },
+    { type: "image", data: new Blob([pngBytes], { type: "image/png" }) },
+    { type: "image", data: new File([pngBytes], "shot.png", { type: "image/png" }) },
+  ];
+  for (const block of refused) {
+    assert.throws(
+      () => session.prompt([{ type: "text", text: "look" }, block]),
+      (error) => error instanceof TypeError && /^a durable prompt carries image data as a base64 string$/.test(error.message),
+    );
+  }
+  const turn = session.prompt([{ type: "text", text: "look" }, image, { ...image, sourceRef: "uploads:shot" }]);
+  assert.equal((await turn.result).stopReason, "end_turn");
+  assert.deepEqual(seen, [[{ type: "text", text: "look" }, image, { ...image, sourceRef: "uploads:shot" }]], "base64 passes as given");
+  await agent.close();
+});
+
+test("a prompt storing its image is stored before the prompts made after it, and a failed image write stores nothing", async () => {
+  const fault = { writeMs: 150 };
+  const { agent, seen } = recordingAgent(faultyImages(await durabilityFor(), fault));
+  const session = agent.session();
+  const first = session.prompt([imageOf(1)]);
+  const second = session.prompt("second");
+  assert.deepEqual([(await first.result).stopReason, (await second.result).stopReason], ["end_turn", "end_turn"]);
+  assert.deepEqual(kinds(seen), ["image", "second"]);
+  fault.failWrites = 1;
+  const failing = session.prompt([imageOf(2)]);
+  const after = session.prompt("after");
+  await assert.rejects(failing.accepted, /^Error: the store is full$/);
+  await assert.rejects(failing.result, /^Error: the store is full$/);
+  assert.equal((await after.result).stopReason, "end_turn");
+  assert.deepEqual(kinds(seen), ["image", "second", "after"], "the failed write stored no turn, and the prompt behind it ran");
+  await agent.close();
+});
+
+test("a prompt's signal or the agent closing while its image is stored keeps its turn from running", async () => {
+  const fault = { writeMs: 400 };
+  const { agent, seen } = recordingAgent(faultyImages(await durabilityFor(), fault));
+  const session = agent.session();
+  const controller = new AbortController();
+  const cancelled = session.prompt([imageOf(3)], { messageId: "turn-store", signal: controller.signal });
+  await sleep(20);
+  const aborted = Date.now();
+  controller.abort();
+  await cancelled.accepted;
+  assert.equal((await cancelled.result).stopReason, "cancelled");
+  assert.ok(Date.now() - aborted < 300, "the prompt stopped waiting for its image write at once");
+  // Neither the prompt nor a cancel naming it was stored: its id runs anew.
+  assert.equal((await session.prompt("after", { messageId: "turn-store" }).result).stopReason, "end_turn");
+  assert.deepEqual(kinds(seen), ["after"]);
+  fault.writeMs = 150;
+  const closing = session.prompt([imageOf(4)]);
+  await agent.close();
+  await assert.rejects(closing.accepted, /agent is closed/);
+  await assert.rejects(closing.result, /agent is closed/);
+  assert.deepEqual(kinds(seen), ["after"]);
+});
+
+test("a prompt withdrawn while it waits keeps the prompts behind it waiting for the ones before it", async () => {
+  const { agent, seen } = recordingAgent(faultyImages(await durabilityFor(), { writeMs: 300 }));
+  const session = agent.session();
+  const first = session.prompt([imageOf(5)], { messageId: "turn-first" });
+  const controller = new AbortController();
+  const second = session.prompt([imageOf(6)], { messageId: "turn-second", signal: controller.signal });
+  const third = session.prompt("third", { messageId: "turn-third" });
+  await sleep(20);
+  controller.abort();
+  assert.equal((await second.result).stopReason, "cancelled");
+  assert.equal((await first.result).stopReason, "end_turn");
+  assert.equal((await third.result).stopReason, "end_turn");
+  assert.deepEqual(kinds(seen), ["image", "third"], "the prompt behind the withdrawn one still came after the one before it");
+  await agent.close();
+});
+
+test("an image prompt its first worker could not start runs from the log with the same base64, once", async () => {
+  const { agent, seen } = recordingAgent(await durabilityFor(), { refuseFirst: true });
+  const session = agent.session();
+  const shot = { ...image, sourceRef: "uploads:shot" };
+  assert.equal((await session.prompt([shot], { messageId: "turn-img" }).result).stopReason, "end_turn");
+  assert.deepEqual(seen, [[shot], [shot]]);
+  const again = await agent.session(session.id).prompt([shot], { messageId: "turn-img" }).result;
+  assert.equal(again.repeated, true);
+  assert.equal(seen.length, 2, "the retry ran nothing");
+  await agent.close();
+});
+
+test("an image block is read once, so the log holds what was checked", async () => {
+  const { agent, seen } = recordingAgent(await durabilityFor());
+  const session = agent.session();
+  // Accessors that answer one way when checked and another way after.
+  let dataReads = 0;
+  let mimeReads = 0;
+  const shifting = {
+    type: "image",
+    get data() { dataReads += 1; return dataReads === 1 ? png : new Uint8Array([1, 2, 3]); },
+    mimeType: "image/png",
+    sourceRef: "uploads:shifting",
+  };
+  const relabelled = {
+    type: "image",
+    data: png,
+    get mimeType() { mimeReads += 1; return mimeReads === 1 ? "image/png" : undefined; },
+  };
+  assert.equal((await session.prompt([{ type: "text", text: "look" }, shifting, relabelled]).result).stopReason, "end_turn");
+  assert.deepEqual(seen.at(-1), [{ type: "text", text: "look" }, { ...image, sourceRef: "uploads:shifting" }, image]);
+  assert.deepEqual([dataReads, mimeReads], [1, 1]);
+  // An Array subclass whose map() returns something else still stores its blocks.
+  class Remapped extends Array { map() { return "not the caller's blocks"; } }
+  const blocks = Remapped.from([{ type: "text", text: "remapped" }, image]);
+  assert.equal((await session.prompt(blocks).result).stopReason, "end_turn");
+  assert.deepEqual(seen.at(-1), [{ type: "text", text: "remapped" }, image]);
+  await agent.close();
+});
+
+const pngName = Buffer.from(await crypto.subtle.digest("SHA-256", pngBytes)).toString("hex");
+// Every image stream's name holds this: "_user_", then the base64url of the
+// namespace "libfx-image-".
+const imageStreamTag = `_user_${Buffer.from("libfx-image-").toString("base64url")}`;
+
+// The durability with a faulty image store: with `fault.lose`, every image
+// reads back as missing; with `fault.corrupt`, every image reads back with
+// its last byte changed; `fault.failWrites` fails that many image writes;
+// `fault.writeMs` makes each image write wait that long first. The test may
+// change `fault` as it goes. A World's faults are in its streams, under the
+// code that names images.
+function faultyImages(durability, fault = {}) {
+  fault.failWrites ??= 0;
+  const slowly = async () => { if (fault.writeMs) await sleep(fault.writeMs); };
+  const refuse = () => {
+    fault.failWrites -= 1;
+    throw new Error("the store is full");
+  };
+  const flipped = (bytes) => {
+    if (!(bytes instanceof Uint8Array) || bytes.byteLength === 0) return bytes;
+    const copy = bytes.slice();
+    copy[copy.length - 1] ^= 0xff;
+    return copy;
+  };
+  if (typeof durability.create === "function") {
+    return {
+      ...durability,
+      create() {
+        const backend = durability.create();
+        return {
+          ...backend,
+          async session(id) {
+            const log = await backend.session(id);
+            return {
+              ...log,
+              images: {
+                put: async (name, bytes) => {
+                  await slowly();
+                  return fault.failWrites > 0 ? refuse() : log.images.put(name, bytes);
+                },
+                get: async (name) => {
+                  if (fault.lose) return undefined;
+                  const bytes = await log.images.get(name);
+                  return fault.corrupt ? flipped(bytes) : bytes;
+                },
+              },
+            };
+          },
+        };
+      },
+    };
+  }
+  const isImage = (name) => String(name).includes(imageStreamTag);
+  const bound = (target, value) => (typeof value === "function" ? value.bind(target) : value);
+  return {
+    ...durability,
+    async world() {
+      const world = await durability.world();
+      const streams = new Proxy(world.streams, {
+        get(target, prop) {
+          const value = Reflect.get(target, prop);
+          if (prop === "write") {
+            return async (runId, name, chunk) => {
+              if (!isImage(name)) return value.call(target, runId, name, chunk);
+              await slowly();
+              return fault.failWrites > 0 ? refuse() : value.call(target, runId, name, chunk);
+            };
+          }
+          if (prop === "getChunks") {
+            return async (runId, name, options) => {
+              if (fault.lose && isImage(name)) return { data: [], cursor: null, hasMore: false, done: false };
+              const result = await value.call(target, runId, name, options);
+              if (!fault.corrupt || !isImage(name) || !Array.isArray(result?.data)) return result;
+              return { ...result, data: result.data.map((chunk) => ({ ...chunk, data: flipped(chunk?.data) })) };
+            };
+          }
+          return bound(target, value);
+        },
+      });
+      return new Proxy(world, { get: (target, prop) => (prop === "streams" ? streams : bound(target, Reflect.get(target, prop))) });
+    },
+  };
+}
+
+// Every file under a World's folder, for checking what it stored. A lock or
+// temporary file gone by the time it is read is skipped.
+async function filesUnder(dir) {
+  const files = [];
+  for (const entry of await readdir(dir, { withFileTypes: true, recursive: true })) {
+    if (!entry.isFile()) continue;
+    try {
+      files.push(await readFile(join(entry.parentPath ?? entry.path, entry.name)));
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+  }
+  return files;
+}
+
+test("a durable prompt stores each image once in the session's image store, and the log only names it", async () => {
+  const durability = await durabilityFor();
+  const { agent, seen } = recordingAgent(durability);
+  const session = agent.session();
+  const turn = session.prompt([
+    { type: "text", text: "look" },
+    image,
+    { ...image, sourceRef: "uploads:shot" },
+    image,
+  ]);
+  assert.equal((await turn.result).stopReason, "end_turn");
+  assert.deepEqual(seen, [[{ type: "text", text: "look" }, image, { ...image, sourceRef: "uploads:shot" }, image]]);
+  if (typeof durability.create === "function") {
+    const log = await durability.create().session(session.id);
+    const entries = (await log.readSince("0")).map(({ entry }) => entry);
+    assert.deepEqual(entries.find((entry) => entry.k === "input")?.input, [
+      { type: "text", text: "look" },
+      { type: "image", mimeType: "image/png", data: { sha256: pngName } },
+      { type: "image", mimeType: "image/png", sourceRef: "uploads:shot", data: { sha256: pngName } },
+      { type: "image", mimeType: "image/png", data: { sha256: pngName } },
+    ]);
+    assert.ok(!JSON.stringify(entries).includes(png), "no entry holds the image's base64");
+    assert.deepEqual(await log.images.get(pngName), pngBytes);
+  }
+  await agent.close();
+  if (typeof durability.create !== "function") {
+    // On disk: the image's bytes once, in its stream, and its base64 nowhere.
+    const files = await filesUnder(dirs.at(-1));
+    assert.ok(!files.some((bytes) => bytes.includes(Buffer.from(png))), "no file holds the image's base64");
+    assert.equal(files.filter((bytes) => bytes.includes(Buffer.from(pngBytes))).length, 1, "one file holds the image's bytes");
+  }
+});
+
+test("an image the session's store no longer holds fails its turn, naming it", async () => {
+  const { agent, seen } = recordingAgent(faultyImages(await durabilityFor(), { lose: true }));
+  const session = agent.session();
+  const result = await session.prompt([{ type: "text", text: "look" }, image]).result;
+  assert.equal(result.stopReason, "error");
+  assert.match(result.error.message, new RegExp(`does not hold image ${pngName}`));
+  assert.deepEqual(seen, [], "the harness never ran it");
+  assert.equal((await session.prompt("after").result).stopReason, "end_turn");
+  await agent.close();
+});
+
+test("an image whose stored bytes changed fails its turn, naming it", async () => {
+  const { agent, seen } = recordingAgent(faultyImages(await durabilityFor(), { corrupt: true }));
+  const session = agent.session();
+  const result = await session.prompt([{ type: "text", text: "look" }, image]).result;
+  assert.equal(result.stopReason, "error");
+  // A World's read skips bytes that don't match the name, so to it the image
+  // is missing; a store that returns them fails the check after the read.
+  assert.match(result.error.message, new RegExp(`(holds other bytes under|does not hold) image ${pngName}`));
+  assert.deepEqual(seen, [], "the harness never ran it");
+  assert.equal((await session.prompt("after").result).stopReason, "end_turn");
+  await agent.close();
+});
+
+test("a World whose streams lack getChunks refuses an image prompt before storing it, and text still runs", async () => {
+  const durability = await durabilityFor();
+  // memory() keeps images itself; the others keep them in World streams.
+  if (typeof durability.world !== "function") return;
+  const bound = (target, value) => (typeof value === "function" ? value.bind(target) : value);
+  const withoutGetChunks = {
+    ...durability,
+    async world() {
+      const world = await durability.world();
+      const streams = new Proxy(world.streams, { get: (target, prop) => (prop === "getChunks" ? undefined : bound(target, Reflect.get(target, prop))) });
+      return new Proxy(world, { get: (target, prop) => (prop === "streams" ? streams : bound(target, Reflect.get(target, prop))) });
+    },
+  };
+  const { agent, seen } = recordingAgent(withoutGetChunks);
+  const session = agent.session();
+  const refused = session.prompt([{ type: "text", text: "look" }, image]);
+  await assert.rejects(refused.accepted, (error) => error instanceof TypeError && /getChunks/.test(error.message));
+  await assert.rejects(refused.result);
+  assert.equal((await session.prompt("text only").result).stopReason, "end_turn");
+  assert.deepEqual(kinds(seen), ["text only"]);
+  await agent.close();
+});
+
+test("a failed image write rejects the prompt before anything is stored", async () => {
+  const { agent, seen } = recordingAgent(faultyImages(await durabilityFor(), { failWrites: 1 }));
+  const session = agent.session();
+  const refused = session.prompt([{ type: "text", text: "look" }, image], { messageId: "refused-img" });
+  // The store's own error.
+  const storeFailed = (error) => error.message === "the store is full";
+  await assert.rejects(refused.accepted, storeFailed);
+  await assert.rejects(refused.result, storeFailed);
+  assert.equal((await session.prompt([{ type: "text", text: "again" }, image]).result).stopReason, "end_turn");
+  assert.deepEqual(kinds(seen), ["image"], "only the second prompt was stored and ran");
+  // The refused prompt was never stored, so its retry is a new turn.
+  const retried = await session.prompt([{ type: "text", text: "look" }, image], { messageId: "refused-img" }).result;
+  assert.equal(retried.stopReason, "end_turn");
+  assert.notEqual(retried.repeated, true);
+  assert.deepEqual(kinds(seen), ["image", "image"]);
+  await agent.close();
+});
+
+test("a failed image write rejects a steer before it is sent", async () => {
+  const fault = {};
+  const { agent, seen } = recordingAgent(faultyImages(await durabilityFor(), fault));
+  const session = agent.session();
+  assert.equal((await session.prompt("first").result).stopReason, "end_turn");
+  fault.failWrites = 1;
+  // The store's own error.
+  await assert.rejects(session.steer([{ type: "text", text: "look" }, image]), (error) => error.message === "the store is full");
+  // The steer was never sent, so no turn ran for it before the next prompt.
+  assert.equal((await session.prompt("after").result).stopReason, "end_turn");
+  assert.deepEqual(kinds(seen), ["first", "after"]);
+  await agent.close();
+});
+
+test("a retried image prompt the log already holds is answered without writing its images again", async () => {
+  const fault = {};
+  const { agent, seen } = recordingAgent(faultyImages(await durabilityFor(), fault));
+  const session = agent.session();
+  assert.equal((await session.prompt([{ type: "text", text: "look" }, image], { messageId: "img-once" }).result).stopReason, "end_turn");
+  // From now on every image write fails, so a retry that wrote again would fail.
+  fault.failWrites = Infinity;
+  const again = await agent.session(session.id).prompt([{ type: "text", text: "look" }, image], { messageId: "img-once" }).result;
+  assert.equal(again.repeated, true);
+  assert.equal(again.stopReason, "end_turn");
+  assert.deepEqual(kinds(seen), ["image"], "the retry ran nothing");
+  await agent.close();
+});
+
+test("base64 is the same with and without the runtime's own encoder and decoder", async () => {
+  const reference = (bytes) => btoa(String.fromCharCode(...bytes));
+  const inputs = [...Array.from({ length: 9 }, (_, n) => pngBytes.subarray(0, n + 1)), Uint8Array.from({ length: 3000 }, (_, i) => (i * 131) & 255)];
+  const run = async () => {
+    const { agent, seen } = recordingAgent(await durabilityFor());
+    const session = agent.session();
+    // Each image is decoded to be stored, and encoded again for the harness.
+    for (const bytes of inputs) assert.equal((await session.prompt([{ type: "image", data: reference(bytes), mimeType: "image/png" }]).result).stopReason, "end_turn");
+    // Each turn's records went through the log as base64 and back.
+    const words = JSON.parse(decoder.decode(await session.checkpoint()));
+    await agent.close();
+    return { seen, words };
+  };
+  const native = await run();
+  const encode = Uint8Array.prototype.toBase64;
+  const decode = Uint8Array.fromBase64;
+  delete Uint8Array.prototype.toBase64;
+  delete Uint8Array.fromBase64;
+  let fallback;
+  try {
+    fallback = await run();
+  } finally {
+    if (encode) Uint8Array.prototype.toBase64 = encode;
+    if (decode) Uint8Array.fromBase64 = decode;
+  }
+  for (const result of [native, fallback]) {
+    assert.deepEqual(result.seen.map((input) => input[0].data), inputs.map(reference));
+    assert.equal(result.words.length, inputs.length * 3);
+  }
 });
 
 test("a worker lives only while a delivery runs it", async () => {
@@ -1662,6 +2125,355 @@ if (durabilityKind === "queue") {
     assert.deepEqual(openersOf(session.id), [], "no agent ran the closed agent's session");
     await theirs.close();
     for (const { stored } of [acme, carl]) await stored.close();
+  });
+}
+
+// A log of `count` slots as a World holds one: inputs, a chain of leases,
+// records and releases, and checkpoints whose `through` only moves forward.
+function randomLog(seed, count) {
+  let state = seed;
+  const next = () => (state = (state * 1103515245 + 12345) % 2147483648) / 2147483648;
+  const log = [];
+  let through = null;
+  for (let slot = 1; slot <= count; slot += 1) {
+    const roll = next();
+    let entry;
+    if (roll < 0.15 && slot > 2) {
+      through = String(Math.max(Number(through ?? 0), Math.floor(1 + next() * (slot - 1))));
+      entry = { k: "checkpoint", through, data: `c${slot}` };
+    } else if (roll < 0.35) entry = { k: "input", key: `prompt:p${slot}`, type: "prompt", messageId: `p${slot}` };
+    else entry = { k: ["lease", "record", "release"][Math.floor(next() * 3)], a: null, n: slot };
+    log.push({ cursor: String(slot), entry });
+  }
+  return log;
+}
+
+// The log as a whole read returns it: every entry after the newest
+// checkpoint's `through`, which is 0 without one.
+function wholeRead(log) {
+  let through = 0;
+  for (const { entry } of log) if (entry.k === "checkpoint") through = entry.through === null ? 0 : Number(entry.through);
+  return { entries: log.filter(({ cursor }) => Number(cursor) > through), through };
+}
+
+test("a log view extended by the entries after it reads as the whole log does, wherever it was cut", () => {
+  for (let seed = 1; seed <= 200; seed += 1) {
+    const log = randomLog(seed, 1 + (seed % 40));
+    const whole = wholeRead(log);
+    const chained = [...whole.entries].reverse().find(({ entry }) => ["lease", "record", "release"].includes(entry.k));
+    for (let cut = 0; cut <= log.length; cut += 1) {
+      const next = extendLogView(wholeRead(log.slice(0, cut)), log.slice(cut));
+      assert.ok(next, `seed ${seed} cut ${cut} kept a view`);
+      assert.deepEqual(next.entries, whole.entries, `seed ${seed} cut ${cut}`);
+      assert.equal(next.through, whole.through);
+      assert.equal(next.head, chained?.cursor ?? (whole.through ? String(whole.through) : "null"));
+    }
+  }
+  // A checkpoint covering less than the view starts after cannot stand for
+  // the view; only a whole read can answer it.
+  const view = { entries: [{ cursor: "12", entry: { k: "record", a: "11" } }], through: 10 };
+  assert.equal(extendLogView(view, [{ cursor: "13", entry: { k: "checkpoint", through: "5" } }]), null);
+});
+
+test("a worker starts from its sender's read only when the sender's entries took the very next slots", () => {
+  const read = [{ cursor: "7", entry: { k: "release" } }];
+  const input = (cursor) => ({ cursor, entry: { k: "input", messageId: "m" } });
+  assert.deepEqual(handoffEntries(read, 9, [input("10")]), [...read, input("10")]);
+  assert.deepEqual(handoffEntries(read, 9, [input("10"), input("11")]), [...read, input("10"), input("11")]);
+  // Another server's write landed between the read and the input.
+  assert.equal(handoffEntries(read, 9, [input("11")]), null);
+  assert.equal(handoffEntries(read, 9, [input("10"), input("12")]), null);
+  // Nothing written, or a log that cannot say what it has seen.
+  assert.equal(handoffEntries(read, 9, []), null);
+  assert.equal(handoffEntries(read, undefined, [input("10")]), null);
+  assert.equal(handoffEntries(read, null, [input("10")]), null);
+  // The worker gets what the World stored, not the sender's own objects.
+  const written = [input("10")];
+  handoffEntries(read, 9, written)[1].entry.changed = true;
+  assert.equal(written[0].entry.changed, undefined);
+});
+
+// A World durability that tells `onList(params)` of each log listing and
+// `onCreate(kind)` of each entry written.
+function watchingLog(base, { onList = () => {}, onCreate = () => {} } = {}) {
+  return {
+    ...base,
+    world: async () => {
+      const world = await base.world();
+      const list = world.events.list.bind(world.events);
+      const create = world.events.create.bind(world.events);
+      const events = Object.assign(Object.create(world.events), {
+        list(params, ...rest) {
+          onList(params);
+          return list(params, ...rest);
+        },
+        create(runId, event, ...rest) {
+          if (event?.eventType === "step_created") {
+            try { onCreate(JSON.parse(decoder.decode(event.eventData.input)).k); } catch {}
+          }
+          return create(runId, event, ...rest);
+        },
+      });
+      return Object.assign(Object.create(world), { events });
+    },
+  };
+}
+
+async function untilIdle(agent) {
+  const internals = agent[Symbol.for("libfx.durableInternals")];
+  for (let tries = 0; internals.liveWorkers() > 0; tries += 1) {
+    assert.ok(tries < 200, "the worker never let go");
+    await sleep(10);
+  }
+}
+
+if (durabilityKind !== "memory") {
+  test("a server reads again only what landed in a session's log since it last read it, and sees what a fresh server sees", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-log-view-"));
+    dirs.push(dir);
+    const lists = [];
+    const agent = createAgent({ durability: watchingLog(await durabilityAt(dir), { onList: (params) => lists.push(params) }) });
+    const session = agent.session();
+    for (const input of ["rho", "sigma", "tau", "chi"]) assert.equal((await textOf(session.prompt(input))).result.stopReason, "end_turn");
+    await untilIdle(agent);
+    const ours = await agent[Symbol.for("libfx.durableInternals")].openLog(session.id);
+    // More entries than a read's first page, so a whole read lists two.
+    const first = await ours.read();
+    assert.ok(first.length > 10);
+    // A caller that changes what a read returned changes nothing stored.
+    for (const item of first) item.entry.changedByCaller = true;
+    const other = createAgent({ durability: await durabilityAt(dir) });
+    const theirs = await other[Symbol.for("libfx.durableInternals")].openLog(session.id);
+    const fresh = async () => {
+      const reader = createAgent({ durability: await durabilityAt(dir) });
+      const entries = await (await reader[Symbol.for("libfx.durableInternals")].openLog(session.id)).read();
+      await reader.close();
+      return entries;
+    };
+    // Another server adds an input.
+    await theirs.append({ k: "input", key: "cancel:cnl_elsewhere", type: "cancel", messageId: "cnl_elsewhere" });
+    lists.length = 0;
+    const cached = await ours.read();
+    assert.equal(lists.length, 1, "one short page lists what landed since");
+    assert.equal(lists[0].pagination.cursor, undefined);
+    assert.deepEqual(cached, await fresh());
+    // Then a checkpoint that covers the chain: only the entries after its
+    // head are read, the input written after the head and the checkpoint.
+    const { head } = foldSessionLog(await theirs.read());
+    await theirs.append({ k: "checkpoint", through: head, data: "", pending: [], recent: [] });
+    const after = await ours.read();
+    assert.deepEqual(after, await fresh());
+    assert.deepEqual(after.map(({ entry }) => entry.k), ["input", "checkpoint"]);
+    // A view many entries behind reads only back to the newest checkpoint
+    // among them, not every entry since the view.
+    let last;
+    for (let index = 0; index < 15; index += 1) {
+      last = await theirs.append({ k: "input", key: `cancel:cnl_burst${index}`, type: "cancel", messageId: `cnl_burst${index}` });
+    }
+    await theirs.append({ k: "checkpoint", through: last, data: "", pending: [], recent: [] });
+    lists.length = 0;
+    const behind = await ours.read();
+    assert.equal(lists.length, 1, "the read stops at the checkpoint on its first page");
+    assert.deepEqual(behind, await fresh());
+    assert.deepEqual(behind.map(({ entry }) => entry.k), ["checkpoint"]);
+    for (const closing of [agent, other]) await closing.close();
+  });
+
+  test("a server whose listing skips a slot keeps no view past it, and reads the entry once the World shows it", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-log-gap-"));
+    dirs.push(dir);
+    // Slots the World's listings leave out, as a World can list a newer
+    // write before an earlier one has landed.
+    const hidden = new Set();
+    const hiding = async () => {
+      const base = await durabilityAt(dir);
+      return {
+        ...base,
+        world: async () => {
+          const world = await base.world();
+          const list = world.events.list.bind(world.events);
+          const events = Object.assign(Object.create(world.events), {
+            async list(...args) {
+              const page = await list(...args);
+              const slot = (event) => Number(/_(\d{26})$/.exec(String(event.eventId))?.[1]);
+              return { ...page, data: page.data.filter((event) => !hidden.has(slot(event))) };
+            },
+          });
+          return Object.assign(Object.create(world), { events });
+        },
+      };
+    };
+    const internals = (agent) => agent[Symbol.for("libfx.durableInternals")];
+    const agent = createAgent({ durability: await hiding() });
+    const session = agent.session();
+    for (const input of ["omicron", "psi"]) assert.equal((await textOf(session.prompt(input))).result.stopReason, "end_turn");
+    await untilIdle(agent);
+    const ours = await internals(agent).openLog(session.id);
+    await ours.read();
+    assert.ok(Number.isSafeInteger(ours.newest()));
+    const other = createAgent({ durability: await durabilityAt(dir) });
+    const theirs = await internals(other).openLog(session.id);
+    // Another server writes three inputs, and the middle one does not list yet.
+    await theirs.append({ k: "input", key: "cancel:cnl_first", type: "cancel", messageId: "cnl_first" });
+    hidden.add(Number(await theirs.append({ k: "input", key: "cancel:cnl_late", type: "cancel", messageId: "cnl_late" })));
+    await theirs.append({ k: "input", key: "cancel:cnl_next", type: "cancel", messageId: "cnl_next" });
+    const ids = (entries) => entries.map(({ entry }) => entry.messageId);
+    const gapped = await ours.read();
+    assert.ok(ids(gapped).includes("cnl_first") && ids(gapped).includes("cnl_next") && !ids(gapped).includes("cnl_late"));
+    assert.equal(ours.newest(), null, "a read that skipped a slot hands no worker its view");
+    // A server's first, whole read keeps no view past the gap either.
+    const late = createAgent({ durability: await hiding() });
+    const latecomer = await internals(late).openLog(session.id);
+    assert.ok(!ids(await latecomer.read()).includes("cnl_late"));
+    assert.equal(latecomer.newest(), null);
+    hidden.clear();
+    // Nor does a whole read that did not reach the run's first event.
+    hidden.add(1);
+    const bottom = createAgent({ durability: await hiding() });
+    const unreached = await internals(bottom).openLog(session.id);
+    await unreached.read();
+    assert.equal(unreached.newest(), null, "a whole read that missed the first slot keeps no view");
+    hidden.clear();
+    const fresh = createAgent({ durability: await durabilityAt(dir) });
+    const whole = await (await internals(fresh).openLog(session.id)).read();
+    assert.ok(ids(whole).includes("cnl_late"));
+    for (const log of [ours, latecomer, unreached]) {
+      assert.deepEqual(await log.read(), whole, "the entry is read once the World lists it");
+      assert.ok(Number.isSafeInteger(log.newest()));
+    }
+    // The lowest of the newer writes lists late: the newer listing does not
+    // reach the view, so the read is whole and keeps no view.
+    hidden.add(Number(await theirs.append({ k: "input", key: "cancel:cnl_low", type: "cancel", messageId: "cnl_low" })));
+    await theirs.append({ k: "input", key: "cancel:cnl_high", type: "cancel", messageId: "cnl_high" });
+    assert.ok(!ids(await ours.read()).includes("cnl_low"));
+    assert.equal(ours.newest(), null, "a newer listing that does not reach the view hands no worker its view");
+    hidden.clear();
+    assert.ok(ids(await ours.read()).includes("cnl_low"));
+    // A whole read that stops at a checkpoint keeps a view, but only when its
+    // listing reached that checkpoint's through.
+    const through = await theirs.append({ k: "input", key: "cancel:cnl_covered", type: "cancel", messageId: "cnl_covered" });
+    await theirs.append({ k: "input", key: "cancel:cnl_after", type: "cancel", messageId: "cnl_after" });
+    await theirs.append({ k: "checkpoint", through, data: "", pending: [], recent: [] });
+    for (let slot = 1; slot <= Number(through) + 1; slot += 1) hidden.add(slot);
+    const short = createAgent({ durability: await hiding() });
+    const shortLog = await internals(short).openLog(session.id);
+    assert.ok(!ids(await shortLog.read()).includes("cnl_after"));
+    assert.equal(shortLog.newest(), null, "a listing that ended above the checkpoint's through keeps no view");
+    hidden.clear();
+    const cold = createAgent({ durability: await hiding() });
+    const coldLog = await internals(cold).openLog(session.id);
+    const coldRead = await coldLog.read();
+    assert.deepEqual(coldRead.map(({ entry }) => entry.k), ["input", "checkpoint"]);
+    assert.ok(Number.isSafeInteger(coldLog.newest()), "a whole read that stopped at a checkpoint keeps a view");
+    assert.deepEqual(await shortLog.read(), coldRead);
+    for (const closing of [agent, other, late, bottom, fresh, short, cold]) await closing.close();
+  });
+
+  test("a write a log makes while its own read lists shows in its next read", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-log-own-write-"));
+    dirs.push(dir);
+    // Runs once inside the next listing, after the World answered it.
+    let during = null;
+    const base = await durabilityAt(dir);
+    const durability = {
+      ...base,
+      world: async () => {
+        const world = await base.world();
+        const list = world.events.list.bind(world.events);
+        const events = Object.assign(Object.create(world.events), {
+          async list(...args) {
+            const page = await list(...args);
+            const write = during;
+            during = null;
+            await write?.();
+            return page;
+          },
+        });
+        return Object.assign(Object.create(world), { events });
+      },
+    };
+    const internals = (agent) => agent[Symbol.for("libfx.durableInternals")];
+    const agent = createAgent({ durability });
+    const session = agent.session();
+    for (const input of ["iota", "kappa"]) assert.equal((await textOf(session.prompt(input))).result.stopReason, "end_turn");
+    await untilIdle(agent);
+    const ours = await internals(agent).openLog(session.id);
+    await ours.read();
+    let written;
+    during = async () => { written = await ours.append({ k: "note", n: 1 }); };
+    const listed = await ours.read();
+    assert.ok(written && !listed.some(({ cursor }) => cursor === written), "the listing was answered before the write");
+    const next = await ours.read();
+    assert.ok(next.some(({ cursor }) => cursor === written));
+    const fresh = createAgent({ durability: await durabilityAt(dir) });
+    assert.deepEqual(next, await (await internals(fresh).openLog(session.id)).read());
+    for (const closing of [agent, fresh]) await closing.close();
+  });
+}
+
+if (durabilityKind === "queue") {
+  test("a prompt the request runs itself starts its worker from the sender's read, without reading the log again", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-handoff-"));
+    dirs.push(dir);
+    const ops = [];
+    const { durability: base } = await queueWorldAt(dir, { queueLeases: true, runInRequest: true, maxDurationMs: 60_000 });
+    const agent = createAgent({ durability: watchingLog(base, { onList: () => ops.push("list"), onCreate: (kind) => ops.push(kind) }) });
+    const session = agent.session();
+    assert.equal((await textOf(session.prompt("upsilon"))).result.stopReason, "end_turn");
+    await untilIdle(agent);
+    ops.length = 0;
+    assert.equal((await textOf(session.prompt("phi"))).result.stopReason, "end_turn");
+    const input = ops.indexOf("input");
+    const lease = ops.indexOf("lease", input);
+    assert.ok(input >= 0 && lease > input, JSON.stringify(ops));
+    assert.deepEqual(ops.slice(input + 1, lease), [], "nothing read or written between the input and the worker's lease");
+    await agent.close();
+  });
+
+  test("a worker reads the log itself when another write lands between its sender's read and the input", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-handoff-gap-"));
+    dirs.push(dir);
+    const ops = [];
+    // Runs once, just before the next input is written.
+    let before = null;
+    const kindOf = (event) => {
+      try { return JSON.parse(decoder.decode(event.eventData.input)).k; } catch { return null; }
+    };
+    const { durability: base } = await queueWorldAt(dir, { queueLeases: true, runInRequest: true, maxDurationMs: 60_000 });
+    const watched = watchingLog(base, { onList: () => ops.push("list"), onCreate: (kind) => ops.push(kind) });
+    const durability = {
+      ...watched,
+      world: async () => {
+        const world = await watched.world();
+        const create = world.events.create.bind(world.events);
+        const events = Object.assign(Object.create(world.events), {
+          async create(runId, event, ...rest) {
+            if (before && event?.eventType === "step_created" && kindOf(event) === "input") {
+              const write = before;
+              before = null;
+              await write();
+            }
+            return create(runId, event, ...rest);
+          },
+        });
+        return Object.assign(Object.create(world), { events });
+      },
+    };
+    const internals = (agent) => agent[Symbol.for("libfx.durableInternals")];
+    const agent = createAgent({ durability });
+    const session = agent.session();
+    assert.equal((await textOf(session.prompt("lambda"))).result.stopReason, "end_turn");
+    await untilIdle(agent);
+    const other = createAgent({ durability: await durabilityAt(dir) });
+    const theirs = await internals(other).openLog(session.id);
+    ops.length = 0;
+    before = () => theirs.append({ k: "note", n: 1 });
+    assert.equal((await textOf(session.prompt("mu"))).result.stopReason, "end_turn");
+    const input = ops.indexOf("input");
+    const lease = ops.indexOf("lease", input);
+    assert.ok(input >= 0 && lease > input, JSON.stringify(ops));
+    assert.ok(ops.slice(input + 1, lease).includes("list"), "the worker read the log before its lease");
+    for (const closing of [agent, other]) await closing.close();
   });
 }
 

@@ -53,7 +53,6 @@ const file_mutation_execution = @import("file_mutation_execution.zig");
 const tool_mcp_registry = @import("tool_mcp_registry.zig");
 const tool_mcp_runtime = @import("tool_mcp_runtime.zig");
 const capability_retrieval = @import("capability_retrieval.zig");
-const tool_mcp_feature_dispatch = @import("tool_mcp_feature_dispatch.zig");
 const tool_presentation = @import("tool_presentation.zig");
 const shell_impl = @import("../../tools/shell/shell.zig");
 const shell_resolver = @import("../terminal/shell_resolver.zig");
@@ -205,7 +204,6 @@ pub const Context = struct {
     expected_mcp_runtime_generation: ?u64 = null,
     expected_mcp_binding: ?types.McpToolBinding = null,
     mcp_review_schema_json: ?[]const u8 = null,
-    mcp_call_feature: ?tool_mcp_runtime.FeatureCallFn = null,
     mcp_access: tool_mcp_runtime.Access = .unrestricted,
     mcp_input_responder: ?tool_mcp_runtime.InputResponder = null,
     mcp_progress_ctx: ?*anyopaque = null,
@@ -362,7 +360,7 @@ pub fn validateToolCall(ctx: Context, arena: Allocator, call: ToolCall) !tool_co
     };
     switch (spec.executor_kind) {
         // Preserve execution-time argument failures for MCP control tool calls.
-        .mcp_select_tool, .mcp_features => return .{ .valid = .{} },
+        .mcp_select_tool => return .{ .valid = .{} },
         // File mutation arguments are decoded once by shared permission preflight.
         .write_file, .edit_file => return .{ .valid = .{} },
         else => {},
@@ -923,10 +921,7 @@ fn executeRegisteredTool(
     else
         toolExecutionResultFromDispatch(dispatched, dispatch_metadata);
     execution.model_output = dispatched.body;
-    if (mcp_call_status == .input_required or
-        (execution.status == .failure and
-            tool_mcp_feature_dispatch.isInputRequiredFailure(execution.model_output)))
-    {
+    if (mcp_call_status == .input_required) {
         execution.finish_turn = true;
         execution.status_detail = "McpInputRequired";
     }
@@ -1214,7 +1209,6 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
         .mcp_call_tool = ctx.mcp_call_tool,
         .mcp_search_tools = ctx.mcp_search_tools,
         .mcp_tool_schema = ctx.mcp_tool_schema,
-        .mcp_call_feature = ctx.mcp_call_feature,
         .mcp_access = ctx.mcp_access,
         .mcp_input_responder = ctx.mcp_input_responder,
         .mcp_permission_rules = if (ctx.permission_mode == .yolo)
@@ -2501,7 +2495,6 @@ const TestRuntime = struct {
     mcp_search_tools: ?tool_mcp_runtime.SearchToolsFn = null,
     mcp_tool_schema: ?tool_mcp_runtime.ToolSchemaFn = null,
     mcp_snapshot_tool: ?tool_mcp_runtime.SnapshotToolFn = null,
-    mcp_call_feature: ?tool_mcp_runtime.FeatureCallFn = null,
     mcp_input_responder: ?tool_mcp_runtime.InputResponder = null,
     advertised_dynamic_tool_names: []const []const u8 = &.{},
     auto_classifier: permission_auto_classifier.Classifier = .disabled(),
@@ -2575,7 +2568,6 @@ const TestRuntime = struct {
             .mcp_search_tools = self.mcp_search_tools,
             .mcp_tool_schema = self.mcp_tool_schema,
             .mcp_snapshot_tool = self.mcp_snapshot_tool,
-            .mcp_call_feature = self.mcp_call_feature,
             .mcp_input_responder = self.mcp_input_responder,
             .advertised_dynamic_tool_names = self.advertised_dynamic_tool_names,
             .auto_classifier = self.auto_classifier,
@@ -3251,6 +3243,120 @@ test "ask_user_question worker bridge preserves allocator ownership" {
     try std.testing.expect(state.err == null);
     try std.testing.expectEqual(@as(usize, 1), state.answers.?.len);
     try std.testing.expectEqualStrings("Run tests", state.answers.?[0]);
+}
+
+const FullQuestionBatchExecution = struct {
+    ctx: Context,
+    arena: Allocator,
+    call: ToolCall,
+    max_tool_result_bytes: usize,
+    result: ?ToolExecutionResult = null,
+    err: ?anyerror = null,
+
+    fn run(self: *FullQuestionBatchExecution) void {
+        self.result = executeToolCallAuthorized(self.ctx, .{
+            .call_allocator = self.arena,
+            .result_allocator = self.arena,
+            .call = self.call,
+            .authority = .ordinary,
+            .session_grants = &.{},
+            .advertised_dynamic_tool_names = &.{},
+            .max_tool_result_bytes = self.max_tool_result_bytes,
+        }) catch |err| {
+            self.err = err;
+            return;
+        };
+    }
+};
+
+test "ask_user_question carries a full batch from model arguments through the worker prompt to the model result" {
+    const question_answer = @import("../agent/question_answer.zig");
+    const question_prompt = @import("../agent/question_prompt.zig");
+    const alloc = std.testing.allocator;
+    const batch_len = question_answer.max_questions;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var args: std.Io.Writer.Allocating = .init(arena);
+    try args.writer.writeAll("{\"questions\":[");
+    for (0..batch_len) |question| {
+        if (question > 0) try args.writer.writeByte(',');
+        try args.writer.print(
+            "{{\"question\":\"Batch question {d}?\",\"options\":[{{\"label\":\"Keep {d}\"}},{{\"label\":\"Change {d}\",\"description\":\"Apply the change.\"}}]}}",
+            .{ question + 1, question + 1, question + 1 },
+        );
+    }
+    try args.writer.writeAll("]}");
+
+    const tools = [_]tool_dispatch.Tool{test_builtin_tools.ask_user_question};
+    var rt = TestRuntime{ .tool_registry = .{ .tools = tools[0..] } };
+    // The worker side of the question bridge allocates with `c_allocator`.
+    defer {
+        rt.worker.deinit(std.heap.c_allocator);
+        rt.session.deinit(alloc);
+    }
+    var execution = FullQuestionBatchExecution{
+        .ctx = rt.context(),
+        .arena = arena,
+        .call = .{ .id = "ask-full-batch", .name = "ask_user_question", .arguments_json = args.written() },
+        .max_tool_result_bytes = rt.max_tool_result_bytes,
+    };
+    const thread = try std.Thread.spawn(.{}, FullQuestionBatchExecution.run, .{&execution});
+    var thread_joined = false;
+    defer if (!thread_joined) {
+        rt.worker.requestStop();
+        thread.join();
+    };
+
+    // The interactive side receives the whole batch as one prompt.
+    var snapshot = try waitForQuestionBridgeSnapshot(&rt.worker);
+    defer snapshot.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, batch_len), snapshot.entries.len);
+    var prompt: question_prompt.QuestionPrompt = .{};
+    defer prompt.deinit(alloc);
+    try prompt.syncFrom(alloc, snapshot.entries);
+
+    // Even pages keep their first option and odd pages take the second.
+    for (0..batch_len) |page| {
+        const projection = prompt.projection().?;
+        try std.testing.expectEqual(page, projection.current_index);
+        var question_buf: [32]u8 = undefined;
+        try std.testing.expectEqualStrings(
+            try std.mem.print(&question_buf, "Batch question {d}?", .{page + 1}),
+            projection.current_entry.?.question,
+        );
+        const event = try prompt.apply(alloc, .{ .select_ordinal = @intCast(page % 2) });
+        if (page + 1 < batch_len) {
+            try std.testing.expectEqual(question_prompt.QuestionInputEvent{ .decision = @intCast(page) }, event);
+        } else {
+            try std.testing.expectEqual(question_prompt.QuestionInputEvent.all_decided, event);
+        }
+    }
+    var labels: [batch_len][]const u8 = undefined;
+    for (&labels, prompt.entries.items) |*label, entry| label.* = entry.answer.?;
+    try rt.worker.submitQuestionBatchAnswer(std.heap.c_allocator, &labels);
+    thread.join();
+    thread_joined = true;
+
+    if (execution.err) |err| return err;
+    const result = execution.result.?;
+    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, result.status);
+    const answers = (try question_answer.decodeJson(arena, result.model_output)).?;
+    try std.testing.expectEqual(@as(usize, batch_len), answers.len);
+    for (answers, 0..) |pair, page| {
+        var question_buf: [32]u8 = undefined;
+        var answer_buf: [32]u8 = undefined;
+        try std.testing.expectEqualStrings(
+            try std.mem.print(&question_buf, "Batch question {d}?", .{page + 1}),
+            pair.question,
+        );
+        try std.testing.expectEqualStrings(
+            try std.mem.print(&answer_buf, "{s} {d}", .{ if (page % 2 == 0) "Keep" else "Change", page + 1 }),
+            pair.answer,
+        );
+    }
+    try std.testing.expect(try rt.worker.snapshotPendingQuestionBatch(alloc) == null);
 }
 
 test "ask_user_question execution uses supplied registry entry and interactive host capability" {
@@ -6121,7 +6227,7 @@ test "shell run rejects legacy background input without creating state" {
 
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
     try expectContains(result.model_output, "\"code\":\"invalid_shell_request\"");
-    try expectContains(result.model_output, "request.background is not accepted for run.");
+    try expectContains(result.model_output, "\"background is not accepted for run.\"");
     try std.testing.expect(std.mem.find(u8, result.model_output, "retry_with") == null);
 }
 
@@ -6564,7 +6670,6 @@ test "MCP execution binds the last live action generation before transport" {
         .runtime_generation = 1,
         .owner_id = try alloc.dupe(u8, "child"),
         .parent_id = try alloc.dupe(u8, "parent"),
-        .features_visible = false,
         .servers = try alloc.alloc(mcp_access_policy.ServerIdentity, 0),
         .tools = try alloc.alloc(mcp_access_policy.ToolIdentity, 0),
     };
@@ -6775,6 +6880,7 @@ test "skill tool preserves resource and discovery notices separately" {
     const skills_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
     defer alloc.free(skills_dir);
     try setTestHome(null);
+    defer io_mod.resetEnvironForTest();
 
     var rt = TestRuntime{ .workspace_root = workspace_root, .skills_dir = skills_dir, .session_allocator = alloc };
     defer rt.deinit(alloc);
@@ -6850,7 +6956,7 @@ test "skill tool loads the exact advertised duplicate and rejects ambiguous or u
     const outside_skill = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/outside/workflow");
     defer alloc.free(outside_skill);
     try setTestHome(null);
-    defer setTestHome(null) catch {};
+    defer io_mod.resetEnvironForTest();
 
     var rt = TestRuntime{ .workspace_root = workspace_root, .skills_dir = skills_dir, .session_allocator = alloc };
     defer rt.deinit(alloc);
@@ -6908,7 +7014,7 @@ test "name-only skill call rediscovers a duplicate added after the first read" {
     const skills_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
     defer alloc.free(skills_dir);
     try setTestHome(null);
-    defer setTestHome(null) catch {};
+    defer io_mod.resetEnvironForTest();
 
     var rt = TestRuntime{ .workspace_root = workspace_root, .skills_dir = skills_dir, .session_allocator = alloc };
     defer rt.deinit(alloc);
@@ -6967,7 +7073,7 @@ test "skill tool reports missing skill" {
     const skills_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
     defer alloc.free(skills_dir);
     try setTestHome(null);
-    defer setTestHome(null) catch {};
+    defer io_mod.resetEnvironForTest();
 
     var rt = TestRuntime{ .workspace_root = workspace_root, .skills_dir = skills_dir };
     defer rt.deinit(alloc);

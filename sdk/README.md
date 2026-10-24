@@ -55,9 +55,10 @@ agent.session(sessionId).prompt("Start with the schema.");
 
 - **One turn at a time.** A prompt sent while a turn runs waits behind it, even when it reaches a different server.
 - **Turns finish on their own.** A turn runs to the end whether or not anyone reads its events, and a turn nobody reads holds no connection open: its view starts reading only once you use its events, `readable` or `result`. Stop it with `session.cancel()`, or with the `signal` you passed to `prompt()`.
-- **Steering.** `session.steer(input)` steers the running turn the way the fx CLI does. While the model streams a reply, the steer cuts it short and the turn continues with it. While a tool runs, the steer waits for the tool. A steer sent while a turn waits to start joins that turn, and when no turn runs or waits, the steer becomes the next turn. A steer with images can't join a turn, so the running turn ends at its next safe point and the steer runs next.
+- **Steering.** `session.steer(input)` steers the running turn the way the fx CLI does. While the model streams a reply, the steer cuts it short and the turn continues with it. While a tool runs, the steer waits for the tool. A steer sent while a turn waits to start joins that turn, and when no turn runs or waits, the steer becomes the next turn. A steer with images can't join a turn, so the running turn ends at its next safe point and the steer runs next. Its images are saved once with the session before the steer is sent, as a prompt's are, and a steer whose image can't be saved throws the store's error.
 - **Retries are safe.** Give a prompt or a steer a `messageId`, and a repeated request with the same id runs nothing new. A repeated prompt follows the original turn, and its result has `repeated: true`. One id names one input, so a steer that reuses a prompt's id is rejected with `FX_MESSAGE_ID_IN_USE`. A steer's `user_message` event carries its id as `id` where it joined a turn.
 - **Inputs have a size limit.** A prompt or steer whose input, with the session's `context` and settings, comes to more than 8 MiB of JSON is rejected with `FX_INPUT_TOO_LARGE` before anything is stored. The model can't take a larger one.
+- **A refused prompt is never stored.** `prompt()` checks a prompt as the engine's `prompt()` does and throws a `TypeError` or `RangeError` for one libfx would refuse, such as an empty prompt, base64 that isn't canonical, an image whose bytes aren't its type, or more than 8 images. A prompt whose `signal` aborts before the prompt is stored isn't stored either, and its turn ends `cancelled`.
 
 Each conversation can bring its own settings, which apply to the turns that session object starts:
 
@@ -326,6 +327,8 @@ const agent = createFxAgent({
 });
 ```
 
+Name a model the plan serves, here or in `agent.session(id, { model })`. fx's default model is an AI Gateway id, so libfx refuses a Codex engine or session without one.
+
 libfx calls `credentials()` in whichever process runs the turn. It refreshes the credentials shortly before they expire and once after a rejected request, then passes the new ones to `onCredentials` for you to save. Codex doesn't accept requests from web pages, so these turns run on your server.
 
 To sign a user in, use `libfx/chatgpt`:
@@ -346,7 +349,7 @@ The sign-in uses the same OpenAI client as the Codex CLI, and the user's ChatGPT
 
 ### Grok plans
 
-`provider: "grok"` runs on a user's Grok plan, with the same `credentials` and `onCredentials` callbacks, called with `provider: "grok"`. libfx also checks that refreshed credentials still belong to the same xAI account. These turns run on your server too.
+`provider: "grok"` runs on a user's Grok plan, with the same `credentials` and `onCredentials` callbacks, called with `provider: "grok"`. It needs a Grok model too, such as `model: "grok-4.7"`; the AI Gateway id `spacexai/grok-4.7` doesn't work on a Grok plan. libfx also checks that refreshed credentials still belong to the same xAI account. These turns run on your server too.
 
 To sign a user in, use `libfx/grok`. Device code is the simplest:
 
@@ -407,7 +410,7 @@ agent.session().prompt([
 ]);
 ```
 
-A session stores each prompt as JSON before it runs, so a session prompt takes image data as a base64 string. `createFxEngine()` also takes bytes, a `Blob` or a `File`. Each prompt takes up to 8 PNG, JPEG, GIF or WebP images, at most 3.75 MiB each and 6 MiB together. Pass `resizeImage` to downscale or convert prompt images before they're sent.
+A session stores each prompt as JSON before it runs, so a session prompt takes image data as a base64 string. `createFxEngine()` also takes bytes, a `Blob` or a `File`. A session saves each image once, named by its SHA-256, before it stores the prompt, and the saved conversation refers to it by that name, so images don't count toward the 4 MiB the session's own checkpoints hold. Images a host tool returns are saved the same way; one that can't be saved stays in the tool's result, held inline. A session keeps its newest 4,096 images, up to 512 MiB of them; an older image leaves the conversation, and the model sees a note in its place. A checkpoint you take with `checkpoint()` carries the images' bytes, within its 4 MiB. An engine with a `persistence` store of its own keeps images inside its records and checkpoints, so they count toward that 4 MiB; for a conversation with many images, use a session with [durability](#durability). libfx never deletes a saved image; it lasts as long as the session's storage. Each prompt takes up to 8 PNG, JPEG, GIF or WebP images, at most 3.75 MiB each and 6 MiB together. Pass `resizeImage` to downscale or convert prompt images before they're sent.
 
 ## Diagnostics
 
@@ -436,7 +439,7 @@ const agent = createFxAgent({
 
 `wait.start` and `wait.end` describe actual input requests separately from permission evaluation. Their `kind` is `approval`, `question`, `mcp_form`, or `mcp_url`; request IDs pair outcomes, including denial, cancellation, and failure. Native delegation events carry the child session and durable work ID. Child events retain that work ID, their own session/turn/execution identity, and the root and parent session IDs, so the host can join them even if delivery interleaves.
 
-MCP events include the configured server, original remote tool name, and owning fx call ID. `mcp.request.data.requestIdKind` distinguishes a native JSON-RPC ID, an MCP-v2 engine handle, and an explicitly propagated host correlation token. Hooks don't change remote MCP requests by default: the host adapter emits `mcp.start` and `mcp.end` without adding metadata or emitting a request ID. Opt in with `createMcpAdapter(client, { propagateCorrelation: true })` to send an opaque UUID as `_meta["libfx/correlationId"]` and record it in `mcp.request`. It contains no internal execution/call IDs and doesn't request progress notifications. Give the adapter a `serverName` for a stable local identity; otherwise it uses the client's reported server name when available. Native resource/prompt operations also report their server and action.
+MCP events include the configured server, original remote tool name, and owning fx call ID. `mcp.request.data.requestIdKind` distinguishes a native JSON-RPC ID, an MCP engine handle, and an explicitly propagated host correlation token. Hooks don't change remote MCP requests by default: the host adapter emits `mcp.start` and `mcp.end` without adding metadata or emitting a request ID. Opt in with `createMcpAdapter(client, { propagateCorrelation: true })` to send an opaque UUID as `_meta["libfx/correlationId"]` and record it in `mcp.request`. It contains no internal execution/call IDs and doesn't request progress notifications. Give the adapter a `serverName` for a stable local identity; otherwise it uses the client's reported server name when available. Native resource/prompt operations also report their server and action.
 
 `mcp.end.status` uses `success`, `failure`, `cancelled`, `input_required`, `unavailable`, or `unknown`. Native tool/protocol failures map to `failure`; `unavailable` means no operation result was available, and `unknown` means observation couldn't classify a returned host result.
 
@@ -498,9 +501,9 @@ interface JournalRecord {
 }
 ```
 
-Reject an `append()` whose `expected` isn't the last stored cursor with `FxFencedError`, so two processes can't write the same conversation. If your store keeps entries of its own after the last record, return the cursor the next `append()` should name as `head`. When a resumed turn left a tool call running, `resume({ onAmbiguous })` lets you return `"rerun"` to run it again under the same `executionId`.
+Reject an `append()` whose `expected` isn't the last stored cursor with `FxFencedError`, so two processes can't write the same conversation. If your store keeps entries of its own after the last record, return the cursor the next `append()` should name as `head`. When a resumed turn left a tool call running, `resume({ onAmbiguous })` lets you return `"rerun"` to run it again under the same `executionId`. A resumed turn first sends, as `text_delta`, the reply the last process had started, since the new engine's host saw none of it. If that process stopped after the turn's final reply was stored but before the turn's end was, `resume()` then ends the turn with that reply instead of asking the model again.
 
-The engine sends one `append()` at a time, and everything that happens while one is in flight goes in the next record. `barrier` is `true` when the engine waits for the record before it goes on, such as before a tool call with effects. A store may acknowledge a record with `barrier: false` before it is durable, as long as it keeps records in order and acknowledges a barrier only once it and every record before it are durable. Set `marks: true` to receive each record's `marks`, which say where turns start (`{ start: turnId }`), yield and end, and which inputs a turn took (`{ accepted: id }`), so a store can track turns without reading records.
+The engine sends one `append()` at a time, and everything that happens while one is in flight goes in the next record. `barrier` is `true` when something waits for the record, such as a tool call with effects, or a turn's `result`, which resolves only once the record that ends the turn is stored and rejects if that record can't be stored. A store may acknowledge a record with `barrier: false` before it is durable, as long as it keeps records in order and acknowledges a barrier only once it and every record before it are durable. Set `marks: true` to receive each record's `marks`, which say where turns start (`{ start: turnId }`), yield and end, and which inputs a turn took (`{ accepted: id }`), so a store can track turns without reading records.
 
 `prompt()` and `resume()` take `yieldAt`, a time in milliseconds since the epoch: the turn stops before its next model request after that time, with the stop reason `yielded`, and the next `resume()` continues it without telling the model it was interrupted.
 
