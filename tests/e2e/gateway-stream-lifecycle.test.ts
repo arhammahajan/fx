@@ -10216,16 +10216,15 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         if (fixture.streamedText) {
           expect(retryPrompt.some(message => message.role === "assistant")).toBe(false);
           expect(retryPrompt.some(message => contentText(message.content) === fixture.streamedText)).toBe(false);
-          expect(retryPrompt.at(-1)?.role).toBe("user");
-          expect(contentText(retryPrompt.at(-1)?.content)).toContain(
-            "Restart that response from the beginning",
-          );
           if (fixture.name === "partial") {
             expect(result.stderr).toContain("Response interrupted. Restarting.");
           }
-        } else {
-          expect(retryBody).not.toContain("Restart that response");
         }
+        // The resend is the same request, with no word to the model that the
+        // answer was interrupted.
+        expect(retryPrompt.at(-1)?.role).toBe("user");
+        expect(contentText(retryPrompt.at(-1)?.content)).toContain("Return the fixture response.");
+        expect(retryBody).not.toContain("previous response was interrupted");
         expect(trace).toContain("event=prompt_finish");
         expect(trace).toContain("outcome_kind=assistant");
         // A stream that ends without its finish is a dropped connection.
@@ -10307,21 +10306,25 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       // The cut-off reply, its refused restart, the compaction's summary
       // requests, and the restart sent again over the compacted conversation.
       const requests = gateway.requests.slice(seedRequests).map((request) => request.body);
-      const restart = "Restart that response from the beginning";
+      // The restart is the same request again, with no word to the model that
+      // it was interrupted.
+      const note = "previous response was interrupted";
       const isSummary = (raw: string) => {
         const body = JSON.parse(raw);
         return body.toolChoice?.type === "none" && body.tools?.length === 0;
       };
       expect(requests.length).toBeGreaterThanOrEqual(4);
-      expect(promptText(requests[0]!)).not.toContain(restart);
-      expect(promptText(requests[1]!)).toContain(restart);
+      expect(promptText(requests[0]!)).not.toContain(note);
+      expect(promptText(requests[1]!)).not.toContain(note);
+      expect(promptText(requests[1]!)).toContain("Continue.");
       expect(requests[1]).not.toContain("compacted_conversation");
       const summaries = requests.slice(2, -1);
       expect(summaries.every(isSummary)).toBe(true);
       expect(summaries[0]).toContain("seed-notes.txt");
       const retry = requests.at(-1)!;
       expect(isSummary(retry)).toBe(false);
-      expect(promptText(retry)).toContain(restart);
+      expect(promptText(retry)).not.toContain(note);
+      expect(promptText(retry)).toContain("Continue.");
       expect(retry).toContain("compacted_conversation");
       expect(retry).toContain("RESTARTED_OVERFLOW_SUMMARY");
       expect(retry).not.toContain("RESTARTED_OVERFLOW_SEED_NOTES");

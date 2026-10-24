@@ -7589,7 +7589,10 @@ test "processQueuedPrompt explicit checkpoint continuation starts a fresh attemp
     try runFakePrompt(&second_gateway, &second_hooks, continued_config, continued_job);
 
     try std.testing.expectEqual(@as(usize, 1), second_gateway.request_models.items.len);
-    try expectGatewayPromptTailText(&second_gateway, 0, .user, "Restart that response from the beginning");
+    // The broken-off answer resends the same request, with no word that it
+    // was interrupted.
+    try expectGatewayPromptTailText(&second_gateway, 0, .user, "user prompt");
+    try expectBodyNotContains(&second_gateway, 0, "previous response was interrupted");
     try expectGatewayPromptTextCount(&second_gateway, 0, "partial", 0);
     try std.testing.expectEqualStrings("partial response finished", second_hooks.history_assistant_text.?);
     try std.testing.expectEqual(@as(usize, 1), second_hooks.history_propagation_count);
@@ -7665,7 +7668,8 @@ test "processQueuedPrompt resumed reply retries a size rejection with fewer imag
 
     try runFakePrompt(&second_gateway, &second_hooks, continued_config, continued_job);
 
-    try expectGatewayPromptTailText(&second_gateway, 0, .user, "Restart that response from the beginning");
+    try expectGatewayPromptTailText(&second_gateway, 0, .user, "Describe the attached image.");
+    try expectBodyNotContains(&second_gateway, 0, "previous response was interrupted");
     try expectBodyContains(&second_gateway, 0, "\"type\":\"file\"");
     try std.testing.expectEqual(@as(usize, 2), second_gateway.request_models.items.len);
     try expectBodyNotContains(&second_gateway, 1, "\"type\":\"file\"");
@@ -7990,7 +7994,8 @@ test "processQueuedPrompt restarts an interrupted response until one completes" 
     try std.testing.expectEqual(@as(usize, 4), gateway.request_models.items.len);
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
     for (1..4) |index| {
-        try expectGatewayPromptTailText(&gateway, index, .user, "Restart that response from the beginning");
+        try expectGatewayPromptTailText(&gateway, index, .user, "user prompt");
+        try expectBodyNotContains(&gateway, index, "previous response was interrupted");
     }
     try expectRecovered(&hooks, 4);
     try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
@@ -8391,7 +8396,8 @@ test "processQueuedPrompt restarts failed response without committing its partia
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
     try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
-    try expectGatewayPromptTailText(&gateway, 1, .user, "Restart that response from the beginning");
+    try expectGatewayPromptTailText(&gateway, 1, .user, "user prompt");
+    try expectBodyNotContains(&gateway, 1, "previous response was interrupted");
     try expectBodyNotContains(&gateway, 1, "DISCARDED_PREVIEW");
     try std.testing.expectEqual(@as(usize, 0), hooks.route_recovery_count);
     try std.testing.expectEqual(@as(usize, 1), countText(&hooks, "DISCARDED_PREVIEW software"));

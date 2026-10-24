@@ -3353,10 +3353,10 @@ test "recovery conversation context is chronological and system free" {
         var messages: std.ArrayList(ChatMessage) = .empty;
         defer messages.deinit(alloc);
         try messages.append(alloc, .{ .role = .user, .content = "request" });
-        try appendRecoveryConversationContext(alloc, &messages, .continue_response);
+        try appendRecoveryConversationContext(alloc, &messages, .regenerate_tool);
         try std.testing.expectEqual(@as(usize, 2), messages.items.len);
         try std.testing.expectEqual(types.ChatRole.user, messages.items[1].role);
-        try std.testing.expectEqualStrings(resend_strategy.continue_response_prompt, messages.items[1].content.?);
+        try std.testing.expectEqualStrings(resend_strategy.regenerate_tool_prompt, messages.items[1].content.?);
     }
 
     const prompted = [_]resend_strategy.Strategy{
@@ -3532,10 +3532,7 @@ fn restoredRecoveryStrategy(
         .proven_unexecuted => .regenerate_tool,
         .confirmed => .continue_after_confirmed_tool,
         .uncertain => .reconcile_tool,
-        .none => if (checkpoint.assistant_source.len > 0)
-            .continue_response
-        else
-            .retry_request,
+        .none => .retry_request,
     };
 }
 
@@ -3666,7 +3663,6 @@ fn checkpointAction(
 ) types.ModelRecoveryAction {
     return switch (strategy orelse .retry_request) {
         .retry_request => .retrying_request,
-        .continue_response => .continuing_response,
         .regenerate_tool => .regenerating_tool,
         .continue_after_confirmed_tool => .continuing_after_tool,
         .reconcile_tool => .reconciling_tool,
@@ -7364,7 +7360,6 @@ fn processQueuedPromptLoop(
                             .possibly_sent => .possibly_sent,
                         },
                         failure_tool_evidence,
-                        stream_ctx.interruption_source_or("").len > 0,
                     )
                 else
                     null;
@@ -7821,11 +7816,7 @@ fn processQueuedPromptLoop(
                         preserved_tool_evidence = failure_tool_evidence;
                         stream_result.deinit(arena);
                         stream_result_set = false;
-                        recovery_strategy = resend_strategy.select(
-                            .possibly_sent,
-                            failure_tool_evidence,
-                            stream_ctx.interruption_source_or("").len > 0,
-                        );
+                        recovery_strategy = resend_strategy.select(.possibly_sent, failure_tool_evidence);
                         recovery_cause = cause;
                         reset_stream_for_next_attempt = true;
                         continue;
@@ -8023,11 +8014,7 @@ fn processQueuedPromptLoop(
                     try request_recovery.failed(.{ .kind = failure_kind.? });
                     if (try request_recovery.waitForSend() != null) {
                         preserved_tool_evidence = failure_tool_evidence;
-                        recovery_strategy = resend_strategy.select(
-                            .possibly_sent,
-                            failure_tool_evidence,
-                            partial_assistant.len > 0,
-                        );
+                        recovery_strategy = resend_strategy.select(.possibly_sent, failure_tool_evidence);
                         recovery_cause = cause;
                         if (recovery_strategy == .regenerate_tool) {
                             recovery_has_unexecuted_tool_start = true;
