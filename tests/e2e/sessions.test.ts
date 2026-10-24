@@ -277,10 +277,13 @@ test("fx ask saves to v2, resumes by id and by last, and never writes v1", async
     expect(first.output).toBe("V2_FIRST_ANSWER");
     const id: string = first.session_id;
     expect(id.length).toBeGreaterThan(0);
+    // The first turn saves the runtime context it captured right after its
+    // user message (D93).
     expect(shape(logLines(fixture.home, id))).toEqual([
       "session_created",
       "turn_started",
       "item:user",
+      "item:runtime_context",
       "item:assistant",
       "item:turn_end",
       "turn_committed",
@@ -305,6 +308,8 @@ test("fx ask saves to v2, resumes by id and by last, and never writes v1", async
 
     const kinds = logLines(fixture.home, id).map((line) => line.kind);
     expect(kinds.filter((kind) => kind === "turn_committed").length).toBe(3);
+    // The resumed turns send the saved copy and save none of their own.
+    expect(shape(logLines(fixture.home, id)).filter((kind) => kind === "item:runtime_context").length).toBe(1);
     expectNoV1Sessions(fixture);
   } finally {
     gateway.stop();
@@ -4093,8 +4098,20 @@ async function gridRow(exit: GridExit, entry: GridEntry) {
           expect(first.entered, `${label}: ${first.said}`).toBe(true);
           expectGridHistory(exit, asked(token)!, label);
         } else if (fault === "full-disk" && first.entered) {
-          // Every write fit in space its files already held; nothing is lost.
           expectGridHistory(exit, asked(token)!, label);
+          // Every write fit in space its files already held, or a write after
+          // the turn committed, such as `closed` on quit, failed and took the
+          // log down with a torn tail. The next open cuts it, and nothing is
+          // lost: the turn comes back.
+          if (readFileSync(c.log).at(-1) !== 0x0a) {
+            await clear();
+            clear = async () => {};
+            const second = await gridEnter(entry, c, gateway, retry, limit);
+            expect(second.entered, `${label} after a failed write: ${second.said}`).toBe(true);
+            expectGridHistory(exit, asked(retry)!, `${label} after a failed write`);
+            expect(asked(retry)!, `${label} after a failed write`).toContain(`Grid token ${token}.`);
+            expect(asked(retry)!, `${label} after a failed write`).toContain(`GRID_ANSWER_${token}`);
+          }
         } else {
           expect(first.entered, `${label} entered`).toBe(false);
           const cause = fault === "flipped-byte" || fault === "lost-blob" ? "damaged" : fault === "read-only" ? "denied" : fault === "full-disk" ? "full" : "busy";

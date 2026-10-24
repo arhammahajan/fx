@@ -50,6 +50,12 @@ pub const ConversationContextNote = struct {
     sources: []const types.ContextNoteSource = &.{},
 };
 
+/// A runtime context's item data (D93): the system message texts the turn
+/// captured for the session and sent ahead of the history.
+pub const ConversationRuntimeContext = struct {
+    messages: []const []const u8,
+};
+
 pub const ConversationAssistant = struct {
     text: []const u8,
     provider_replay: ?types.ProviderReplay = null,
@@ -191,6 +197,10 @@ pub const ConversationEvent = union(enum) {
     /// A system note fx added at a step boundary. Only a v2 session saves
     /// one, as its `context_note` item (D92).
     context_note: ConversationContextNote,
+    /// The runtime context a turn captured for the session, right after its
+    /// user message. Only a v2 session saves one, as its `runtime_context`
+    /// item (D93).
+    runtime_context: ConversationRuntimeContext,
 };
 
 pub const ConversationEnvelope = struct {
@@ -269,9 +279,10 @@ pub fn validateConversationTransition(
             return error.UnresolvedToolCall;
         },
         .user, .assistant, .steering, .interrupted => {},
-        // This checks a v1 log, which never holds a context note; only a v2
-        // session saves one (D92).
+        // This checks a v1 log, which never holds a context note or runtime
+        // context; only a v2 session saves them (D92, D93).
         .context_note => return rejectInvalidConversationEvent("context-note-v1"),
+        .runtime_context => return rejectInvalidConversationEvent("runtime-context-v1"),
     }
 }
 
@@ -316,6 +327,10 @@ pub fn validateConversationEventShape(event: ConversationEvent, schema_version: 
             for (value.sources) |source| {
                 if (source.path.len == 0) return rejectInvalidConversationEvent("context-note-source");
             }
+        },
+        .runtime_context => |value| {
+            if (value.messages.len == 0) return rejectInvalidConversationEvent("runtime-context-empty");
+            for (value.messages) |text| try validateConversationText(text);
         },
         .tool_call => |call| {
             try validateConversationIdentity(call.call_id);
@@ -493,9 +508,9 @@ pub fn decodeConversationFrameLeaky(
     }
     validateConversationEventShape(value.event, value.schema_version) catch
         return error.InvalidConversationFrame;
-    // Every caller reads a v1 log, which never holds a context note; only a
-    // v2 session saves one (D92).
-    if (value.event == .context_note) return error.InvalidConversationFrame;
+    // Every caller reads a v1 log, which never holds a context note or
+    // runtime context; only a v2 session saves them (D92, D93).
+    if (value.event == .context_note or value.event == .runtime_context) return error.InvalidConversationFrame;
     return value;
 }
 
@@ -596,6 +611,9 @@ pub fn appendExecutionConversationEvents(
     events: *std.ArrayList(ConversationEvent),
     execution: types.ExecutionMemory,
 ) !void {
+    // Right after the user message, where every save of the turn has it, so
+    // a streamed turn keeps the same prefix (D93).
+    if (execution.runtime_context) |texts| try events.append(alloc, .{ .runtime_context = .{ .messages = texts } });
     var note_index: usize = 0;
     try appendContextNoteConversationEvents(alloc, events, execution.context_notes, &note_index, 0);
     var steering_index: usize = 0;
