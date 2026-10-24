@@ -1563,6 +1563,7 @@ const App = struct {
             .recovery_checkpoint = recovery_checkpoint_copy,
             .recovery_source_already_presented = recovery_checkpoint != null,
             .user_prompt_already_presented = user_prompt_already_presented,
+            .stale_shell_handles = self.session.takeStaleShellHandles(),
         };
     }
 
