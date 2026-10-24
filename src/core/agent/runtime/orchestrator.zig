@@ -4738,34 +4738,6 @@ fn pushTerminalAutoRetryStatusIfNeeded(
     });
 }
 
-/// The same failure that may never heal ended several sends in a row
-/// (`request_recovery.zig` `Repeating`), so the request stops the way fx's
-/// no-progress stop always did: it kept failing at the same point. The stop
-/// is final, so its checkpoint goes with it; a resume would otherwise restart
-/// a request the status already calls stopped. The caller then ends the turn
-/// through its terminal path.
-fn stopRepeatedFailure(
-    deps: *const AgentRuntimeDeps,
-    request: *runtime_request_recovery.RequestRecovery,
-    job: QueuedPrompt,
-    config: Config,
-    cause: types.ModelRecoveryCause,
-    diagnostic: types.ModelFailureDiagnostic,
-) !void {
-    try request.replaceStatus(.{
-        .kind = .terminal_provider_error,
-        .attempt = request.attempt(),
-        .cause = cause,
-        .diagnostic = diagnostic,
-        .repeated = true,
-    });
-    restorePromptAfterTerminalFailure(deps, job, config);
-    const effect = deps.recovery_checkpoint orelse return;
-    effect.clear(deps.ctx) catch |err| {
-        debug_trace.logf("agent", "recovery checkpoint clear on repeated failure stop failed err={s}", .{@errorName(err)});
-    };
-}
-
 fn onRequiredVisionStreamToolStart(
     ctx: *anyopaque,
     tool_id: []const u8,
@@ -7410,12 +7382,7 @@ fn processQueuedPromptLoop(
                 const retryable = !cancel_requested and
                     failure_kind != null and
                     !reconciliation_tool_violation;
-                const repeat_stop = retryable and request_recovery.repeatedFailure(
-                    .{ .kind = failure_kind.? },
-                    if (err == error.TlsInitializationFailed) .tls_setup else null,
-                    stream_ctx.streamed_output_bytes,
-                );
-                const will_auto_retry = retryable and !repeat_stop;
+                const will_auto_retry = retryable;
                 debug_trace.eventf(
                     "gateway",
                     "stream_error",
@@ -7517,9 +7484,7 @@ fn processQueuedPromptLoop(
                     );
                     return;
                 }
-                if (repeat_stop) {
-                    try stopRepeatedFailure(deps, &request_recovery, job, config, failure_cause, failure_diagnostic);
-                } else if (request_recovery.attempt() > 1) {
+                if (request_recovery.attempt() > 1) {
                     try request_recovery.replaceStatus(.{
                         .kind = .terminal_provider_error,
                         .attempt = consumed_attempts,
@@ -8034,24 +7999,7 @@ fn processQueuedPromptLoop(
                 else
                     runtime_request_recovery.failureKind(cause);
                 const retryable = failure_kind != null and !config.cancel_flag.load(.seq_cst);
-                // An unclear ending that keeps happening at the same point
-                // stops after a few sends: a missing finish through the
-                // missing-finish path after the loop, an uncoded or
-                // unexplained provider error through the provider-error path
-                // below. A provider error with a code is never bounded.
-                const repeating: ?runtime_request_recovery.Repeating = if (cause == .response_interrupted)
-                    .missing_finish
-                else if (failure_cause) |known| switch (known) {
-                    .uncoded_error => .uncoded_error,
-                    .unexplained_error_finish => .unexplained_error_finish,
-                    .gateway_stream_timeout, .non_retryable, .rate_limited => null,
-                } else null;
-                const repeat_stop = retryable and request_recovery.repeatedFailure(
-                    .{ .kind = failure_kind.? },
-                    repeating,
-                    stream_ctx.streamed_output_bytes,
-                );
-                const retries = retryable and !repeat_stop;
+                const retries = retryable;
                 if (attempt_disposition == .provider_failure or
                     failure_cause == .gateway_stream_timeout)
                 {
@@ -8150,8 +8098,6 @@ fn processQueuedPromptLoop(
                             &stop_state.terminal_materializing,
                         );
                     }
-                } else if (finish_reason == .provider_error and request_recovery.stoppedRepeating()) {
-                    try stopRepeatedFailure(deps, &request_recovery, job, config, .provider_unavailable, diagnostic);
                 } else if (finish_reason == .provider_error) {
                     if (replay_safe) {
                         try pushTerminalProviderFailureStatus(
@@ -8352,22 +8298,11 @@ fn processQueuedPromptLoop(
         switch (disposition) {
             .completed, .length_limited => {},
             .interrupted => {
-                if (request_recovery.stoppedRepeating()) {
-                    try stopRepeatedFailure(
-                        deps,
-                        &request_recovery,
-                        job,
-                        config,
-                        .response_interrupted,
-                        types.ModelFailureDiagnostic.init("StreamInterrupted"),
-                    );
-                } else {
-                    try pushTerminalAutoRetryStatusIfNeeded(
-                        &request_recovery,
-                        successful_recovery_strategy != null,
-                        types.ModelFailureDiagnostic.init("StreamInterrupted"),
-                    );
-                }
+                try pushTerminalAutoRetryStatusIfNeeded(
+                    &request_recovery,
+                    successful_recovery_strategy != null,
+                    types.ModelFailureDiagnostic.init("StreamInterrupted"),
+                );
                 debug_trace.eventf("agent", "provider_finish_missing", step_ctx, "content_bytes={d} tool_call_count={d}", .{
                     if (completion.content) |content| content.len else 0,
                     completion.tool_calls.len,

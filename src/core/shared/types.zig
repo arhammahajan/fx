@@ -454,10 +454,6 @@ pub const RouteRecoveryStatus = struct {
     attempt: usize = 0,
     cause: ?ModelRecoveryCause = null,
     diagnostic: ?ModelFailureDiagnostic = null,
-    /// With `terminal_provider_error`: the same failure that may never heal
-    /// ended several sends in a row, so fx stopped the request
-    /// (`request_recovery.zig` `repeatedFailure`).
-    repeated: bool = false,
 
     /// Null for `clear`, which hosts receive as the clear event.
     pub fn fromRecovery(status: recovery.Status, attempt: usize) ?RouteRecoveryStatus {
@@ -631,21 +627,6 @@ pub const RouteRecoveryStatus = struct {
     }
 
     fn terminalLabel(self: RouteRecoveryStatus, buf: []u8) []const u8 {
-        if (self.repeated) {
-            const repeated_name = if (self.cause) |cause| causeDisplayName(cause) else "Response failed";
-            if (self.diagnostic) |diagnostic| {
-                return std.mem.print(
-                    buf,
-                    "⚠ {s} · {s} · kept failing at the same point · stopped",
-                    .{ repeated_name, diagnostic.humanText() },
-                ) catch "⚠ Response kept failing at the same point";
-            }
-            return std.mem.print(
-                buf,
-                "⚠ {s} · kept failing at the same point · stopped",
-                .{repeated_name},
-            ) catch "⚠ Response kept failing at the same point";
-        }
         const name = if (self.cause) |cause| causeDisplayName(cause) else "Provider unavailable";
         const plural: []const u8 = if (self.attempt == 1) "" else "s";
         if (self.diagnostic) |diagnostic| {
@@ -724,30 +705,6 @@ test "route recovery terminal label names the cause, diagnostic, and attempts" {
     try std.testing.expectEqualStrings(
         "⚠ Tool state needs review · context preserved",
         (RouteRecoveryStatus{ .kind = .unsafe_tool_start }).label(&label_buf),
-    );
-}
-
-test "a request stopped for repeating the same failure says it kept failing" {
-    var label_buf: [RouteRecoveryStatus.label_max_bytes]u8 = undefined;
-    try std.testing.expectEqualStrings(
-        "⚠ Network interrupted · TlsInitializationFailed · kept failing at the same point · stopped",
-        (RouteRecoveryStatus{
-            .kind = .terminal_provider_error,
-            .attempt = 3,
-            .cause = .network_interrupted,
-            .diagnostic = ModelFailureDiagnostic.init("TlsInitializationFailed"),
-            .repeated = true,
-        }).label(&label_buf),
-    );
-    try std.testing.expectEqualStrings(
-        "⚠ Response ended early · stream interrupted · kept failing at the same point · stopped",
-        (RouteRecoveryStatus{
-            .kind = .terminal_provider_error,
-            .attempt = 3,
-            .cause = .response_interrupted,
-            .diagnostic = ModelFailureDiagnostic.init("StreamInterrupted"),
-            .repeated = true,
-        }).label(&label_buf),
     );
 }
 

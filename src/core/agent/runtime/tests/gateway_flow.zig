@@ -6674,34 +6674,28 @@ test "processQueuedPrompt recovers without Fast before an unexplained error fini
     try expectRecovered(&hooks, 4);
 }
 
-test "processQueuedPrompt stops an endless unexplained error finish after its sends without Fast" {
+test "processQueuedPrompt keeps retrying an unexplained error finish without Fast" {
     const alloc = std.testing.allocator;
     const unexplained = unclearProviderError(.unexplained_error_finish, null);
     const completions = [_]FakeCompletion{
-        unexplained,                             unexplained, unexplained, unexplained, unexplained, unexplained,
-        .{ .content = "must not be requested" },
+        unexplained,                 unexplained, unexplained, unexplained, unexplained, unexplained,
+        .{ .content = "Recovered" },
     };
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     defer hooks.deinit();
 
-    try std.testing.expectError(error.ModelError, runFastPrompt(&gateway, &hooks));
+    try runFastPrompt(&gateway, &hooks);
 
-    // Three sends with Fast, then three without it, then the stop.
-    try std.testing.expectEqual(@as(usize, 6), gateway.request_models.items.len);
+    // Three sends with Fast, then every later one without it.
+    try std.testing.expectEqual(@as(usize, 7), gateway.request_models.items.len);
     for (0..3) |index| try expectBodyContains(&gateway, index, fast_body);
-    for (3..6) |index| try expectBodyContains(&gateway, index, standard_body);
-    const statuses = hooks.route_recovery_statuses.items;
-    try expectRouteStatus(
-        &hooks,
-        statuses.len - 1,
-        .terminal_provider_error,
-        "⚠ Provider unavailable · provider_error · kept failing at the same point · stopped",
-    );
+    for (3..7) |index| try expectBodyContains(&gateway, index, standard_body);
+    try expectRecovered(&hooks, 7);
 }
 
-test "processQueuedPrompt drops Fast before mixed unclear failures can stop it" {
+test "processQueuedPrompt drops Fast during mixed unclear failures and keeps retrying" {
     const alloc = std.testing.allocator;
     const uncoded = unclearProviderError(.uncoded_error, "provider_error: wafer route unavailable");
     const completions = [_]FakeCompletion{
@@ -6712,28 +6706,22 @@ test "processQueuedPrompt drops Fast before mixed unclear failures can stop it" 
         uncoded,
         uncoded,
         uncoded,
-        .{ .content = "must not be requested" },
+        .{ .content = "Recovered" },
     };
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     defer hooks.deinit();
 
-    try std.testing.expectError(error.ModelError, runFastPrompt(&gateway, &hooks));
+    try runFastPrompt(&gateway, &hooks);
 
-    // The missing finish starts fx's count before the gateway errors start
-    // the module's run toward dropping Fast. fx waits for that drop: four
-    // sends with Fast, three without it, then the stop.
-    try std.testing.expectEqual(@as(usize, 7), gateway.request_models.items.len);
+    // The missing finish is not a gateway error, so the run toward dropping
+    // Fast starts with the first uncoded one: four sends with Fast, then every
+    // later one without it.
+    try std.testing.expectEqual(@as(usize, 8), gateway.request_models.items.len);
     for (0..4) |index| try expectBodyContains(&gateway, index, fast_body);
-    for (4..7) |index| try expectBodyContains(&gateway, index, standard_body);
-    const statuses = hooks.route_recovery_statuses.items;
-    try expectRouteStatus(
-        &hooks,
-        statuses.len - 1,
-        .terminal_provider_error,
-        "⚠ Provider unavailable · provider_error: wafer route unavailable · kept failing at the same point · stopped",
-    );
+    for (4..8) |index| try expectBodyContains(&gateway, index, standard_body);
+    try expectRecovered(&hooks, 8);
 }
 
 test "processQueuedPrompt preserves fast mode after a streamed rate limit" {
@@ -7013,103 +7001,37 @@ test "processQueuedPrompt retries a server error event" {
     try expectRecovered(&hooks, 2);
 }
 
-test "processQueuedPrompt stops when the same TLS setup failure ends three sends" {
+test "processQueuedPrompt keeps retrying a TLS setup failure until it connects" {
     const alloc = std.testing.allocator;
-    const completions = [_]FakeCompletion{
-        .{ .pre_send_error = error.TlsInitializationFailed },
-        .{ .pre_send_error = error.TlsInitializationFailed },
-        .{ .pre_send_error = error.TlsInitializationFailed },
-        .{ .content = "must not be requested" },
-    };
-    var gateway = FakeGateway.init(alloc, &completions);
-    defer gateway.deinit();
-    var hooks = FakeAgentRuntimeDeps.init(alloc);
-    hooks.enable_recovery_checkpoint = true;
-    defer hooks.deinit();
-    var fixture = PromptFixture{};
-
-    try std.testing.expectError(
-        error.TlsInitializationFailed,
-        runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job()),
-    );
-    try std.testing.expectEqual(@as(usize, 3), gateway.request_models.items.len);
-    const statuses = hooks.route_recovery_statuses.items;
-    try expectRouteStatus(
-        &hooks,
-        statuses.len - 1,
-        .terminal_provider_error,
-        "⚠ Network interrupted · TlsInitializationFailed · kept failing at the same point · stopped",
-    );
-    try std.testing.expectEqual(@as(usize, 3), statuses[statuses.len - 1].attempt);
-    // The stop is final, so a resume does not restart the request.
-    try std.testing.expectEqual(@as(usize, 1), hooks.recovery_checkpoint_clears);
-}
-
-test "processQueuedPrompt recovers when TLS setup fails twice and then connects" {
-    const alloc = std.testing.allocator;
-    const completions = [_]FakeCompletion{
-        .{ .pre_send_error = error.TlsInitializationFailed },
-        .{ .pre_send_error = error.TlsInitializationFailed },
-        .{ .content = "Recovered after setup" },
-    };
+    const tls: FakeCompletion = .{ .pre_send_error = error.TlsInitializationFailed };
+    const completions = [_]FakeCompletion{ tls, tls, tls, tls, tls, .{ .content = "Recovered" } };
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     defer hooks.deinit();
     var fixture = PromptFixture{};
 
+    // Five sends end the same unclear way; only Esc would stop the request.
     try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
-    try std.testing.expectEqual(@as(usize, 3), gateway.request_models.items.len);
-    try expectRecovered(&hooks, 3);
+    try std.testing.expectEqual(@as(usize, 6), gateway.request_models.items.len);
+    try expectRecovered(&hooks, 6);
     try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
 }
 
-test "processQueuedPrompt stops when a stream ends without a finish three sends in a row" {
+test "processQueuedPrompt keeps retrying a stream that ends without a finish" {
     const alloc = std.testing.allocator;
-    const completions = [_]FakeCompletion{
-        .{ .omit_finish = true },
-        .{ .omit_finish = true },
-        .{ .omit_finish = true },
-        .{ .content = "must not be requested" },
-    };
-    var gateway = FakeGateway.init(alloc, &completions);
-    defer gateway.deinit();
-    var hooks = FakeAgentRuntimeDeps.init(alloc);
-    hooks.enable_recovery_checkpoint = true;
-    defer hooks.deinit();
-    var fixture = PromptFixture{};
-
-    try std.testing.expectError(
-        error.StreamInterrupted,
-        runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job()),
-    );
-    try std.testing.expectEqual(@as(usize, 3), gateway.request_models.items.len);
-    const statuses = hooks.route_recovery_statuses.items;
-    try expectRouteStatus(
-        &hooks,
-        statuses.len - 1,
-        .terminal_provider_error,
-        "⚠ Response ended early · stream interrupted · kept failing at the same point · stopped",
-    );
-    try std.testing.expectEqual(@as(usize, 1), hooks.recovery_checkpoint_clears);
-}
-
-test "processQueuedPrompt recovers when a stream ends without a finish twice" {
-    const alloc = std.testing.allocator;
-    const completions = [_]FakeCompletion{
-        .{ .omit_finish = true },
-        .{ .omit_finish = true },
-        .{ .content = "Recovered" },
-    };
+    const no_finish: FakeCompletion = .{ .omit_finish = true };
+    const completions = [_]FakeCompletion{ no_finish, no_finish, no_finish, no_finish, no_finish, .{ .content = "Recovered" } };
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     defer hooks.deinit();
     var fixture = PromptFixture{};
 
+    // Five sends end the same unclear way; only Esc would stop the request.
     try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
-    try std.testing.expectEqual(@as(usize, 3), gateway.request_models.items.len);
-    try expectRecovered(&hooks, 3);
+    try std.testing.expectEqual(@as(usize, 6), gateway.request_models.items.len);
+    try expectRecovered(&hooks, 6);
     try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
 }
 
@@ -7120,68 +7042,42 @@ fn unclearProviderError(cause: types.ProviderFailureCause, detail: ?[]const u8) 
     return .{ .finish_reason = .provider_error, .provider_failure_cause = cause, .provider_failure_detail = detail };
 }
 
-test "processQueuedPrompt stops when an error event without a code ends three sends" {
+test "processQueuedPrompt keeps retrying an error event without a code" {
     const alloc = std.testing.allocator;
     const uncoded = unclearProviderError(.uncoded_error, "provider_error: wafer route unavailable");
-    const completions = [_]FakeCompletion{ uncoded, uncoded, uncoded, .{ .content = "must not be requested" } };
-    var gateway = FakeGateway.init(alloc, &completions);
-    defer gateway.deinit();
-    var hooks = FakeAgentRuntimeDeps.init(alloc);
-    hooks.enable_recovery_checkpoint = true;
-    defer hooks.deinit();
-    var fixture = PromptFixture{};
-
-    try std.testing.expectError(error.ModelError, runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job()));
-    try std.testing.expectEqual(@as(usize, 3), gateway.request_models.items.len);
-    try expectModuleStatus(&hooks, 0, .waiting, "Gateway error · next try in ");
-    const statuses = hooks.route_recovery_statuses.items;
-    try expectRouteStatus(
-        &hooks,
-        statuses.len - 1,
-        .terminal_provider_error,
-        "⚠ Provider unavailable · provider_error: wafer route unavailable · kept failing at the same point · stopped",
-    );
-    try std.testing.expectEqual(@as(usize, 1), hooks.recovery_checkpoint_clears);
-}
-
-test "processQueuedPrompt recovers when an error event without a code ends two sends" {
-    const alloc = std.testing.allocator;
-    const uncoded = unclearProviderError(.uncoded_error, "provider_error: wafer route unavailable");
-    const completions = [_]FakeCompletion{ uncoded, uncoded, .{ .content = "Recovered" } };
+    const completions = [_]FakeCompletion{ uncoded, uncoded, uncoded, uncoded, uncoded, .{ .content = "Recovered" } };
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     defer hooks.deinit();
     var fixture = PromptFixture{};
 
+    // Five sends end the same unclear way; only Esc would stop the request.
     try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
-    try std.testing.expectEqual(@as(usize, 3), gateway.request_models.items.len);
-    try expectRecovered(&hooks, 3);
+    try std.testing.expectEqual(@as(usize, 6), gateway.request_models.items.len);
+    try expectModuleStatus(&hooks, 0, .waiting, "Gateway error · next try in ");
+    try expectRecovered(&hooks, 6);
     try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
 }
 
-test "processQueuedPrompt stops when an error finish no event explained ends three sends" {
+test "processQueuedPrompt keeps retrying an error finish no event explained" {
     const alloc = std.testing.allocator;
     const unexplained = unclearProviderError(.unexplained_error_finish, null);
-    const completions = [_]FakeCompletion{ unexplained, unexplained, unexplained, .{ .content = "must not be requested" } };
+    const completions = [_]FakeCompletion{ unexplained, unexplained, unexplained, unexplained, unexplained, .{ .content = "Recovered" } };
     var gateway = FakeGateway.init(alloc, &completions);
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     defer hooks.deinit();
     var fixture = PromptFixture{};
 
-    try std.testing.expectError(error.ModelError, runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job()));
-    try std.testing.expectEqual(@as(usize, 3), gateway.request_models.items.len);
-    const statuses = hooks.route_recovery_statuses.items;
-    try expectRouteStatus(
-        &hooks,
-        statuses.len - 1,
-        .terminal_provider_error,
-        "⚠ Provider unavailable · provider_error · kept failing at the same point · stopped",
-    );
+    // Five sends end the same unclear way; only Esc would stop the request.
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+    try std.testing.expectEqual(@as(usize, 6), gateway.request_models.items.len);
+    try expectRecovered(&hooks, 6);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
 }
 
-test "processQueuedPrompt never bounds a provider error that carries a transient code" {
+test "processQueuedPrompt keeps retrying a provider error that carries a transient code" {
     const alloc = std.testing.allocator;
     const coded: FakeCompletion = .{ .finish_reason = .provider_error, .provider_failure_detail = "server_error: temporarily unavailable" };
     const completions = [_]FakeCompletion{ coded, coded, coded, coded, .{ .content = "Recovered" } };
@@ -7224,14 +7120,16 @@ test "processQueuedPrompt ends a classified code without a finish through its no
     try std.testing.expectEqual(@as(?types.InterruptedTerminalReason, .failed), interrupted.terminal_reason);
 }
 
-test "processQueuedPrompt a different failure between missing finishes starts the count over" {
+test "processQueuedPrompt keeps retrying unclear failures of different classes" {
     const alloc = std.testing.allocator;
+    const uncoded = unclearProviderError(.uncoded_error, "provider_error: wafer route unavailable");
     const completions = [_]FakeCompletion{
+        .{ .pre_send_error = error.TlsInitializationFailed },
         .{ .omit_finish = true },
+        uncoded,
+        .{ .pre_send_error = error.TlsInitializationFailed },
         .{ .omit_finish = true },
-        .{ .stream_error = error.ReadFailed },
-        .{ .omit_finish = true },
-        .{ .omit_finish = true },
+        uncoded,
         .{ .content = "Recovered" },
     };
     var gateway = FakeGateway.init(alloc, &completions);
@@ -7241,33 +7139,8 @@ test "processQueuedPrompt a different failure between missing finishes starts th
     var fixture = PromptFixture{};
 
     try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
-    try std.testing.expectEqual(@as(usize, 6), gateway.request_models.items.len);
-    try expectRecovered(&hooks, 6);
-}
-
-test "processQueuedPrompt stops when unclear failures of different classes end three sends" {
-    const alloc = std.testing.allocator;
-    const completions = [_]FakeCompletion{
-        .{ .pre_send_error = error.TlsInitializationFailed },
-        .{ .omit_finish = true },
-        unclearProviderError(.uncoded_error, "provider_error: wafer route unavailable"),
-        .{ .content = "must not be requested" },
-    };
-    var gateway = FakeGateway.init(alloc, &completions);
-    defer gateway.deinit();
-    var hooks = FakeAgentRuntimeDeps.init(alloc);
-    defer hooks.deinit();
-    var fixture = PromptFixture{};
-
-    try std.testing.expectError(error.ModelError, runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job()));
-    try std.testing.expectEqual(@as(usize, 3), gateway.request_models.items.len);
-    const statuses = hooks.route_recovery_statuses.items;
-    try expectRouteStatus(
-        &hooks,
-        statuses.len - 1,
-        .terminal_provider_error,
-        "⚠ Provider unavailable · provider_error: wafer route unavailable · kept failing at the same point · stopped",
-    );
+    try std.testing.expectEqual(@as(usize, 7), gateway.request_models.items.len);
+    try expectRecovered(&hooks, 7);
 }
 
 test "processQueuedPrompt reports failed when an HTTP error ends a request that showed a status" {

@@ -1057,8 +1057,7 @@ pub const Reducer = struct {
                 self.tools.items.len > 0,
             );
             // An incomplete response with no known reason, or a cancelled
-            // one, failed without saying why. fx resends it but bounds it
-            // (`src/core/agent/runtime/request_recovery.zig` `Repeating`).
+            // one, failed without saying why, and fx resends it.
             if (self.finish_reason == .provider_error and !self.failure_explained) {
                 self.provider_failure_cause = .unexplained_error_finish;
             }

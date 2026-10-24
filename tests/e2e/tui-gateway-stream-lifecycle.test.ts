@@ -430,12 +430,9 @@ function retryAfterUnavailable(seconds: number): Response {
 
 // A finish with an empty reason: fx cannot tell how the response ended, so
 // the request fails with no retry.
-function invalidFinishReasonResponse(): Response {
-  return new Response(
-    'data: {"type":"finish","finishReason":{"unified":"","raw":"provider_error"}}\n\n' +
-      "data: [DONE]\n\n",
-    { headers: { "content-type": "text/event-stream" } },
-  );
+// A stream fx cannot read at all ends the turn with no resend.
+function malformedEventResponse(): Response {
+  return new Response("data: {not json}\n\n", { headers: { "content-type": "text/event-stream" } });
 }
 
 function partialEofResponse(text: string): Response {
@@ -2986,7 +2983,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         "fx-tui-recovery-terminal-restore-",
         [
           () => new Response("", { headers: { "content-type": "text/event-stream" } }),
-          () => invalidFinishReasonResponse(),
+          () => malformedEventResponse(),
         ],
       );
 
@@ -2998,7 +2995,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         (value) => /stopped after 2\s+attempts/.test(value),
         "terminal failure after a retry",
       );
-      expect(scrollback).toContain("InvalidProviderFinishReason");
+      expect(scrollback).toContain("InvalidGatewaySseEvent");
       expect(queuedGateway.requests).toHaveLength(2);
       await session!.waitForPane(
         (pane) => composerContains(pane, prompt),
@@ -3018,7 +3015,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         "fx-tui-recovery-terminal-keeps-draft-",
         [
           () => new Response("", { headers: { "content-type": "text/event-stream" } }),
-          () => invalidFinishReasonResponse(),
+          () => malformedEventResponse(),
         ],
       );
 

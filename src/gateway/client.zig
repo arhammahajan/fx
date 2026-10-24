@@ -3426,6 +3426,9 @@ const transient_provider_error_codes = [_][]const u8{
     "overloaded_error",
     "timeout_error",
     "gateway_timeout",
+    // The gateway's upstream stream ended before its last chunk: a resend
+    // gets a new upstream stream.
+    "gateway_stream_terminated",
 };
 
 const rate_limit_error_codes = [_][]const u8{
@@ -3468,14 +3471,14 @@ const error_type_names = [_][]const u8{
 };
 
 /// What an SSE `error` event says about the request: fx classifies what has a
-/// code and bounds what is unclear. This differs from the Responses protocol
+/// code and resends what is unclear. This differs from the Responses protocol
 /// (`responses_protocol.zig` `accept_failure`), which ends the turn for
 /// `provider_error` and for a missing code. The AI Gateway names a provider
 /// route failure `provider_error` and pairs it with HTTP 503, and an event
 /// with neither a code nor a usable HTTP status is the same route failure
 /// that `captureProviderFailureDetail` labels `provider_error`, so here both
-/// are resent: a coded one as a server error, an uncoded one bounded by
-/// `request_recovery.zig` `Repeating`.
+/// are resent until Esc: a coded one as a server error, an uncoded one the
+/// same way.
 const ErrorEventClass = enum {
     /// Neither a code nor a usable HTTP status, so fx cannot tell whether a
     /// resend can succeed.
@@ -3576,8 +3579,7 @@ fn httpStatusClass(status: u16) ?ErrorEventClass {
 /// an error or missing and an error event carried a classified code, which
 /// beats it. Error events decide an error finish or a missing one; any other
 /// normal finish decides on its own. A provider error with nothing to
-/// classify it is unclear: fx resends it, but `request_recovery.zig`
-/// `Repeating` bounds it.
+/// classify it is unclear, and fx resends it.
 fn streamFailureCause(
     class: ?ErrorEventClass,
     finish: ?types.ProviderFinishReason,
@@ -4543,14 +4545,15 @@ fn consumeSseStreamTraced(
             acc.provider_result_state = if (preliminary) .preliminary else .final;
         } else if (std.mem.eql(u8, event_type, "finish")) {
             finish_timeout = providerFailureCause(root) == .gateway_stream_timeout;
-            const finish_event = parseSseFinishEvent(alloc, root, &provider_failure_detail) catch |err| {
-                switch (err) {
-                    error.UnknownProviderFinishReason => {
-                        traceSseTermination(resolved_model_trace, "invalid_finish", null);
-                        return error.InvalidProviderFinishReason;
-                    },
-                    else => return err,
-                }
+            const finish_event = parseSseFinishEvent(alloc, root, &provider_failure_detail) catch |err| switch (err) {
+                // A finish fx cannot read ends the stream as one without a
+                // finish, so the turn resends it like any stream that ended
+                // early.
+                error.InvalidProviderFinishReason, error.UnknownProviderFinishReason => {
+                    traceSseTermination(resolved_model_trace, "invalid_finish", null);
+                    break;
+                },
+                else => return err,
             };
             finish_reason_holder = finish_event.finish_reason;
             finish_usage = finish_event.usage;
@@ -5044,6 +5047,7 @@ test "errorEventClass retries only server errors, overload, and upstream timeout
         .{ .event = "{\"type\":\"error\",\"error\":{\"type\":\"no_available_providers\",\"message\":\"none\"}}", .class = .transient },
         .{ .event = "{\"type\":\"error\",\"error\":{\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}}", .class = .transient },
         .{ .event = "{\"type\":\"error\",\"code\":\"server_error\",\"message\":\"retry\"}", .class = .transient },
+        .{ .event = "{\"type\":\"error\",\"error\":{\"code\":\"gateway_stream_terminated\",\"message\":\"Upstream stream ended before terminal chunk\"}}", .class = .transient },
         .{ .event = "{\"type\":\"error\",\"message\":\"wafer route unavailable\"}", .class = .uncoded },
         .{ .event = "{\"type\":\"error\",\"error\":\"route unavailable\"}", .class = .uncoded },
         .{ .event = "{\"type\":\"error\",\"error\":{\"message\":\"route unavailable\"}}", .class = .uncoded },
@@ -5569,23 +5573,31 @@ test "consumeSseStream returns immediately after valid finish without waiting fo
     try std.testing.expectEqual(types.ProviderFinishReason.stop, completion.finish_reason.?);
 }
 
-test "consumeSseStream rejects malformed provider finish reasons" {
-    const cases = [_][]const u8{
+test "consumeSseStream ends at an unreadable finish as a stream without a finish" {
+    const delta = "data: {\"type\":\"text-delta\",\"id\":\"t1\",\"delta\":\"partial\"}\n\n";
+    const finishes = [_][]const u8{
         "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"\"}}\n\n",
         "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"future-reason\"}}\n\n",
+        "data: {\"type\":\"finish\"}\n\n",
+        "data: {\"type\":\"finish\",\"finishReason\":\"stop\"}\n\n",
     };
 
     const Noop = struct {
         fn chunk(_: *anyopaque, _: []const u8) void {}
     };
 
-    for (cases) |payload| {
+    for (finishes) |finish| {
+        const payload = try std.mem.concat(std.testing.allocator, u8, &.{ delta, finish });
+        defer std.testing.allocator.free(payload);
         var reader = std.Io.Reader.fixed(payload);
         var cancel_flag = std.atomic.Value(bool).init(false);
-        try std.testing.expectError(
-            error.InvalidProviderFinishReason,
-            consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancel_flag),
-        );
+        var completion = try consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancel_flag);
+        defer deinitGatewayCompletion(std.testing.allocator, &completion);
+
+        // The turn sees what any stream that ended early leaves: the text so
+        // far and no finish, which it resends.
+        try std.testing.expectEqualStrings("partial", completion.content.?);
+        try std.testing.expect(completion.finish_reason == null);
     }
 }
 
