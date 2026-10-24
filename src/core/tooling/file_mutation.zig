@@ -29,8 +29,8 @@ const Allocator = std.mem.Allocator;
 const PreparedFileMutation = file_mutation_contract.PreparedFileMutation;
 const PolicyEvaluatedFileTargets = file_mutation_contract.PolicyEvaluatedFileTargets;
 
-const max_content_bytes: usize = 4 * 1024 * 1024;
-const max_total_content_bytes: usize = 8 * 1024 * 1024;
+const max_content_bytes: usize = 16 * 1024 * 1024;
+const max_total_content_bytes: usize = 32 * 1024 * 1024;
 
 pub const ParentCleanupResidueReason = enum {
     not_empty,
@@ -134,7 +134,7 @@ const identity_changed_message =
 const preview_too_large_message =
     "file mutation preparation failed: diff preview exceeds preparation limits";
 const total_content_too_large_message =
-    "file mutation preparation failed: content proof exceeds the 8 MiB preparation limit";
+    "file mutation preparation failed: content proof exceeds the 32 MiB preparation limit";
 
 const FileMutationPrepareError = error{
     OutOfMemory,
@@ -1404,7 +1404,7 @@ fn verifyAndReadPreimage(
         .limited(max_content_bytes + 1),
     ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.StreamTooLong => return .{ .semantic_failure = "file mutation preparation failed: preimage exceeds the 4 MiB preparation limit" },
+        error.StreamTooLong => return .{ .semantic_failure = "file mutation preparation failed: preimage exceeds the 16 MiB preparation limit" },
         error.ReadFailed => {
             const root = reader.err orelse return error.Unexpected;
             if (operationalError(root)) |operational| return operational;
@@ -1412,7 +1412,7 @@ fn verifyAndReadPreimage(
         },
     };
     if (content.len > max_content_bytes) {
-        return .{ .semantic_failure = "file mutation preparation failed: preimage exceeds the 4 MiB preparation limit" };
+        return .{ .semantic_failure = "file mutation preparation failed: preimage exceeds the 16 MiB preparation limit" };
     }
 
     var content_hasher = std.crypto.hash.sha2.Sha256.init(.{});
@@ -1462,14 +1462,14 @@ fn derivePostimage(
                 usize,
                 prefix_len,
                 edit.new_string.len,
-            ) catch break :blk .{ .semantic_failure = "edit_file failed: postimage exceeds the 4 MiB preparation limit" };
+            ) catch break :blk .{ .semantic_failure = "edit_file failed: postimage exceeds the 16 MiB preparation limit" };
             after_len = std.math.add(
                 usize,
                 after_len,
                 before.len - suffix_start,
-            ) catch break :blk .{ .semantic_failure = "edit_file failed: postimage exceeds the 4 MiB preparation limit" };
+            ) catch break :blk .{ .semantic_failure = "edit_file failed: postimage exceeds the 16 MiB preparation limit" };
             if (after_len > max_content_bytes) {
-                break :blk .{ .semantic_failure = "edit_file failed: postimage exceeds the 4 MiB preparation limit" };
+                break :blk .{ .semantic_failure = "edit_file failed: postimage exceeds the 16 MiB preparation limit" };
             }
 
             const after = try alloc.alloc(u8, after_len);
@@ -2081,7 +2081,7 @@ test "prepare enforces independent preimage and postimage caps" {
     };
     const preimage_policy = try evaluatePolicy(arena, root, preimage_call);
     try std.testing.expectEqualStrings(
-        "file mutation preparation failed: preimage exceeds the 4 MiB preparation limit",
+        "file mutation preparation failed: preimage exceeds the 16 MiB preparation limit",
         try expectSemanticFailure(arena, preimage_call, preimage_policy),
     );
 
@@ -2096,7 +2096,7 @@ test "prepare enforces independent preimage and postimage caps" {
     };
     const postimage_policy = try evaluatePolicy(arena, root, postimage_call);
     try std.testing.expectEqualStrings(
-        "edit_file failed: postimage exceeds the 4 MiB preparation limit",
+        "edit_file failed: postimage exceeds the 16 MiB preparation limit",
         try expectSemanticFailure(arena, postimage_call, postimage_policy),
     );
 }

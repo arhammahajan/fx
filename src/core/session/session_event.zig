@@ -21,6 +21,10 @@ pub const Digest = [Sha256.digest_length]u8;
 // frames: previous/after snapshots may live in a result-store artifact with
 // only the handle inline. Version 1 and 2 frames never carry the field and
 // remain readable.
+//
+// CommittedFilePresentation.review_lines came after the last release that
+// wrote these frames, so no frame of any version carries it; the field is
+// optional and only the session store's pieces hold it.
 pub const conversation_schema_version: u8 = 3;
 
 /// Every historical frame version a reader must still accept. Writers always
@@ -361,6 +365,9 @@ pub fn validateConversationEventShape(event: ConversationEvent, schema_version: 
                 }
                 if (presentation.content_handle) |handle| {
                     try validateConversationIdentity(handle);
+                }
+                if (presentation.review_lines) |rows| {
+                    for (rows) |row| try validateOptionalConversationText(row.text);
                 }
             }
             if ((result.command_replay_ref == null) !=
