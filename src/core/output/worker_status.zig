@@ -100,6 +100,15 @@ pub const State = union(enum) {
         self.* = .{ .api = ApiStatus.init(label, tone) };
     }
 
+    /// Whether the status shown is a request waiting for the user, which one
+    /// Esc ends and Enter on an empty composer continues.
+    pub fn waitsForUser(self: *const State) bool {
+        return switch (self.*) {
+            .route_recovery => |*status| status.status.kind == .need_user,
+            .none, .api => false,
+        };
+    }
+
     pub fn clear_route_recovery(self: *State) bool {
         return switch (self.*) {
             .route_recovery => blk: {

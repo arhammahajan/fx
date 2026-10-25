@@ -1433,6 +1433,18 @@ pub fn Runtime(comptime App: type) type {
                         app.shell.render_requests.request(.footer);
                         return;
                     }
+                    // Enter on an empty composer answers a request that waits
+                    // for the user, which resends it.
+                    if (comptime @hasDecl(@TypeOf(app.worker), "requestRecoveryContinue")) {
+                        if (recoveryWaitsForUser(app) and
+                            std.mem.trim(u8, app.input_runtime.edit_state.input.items, " \t\r\n").len == 0)
+                        {
+                            app.worker.requestRecoveryContinue();
+                            debug_trace.logf("input", "event=recovery_continue", .{});
+                            app.shell.render_requests.request(.footer);
+                            return;
+                        }
+                    }
                     debug_trace.logf("input", "submit requested stream_active={s} queued={d} input_bytes={d}", .{ if (app.stream.active) "true" else "false", app.worker.queuedPromptCount(), app.input_runtime.edit_state.input.items.len });
                     try submit_rt.submit(app, max_prompt_history);
                 },
@@ -2727,6 +2739,14 @@ pub fn Runtime(comptime App: type) type {
                     _ = disarmEscapeInterrupt(app, "compaction_feedback");
                     return;
                 }
+                // A request that waits for the user ends on one Esc.
+                if (recoveryWaitsForUser(app)) {
+                    try interrupt_rt.cancelActiveOperation(app);
+                    _ = disarmEscapeClear(app);
+                    _ = disarmEscapeInterrupt(app, "recovery_need_user");
+                    app.shell.render_requests.request(.footer);
+                    return;
+                }
                 // Interrupting active work requires a confirming second Esc
                 // within the gesture window. The first press only arms.
                 const transition = gesture_state.pressEscapeInterrupt(
@@ -2787,6 +2807,12 @@ pub fn Runtime(comptime App: type) type {
             } else {
                 app.shell.render_requests.request(.footer);
             }
+        }
+
+        /// Whether the status row shows a request that waits for the user.
+        fn recoveryWaitsForUser(app: *App) bool {
+            if (comptime !@hasDecl(@TypeOf(app.shell), "worker_status_state")) return false;
+            return app.shell.worker_status_state().waitsForUser();
         }
 
         fn cancelSkillsMenu(app: *App) bool {

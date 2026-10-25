@@ -2301,7 +2301,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
-    "HTTP restricted provider error renders sticky status row",
+    "HTTP restricted provider error shows its reason while fx waits for the user",
     async () => {
       const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
         "fx-tui-route-http-403-",
@@ -2309,20 +2309,21 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       );
 
       await session!.sendText("Trigger restricted provider.");
-      await session!.waitForText(
-        "⚠ API access denied · HTTP 403 · Provider: wafer",
+      // The reason goes to the transcript; the status line says what to do.
+      await session!.waitForText("API access denied · HTTP 403 · Provider: wafer", TIMEOUT);
+      await session!.waitForText("The provider rejected this request · press Esc", TIMEOUT);
+      await session!.sendKeys("Escape");
+      await session!.waitForPane(
+        (pane) => !pane.includes("The provider rejected this request"),
         TIMEOUT,
       );
       const scrollback = await session!.captureFullScrollback();
 
       expect(queuedGateway.requests.length).toBe(1);
-      expect(scrollback).toContain(
-        "⚠ API access denied · HTTP 403 · Provider: wafer",
-      );
+      expect(countOccurrences(scrollback, "API access denied · HTTP 403 · Provider: wafer")).toBe(1);
       expect(scrollback).toContain(
         "no_providers_available: Your team has restricted access to this",
       );
-      expect(scrollback).toContain("no_providers_available");
       expect(scrollback).not.toContain('{"error"');
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
@@ -2533,7 +2534,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
-    "content filter opens local recovery modal without transcript card",
+    "content filter waits for the user and one Esc ends the turn",
     async () => {
       const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
         "fx-tui-route-content-filter-",
@@ -2541,27 +2542,89 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       );
 
       await session!.sendText("Trigger content filter.");
-      const pane = await session!.waitForText("Try again later", TIMEOUT);
-      await session!.sendKeys("Down");
-      await session!.sendKeys("Enter");
+      await session!.waitForText("Blocked by the content filter", TIMEOUT);
+      // A request that waits for the user ends on one Esc, not two.
+      await session!.sendKeys("Escape");
+      await session!.waitForPane(
+        (pane) => !pane.includes("Blocked by the content filter"),
+        TIMEOUT,
+      );
       await session!.waitForComposer(TIMEOUT);
-      await session!.waitForText("⚠ blocked · content_filter · content filter", TIMEOUT);
       const scrollback = await session!.captureFullScrollback();
 
       expect(queuedGateway.requests.length).toBe(1);
-      expect(scrollback).not.toContain("What should fx do?");
-      expect(pane).toContain("Change model");
-      expect(pane).toContain("Try again later");
-      expect(pane).toContain("Response blocked by content filter");
-      expect(scrollback).toContain("⚠ blocked · content_filter · content filter");
-      expect(pane).not.toContain("Disable Fast");
-      expect(pane).not.toContain("Retry same route");
-      expect(scrollback).not.toContain("System");
-      expect(scrollback).not.toContain("Change model");
-      expect(scrollback).not.toContain("request failed: ModelError");
+      expect(scrollback).not.toContain("Try again later");
+      expect(scrollback).not.toContain("request failed");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     TIMEOUT,
+  );
+
+  test(
+    "a rejected request waits for the user and Enter sends it again",
+    async () => {
+      const finalText = "REJECTED_THEN_ANSWERED";
+      const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
+        "fx-tui-route-rejected-",
+        [
+          () => new Response(
+            JSON.stringify({ error: { message: "unsupported parameter" } }),
+            { status: 400, headers: { "content-type": "application/json" } },
+          ),
+          () => fakeGatewayFinalText(finalText),
+        ],
+      );
+
+      await session!.sendText("Send a request the provider rejects once.");
+      await session!.waitForText("The provider rejected this request · press Esc", TIMEOUT);
+      expect(queuedGateway.requests).toHaveLength(1);
+      await session!.sendKeys("Enter");
+      const scrollback = await waitForScrollback(
+        session!,
+        (value) => value.includes(finalText),
+        "answer after Enter",
+      );
+
+      expect(queuedGateway.requests).toHaveLength(2);
+      // The provider's reason showed once, while fx waited.
+      expect(countOccurrences(scrollback, "unsupported parameter")).toBe(1);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "out of credits shows the picker and retries after credits are added",
+    async () => {
+      const finalText = "CREDITS_ADDED_ANSWER";
+      const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
+        "fx-tui-route-out-of-credits-",
+        [
+          () => new Response(
+            JSON.stringify({ error: { code: "credit_card_required", message: "Buy credits to use AI Gateway." } }),
+            { status: 403, headers: { "content-type": "application/json" } },
+          ),
+          () => fakeGatewayFinalText(finalText),
+        ],
+      );
+
+      await session!.sendText("Answer once credits are back.");
+      const pane = await session!.waitForText("I added credits, retry", TIMEOUT);
+      expect(pane).toContain("Switch to another model");
+      expect(pane).toContain("Cancel this turn");
+      await session!.sendKeys("Enter");
+      const scrollback = await waitForScrollback(
+        session!,
+        (value) => value.includes(finalText),
+        "answer after credits",
+      );
+
+      expect(queuedGateway.requests).toHaveLength(2);
+      // The provider's reason showed once, while the picker was up.
+      expect(countOccurrences(scrollback, "credit_card_required")).toBe(1);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT * 2,
   );
 
   test(
