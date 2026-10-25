@@ -429,7 +429,10 @@ pub fn Runtime(comptime App: type) type {
 
         /// Reports blocked provider interaction without changing the composer.
         pub fn reject_provider_picker_if_busy(app: *App) !bool {
-            if (!auth_transition.provider_work_busy(app.stream.active, app.worker.queuedPromptCount())) return false;
+            // A request waiting for the sign-in fx opened has nothing in
+            // flight; it reads the new credential when it continues.
+            const turn_busy = app.stream.active and !requestWaitsForSignIn(app);
+            if (!auth_transition.provider_work_busy(turn_busy, app.worker.queuedPromptCount())) return false;
             try app.writeDomainNotice(.{
                 .topic = "provider",
                 .tone = .neutral,
@@ -1358,7 +1361,8 @@ pub fn Runtime(comptime App: type) type {
             var owned_model = try app.alloc.dupe(u8, selected_model);
             defer app.alloc.free(owned_model);
 
-            if (auth_transition.provider_work_busy(app.stream.active, app.worker.queuedPromptCount())) {
+            const turn_busy = app.stream.active and !requestWaitsForSignIn(app);
+            if (auth_transition.provider_work_busy(turn_busy, app.worker.queuedPromptCount())) {
                 try app.writeDomainNotice(.{
                     .topic = "provider",
                     .tone = .warning,
@@ -1943,8 +1947,36 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn resumePromptAfterAuth(app: *App) !void {
+            // A request waiting for this sign-in continues with it.
+            if (comptime @hasDecl(@TypeOf(app.shell), "worker_status_state") and
+                @hasDecl(@TypeOf(app.worker), "requestRecoveryContinue"))
+            {
+                if (app.shell.worker_status_state().waitsForSignIn()) {
+                    debug_trace.logf("auth", "signed in; continuing the waiting request", .{});
+                    app.worker.requestRecoveryContinue();
+                }
+            }
             if (comptime @hasDecl(App, "resumePromptAfterAuth")) {
                 try app.resumePromptAfterAuth();
+            }
+        }
+
+        fn requestWaitsForSignIn(app: *App) bool {
+            if (comptime !@hasDecl(@TypeOf(app.shell), "worker_status_state")) return false;
+            return app.shell.worker_status_state().waitsForSignIn();
+        }
+
+        /// A request waits for the user to sign in again: opens the sign-in
+        /// for the selected source. Signing in continues the request
+        /// (`resumePromptAfterAuth`), and Esc ends it.
+        pub fn beginRecoverySignIn(app: *App) !void {
+            const source = app.auth.credentialSource() orelse return;
+            debug_trace.logf("auth", "request waits for sign-in source={t}", .{source});
+            switch (source) {
+                .fx_login => try beginSignIn(app, false),
+                .chatgpt_subscription => try beginChatGptSignIn(app),
+                .grok_subscription => try beginGrokSignIn(app),
+                .vercel_oidc_token, .ai_gateway_api_key, .stored_key, .host_managed, .configured => {},
             }
         }
 

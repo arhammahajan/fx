@@ -1107,10 +1107,16 @@ pub fn Runtime(comptime App: type) type {
                         // The TUI shows nothing for how a request ended,
                         // recovered or failed; the error itself arrives on
                         // its own. The status line returns to normal activity.
+                        const was_waiting_for_sign_in = app.shell.worker_status_state().waitsForSignIn();
                         if (status.kind == .recovered or status.kind == .failed) {
                             _ = app.shell.worker_status_state().clear_route_recovery();
                         } else {
                             app.shell.worker_status_state().set_route_recovery(status);
+                        }
+                        // A request that starts waiting for a sign-in opens it,
+                        // once; signing in continues the request.
+                        if (!was_waiting_for_sign_in and app.shell.worker_status_state().waitsForSignIn()) {
+                            if (comptime @hasDecl(App, "beginRecoverySignIn")) try app.beginRecoverySignIn();
                         }
                         app.shell.render_requests.request(.footer);
                         try recordRouteRecoveryNotice(app, status);

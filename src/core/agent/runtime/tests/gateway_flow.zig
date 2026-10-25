@@ -8575,6 +8575,64 @@ test "processQueuedPrompt keeps ending a rejected request at once when the host 
     try std.testing.expectEqual(std.http.Status.bad_request, hooks.http_status.?);
 }
 
+test "processQueuedPrompt waits for a sign-in after an expired login and resends with the new credential" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{
+        .{ .status = .unauthorized, .err_body = "{\"error\":{\"message\":\"token expired\"}}" },
+        .{ .content = "signed in answer" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.credential_refresh_tokens = &.{ "token-before", "token-after" };
+    // The refresh token is rejected, so only a new sign-in helps.
+    hooks.credential_refresh_fail_force = true;
+    var fixture = PromptFixture{};
+    var continue_flag: std.atomic.Value(bool) = .init(false);
+    hooks.continue_on_need_user = &continue_flag;
+    var config = fixture.config();
+    config.recovery_continue_flag = &continue_flag;
+    var job = fixture.job();
+    job.credential_source = .fx_login;
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
+    try std.testing.expectEqualStrings("Sign-in expired · opening /login", needUserText(&hooks).?);
+    const modes = hooks.credential_refresh_modes.items;
+    try std.testing.expectEqualSlices(runtime_deps.CredentialRefreshMode, &.{ .if_needed, .force, .reload }, modes);
+    try std.testing.expectEqualStrings("token-before", gateway.request_api_keys.items[0]);
+    try std.testing.expectEqualStrings("token-after", gateway.request_api_keys.items[1]);
+    // The status line says fx is opening the sign-in; no reason notice.
+    try std.testing.expectEqual(@as(usize, 0), hooks.system_notices.items.len);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
+}
+
+test "processQueuedPrompt keeps the sign-in notice for a credential that /login cannot repair" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{
+        .{ .status = .unauthorized, .err_body = "{\"error\":{\"message\":\"invalid key\"}}" },
+        .{ .content = "MUST_NOT_RUN" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    var continue_flag: std.atomic.Value(bool) = .init(false);
+    var config = fixture.config();
+    config.recovery_continue_flag = &continue_flag;
+    var job = fixture.job();
+    job.credential_source = .ai_gateway_api_key;
+
+    try runFakePrompt(&gateway, &hooks, config, job);
+
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_models.items.len);
+    try std.testing.expect(needUserText(&hooks) == null);
+    try std.testing.expectEqual(std.http.Status.unauthorized, hooks.http_status.?);
+}
+
 const out_of_credits_body =
     \\{"error":{"code":"credit_card_required","message":"Buy credits to use AI Gateway."}}
 ;

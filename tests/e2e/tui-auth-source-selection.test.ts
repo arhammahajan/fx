@@ -2110,6 +2110,96 @@ tmuxTest(
 );
 
 tmuxTest(
+  "an expired login during a request opens sign-in and finishes the request",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-recovery-sign-in-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([
+      () => new Response(JSON.stringify({ error: { message: "token expired" } }), {
+        status: 401,
+        headers: { "content-type": "application/json" },
+      }),
+      fakeGatewayFinalText("SIGNED_IN_RECOVERY_RESPONSE"),
+    ]);
+    // The refresh token is rejected, so only a new sign-in can help.
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Infinity, {
+      rejectRefreshGrant: true,
+      teams: [{ id: "team_123", slug: "vercel-labs", name: "Vercel Labs" }],
+    });
+    writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl, "team_123");
+
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
+      AI_GATEWAY_API_KEY: undefined,
+    });
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("Answer after I sign in again.");
+    // fx opens the sign-in on its own; the fake approves the device code at
+    // once, so the team choice comes next.
+    const waiting = await session.waitForPane(
+      (pane) => pane.includes("Choose a team to finish setup"),
+      TIMEOUT,
+    );
+    expect(waiting).toContain("Sign-in expired · opening /login");
+    expect(gateway.requests).toHaveLength(1);
+    // The team list shows while the request waits.
+    await session.waitForText("› Vercel Labs", TIMEOUT);
+    await session.sendKeys("Enter");
+    await session.waitForText("SIGNED_IN_RECOVERY_RESPONSE", TIMEOUT);
+
+    expect(gateway.requests).toHaveLength(2);
+    expect(gateway.requests[0]?.headers.get("authorization")).toBe(`Bearer ${LOGIN_TOKEN}`);
+    expect(gateway.requests[1]?.headers.get("authorization")).toBe(`Bearer ${ACQUIRED_LOGIN_TOKEN}`);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+tmuxTest(
+  "one Esc during the sign-in fx opened closes it and ends the request",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-recovery-sign-in-esc-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([
+      () => new Response(JSON.stringify({ error: { message: "token expired" } }), {
+        status: 401,
+        headers: { "content-type": "application/json" },
+      }),
+      fakeGatewayFinalText("MUST_NOT_RUN"),
+    ]);
+    // The device code stays unapproved, so the sign-in screen stays up.
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Infinity, {
+      rejectRefreshGrant: true,
+      tokenDelayMs: 20_000,
+      teams: [{ id: "team_123", slug: "vercel-labs", name: "Vercel Labs" }],
+    });
+    writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl, "team_123");
+
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
+      AI_GATEWAY_API_KEY: undefined,
+    });
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("Stop while I would sign in.");
+    await session.waitForPane(
+      (pane) => pane.includes("Sign in with Vercel") && pane.includes("TEST-CODE") &&
+        pane.includes("Sign-in expired · opening /login"),
+      TIMEOUT,
+    );
+    await session.sendKeys("Escape");
+    await session.waitForPane(
+      (pane) => !pane.includes("Sign in with Vercel") && !pane.includes("Sign-in expired"),
+      TIMEOUT,
+    );
+    await session.waitForComposer(TIMEOUT);
+
+    expect(gateway.requests).toHaveLength(1);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+tmuxTest(
   "inline sign-in renders the device flow and Ctrl+C cancels without a session",
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-tui-inline-login-"));

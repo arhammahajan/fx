@@ -650,6 +650,8 @@ pub const FakeAgentRuntimeDeps = struct {
     credential_refresh_sources: std.ArrayList(types.CredentialSource) = .empty,
     credential_refresh_modes: std.ArrayList(runtime_deps.CredentialRefreshMode) = .empty,
     credential_refresh_error: ?anyerror = null,
+    /// A forced refresh finds nothing, as when the refresh token is rejected.
+    credential_refresh_fail_force: bool = false,
     last_credential_refresh_expected_account: ?[]u8 = null,
     enable_interactive_notices: bool = false,
     enable_recovery_checkpoint: bool = false,
@@ -895,6 +897,7 @@ pub const FakeAgentRuntimeDeps = struct {
         else
             null;
         if (self.credential_refresh_error) |err| return err;
+        if (self.credential_refresh_fail_force and mode == .force) return null;
         if (self.credential_refresh_index >= self.credential_refresh_tokens.len) return null;
         const token = self.credential_refresh_tokens[self.credential_refresh_index];
         self.credential_refresh_index += 1;

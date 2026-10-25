@@ -4319,7 +4319,11 @@ fn failureHttpStatus(kind: agent_stream_provider.FailureKind) std.http.Status {
 /// fx keeps its own handling, which ends the turn. Only a host that can ask
 /// the user calls this. A context overflow that reaches it already went
 /// through fx's compaction.
-fn needsUserFailureKind(alloc: Allocator, failure: agent_stream_provider.Failure) ?runtime_request_recovery.Failure.Kind {
+fn needsUserFailureKind(
+    alloc: Allocator,
+    failure: agent_stream_provider.Failure,
+    credential_source: ?types.CredentialSource,
+) ?runtime_request_recovery.Failure.Kind {
     if (failure.kind == .quota_exhausted or
         gateway_error_format.namesOutOfCredits(alloc, failure.detail orelse ""))
     {
@@ -4328,8 +4332,20 @@ fn needsUserFailureKind(alloc: Allocator, failure: agent_stream_provider.Failure
     if (isContextOverflowFailure(failure)) return .too_long;
     return switch (failure.kind) {
         .invalid_request, .forbidden, .request_too_large, .provider_error => .rejected,
-        // 429 and 5xx retry; a 401 keeps the sign-in notice.
-        .unauthorized, .rate_limited, .quota_exhausted, .server_error, .bad_gateway, .unavailable, .gateway_timeout => null,
+        // fx already refreshed the credential once. A source that /login
+        // repairs waits for the user to sign in; any other keeps its notice.
+        .unauthorized => if (signInRepairs(credential_source)) .sign_in else null,
+        // 429 and 5xx retry.
+        .rate_limited, .quota_exhausted, .server_error, .bad_gateway, .unavailable, .gateway_timeout => null,
+    };
+}
+
+/// Whether `/login` repairs the source, so fx can open it on its own.
+fn signInRepairs(credential_source: ?types.CredentialSource) bool {
+    const source = credential_source orelse return false;
+    return switch (source) {
+        .fx_login, .chatgpt_subscription, .grok_subscription => true,
+        .vercel_oidc_token, .ai_gateway_api_key, .stored_key, .host_managed, .configured => false,
     };
 }
 
@@ -6814,6 +6830,8 @@ fn processQueuedPromptLoop(
         var reset_stream_for_next_attempt = false;
         // The current failure's HTTP error notice is already on screen.
         var http_failure_notice_shown = false;
+        // The next send reads the stored credential again, after a sign-in.
+        var credential_reload_pending = false;
         var auth_retry_used = false;
         var assistant_prefill_recovery_used = false;
         var skip_next_preflight_refresh = false;
@@ -6850,18 +6868,20 @@ fn processQueuedPromptLoop(
             // A resend without Fast keeps it off for the rest of this request.
             const attempt_fast_mode = route_fast_mode and !request_recovery.send.no_fast;
             const just_rebuilt_request = skip_next_preflight_refresh and active_compaction_handoff != null and context_overflow_recovery != .pending;
-            if (skip_next_preflight_refresh) {
+            if (skip_next_preflight_refresh and !credential_reload_pending) {
                 skip_next_preflight_refresh = false;
             } else {
+                skip_next_preflight_refresh = false;
                 _ = try refreshGatewayCredentialForJob(
                     deps,
                     std.heap.c_allocator,
                     job,
-                    .if_needed,
+                    if (credential_reload_pending) .reload else .if_needed,
                     &active_api_key,
                     &owned_refreshed_api_key,
                     step_ctx,
                 );
+                credential_reload_pending = false;
             }
             provider_prompt = try build_provider_prompt_with_response_language_control(
                 overlay_arena,
@@ -7918,16 +7938,21 @@ fn processQueuedPromptLoop(
             if (response_failure) |failure| if (request_recovery.canAskUser() and
                 !config.cancel_flag.load(.seq_cst))
             {
-                if (needsUserFailureKind(arena, failure)) |kind| {
+                if (needsUserFailureKind(arena, failure, job.credential_source)) |kind| {
                     // The provider's reason stays visible while fx waits, and
-                    // after Esc, so the user knows what to change.
-                    try pushWaitingHttpFailureReason(deps, arena, failure, job, request_capabilities);
-                    http_failure_notice_shown = true;
+                    // after Esc, so the user knows what to change. A sign-in
+                    // needs no reason: fx opens it.
+                    if (kind != .sign_in) {
+                        try pushWaitingHttpFailureReason(deps, arena, failure, job, request_capabilities);
+                        http_failure_notice_shown = true;
+                    }
                     switch (try waitForUser(&request_recovery, deps, kind)) {
                         .resend => {
                             stream_result.deinit(arena);
                             stream_result_set = false;
                             http_failure_notice_shown = false;
+                            // The resend uses the credential the sign-in stored.
+                            if (kind == .sign_in) credential_reload_pending = true;
                             recovery_strategy = resend_strategy.select(.definitely_unsent, .none);
                             reset_stream_for_next_attempt = true;
                             continue;

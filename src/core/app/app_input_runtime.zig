@@ -2349,7 +2349,10 @@ pub fn Runtime(comptime App: type) type {
 
         fn submitAuthPickerSelection(app: *App) !bool {
             if (comptime !@hasField(App, "auth")) return false;
-            if (app.stream.active) return false;
+            // A running turn keeps its credential, except one waiting for the
+            // sign-in fx opened for it: nothing is in flight, and finishing
+            // the sign-in continues it.
+            if (app.stream.active and !recoveryWaitsForSignIn(app)) return false;
             if (!app.auth.pickerView().active) return false;
             const choice = app.auth.takePickerChoice(app.alloc) orelse {
                 app.shell.render_requests.request(.footer);
@@ -2739,8 +2742,12 @@ pub fn Runtime(comptime App: type) type {
                     _ = disarmEscapeInterrupt(app, "compaction_feedback");
                     return;
                 }
-                // A request that waits for the user ends on one Esc.
+                // A request that waits for the user ends on one Esc, which
+                // also closes a sign-in fx opened for it.
                 if (recoveryWaitsForUser(app)) {
+                    if (comptime @hasField(App, "auth")) {
+                        if (app.auth.pickerView().active) app.auth.closePicker(app.alloc);
+                    }
                     try interrupt_rt.cancelActiveOperation(app);
                     _ = disarmEscapeClear(app);
                     _ = disarmEscapeInterrupt(app, "recovery_need_user");
@@ -2813,6 +2820,11 @@ pub fn Runtime(comptime App: type) type {
         fn recoveryWaitsForUser(app: *App) bool {
             if (comptime !@hasDecl(@TypeOf(app.shell), "worker_status_state")) return false;
             return app.shell.worker_status_state().waitsForUser();
+        }
+
+        fn recoveryWaitsForSignIn(app: *App) bool {
+            if (comptime !@hasDecl(@TypeOf(app.shell), "worker_status_state")) return false;
+            return app.shell.worker_status_state().waitsForSignIn();
         }
 
         fn cancelSkillsMenu(app: *App) bool {
