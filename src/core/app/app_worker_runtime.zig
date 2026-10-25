@@ -737,7 +737,7 @@ pub fn Runtime(comptime App: type) type {
             }
             if (!was_approval_active and agent.approval_prompt.isActive()) {
                 if (comptime @hasDecl(App, "dispatchAttentionRequired")) {
-                    app.dispatchAttentionRequired(snapshot.active_turn_id, .permission);
+                    app.dispatchAttentionRequired(agent, snapshot.active_turn_id, .permission);
                 }
             }
 
@@ -1153,6 +1153,7 @@ pub fn Runtime(comptime App: type) type {
                                 app.shell.render_requests.request(.modal);
                                 if (comptime @hasDecl(App, "dispatchAttentionRequired")) {
                                     app.dispatchAttentionRequired(
+                                        agent,
                                         agent.worker.activeTurnId(),
                                         switch (question_snapshot.source) {
                                             .agent_question, .mcp_elicitation => .question,
@@ -2076,6 +2077,7 @@ const FakeApp = struct {
 
     pub fn dispatchAttentionRequired(
         self: *FakeApp,
+        _: anytype,
         turn_id: u64,
         kind: @import("../hooks/hooks.zig").AttentionKind,
     ) void {
