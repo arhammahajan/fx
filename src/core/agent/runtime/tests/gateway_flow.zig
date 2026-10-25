@@ -7793,7 +7793,7 @@ test "processQueuedPrompt replaces scheduled retry after provider pre-admission 
         &hooks,
         2,
         .terminal_provider_error,
-        "⚠ Network interrupted · TestProviderSerializationFailed · stopped after 1 attempt",
+        "⚠ Network interrupted · test provider serialization failed · stopped after 1 attempt",
     );
     try std.testing.expectEqual(@as(usize, 0), hooks.route_recovery_clear_count);
 }
@@ -7958,7 +7958,7 @@ test "processQueuedPrompt replaces retry status after an invalid replay completi
     try std.testing.expectEqual(@as(usize, 3), hooks.route_recovery_statuses.items.len);
     try expectModuleStatus(&hooks, 0, .waiting, "Connection lost · next try in ");
     try expectModuleStatus(&hooks, 1, .retrying, "Connection lost · retrying · attempt 2 · ");
-    try expectRouteStatus(&hooks, 2, .terminal_provider_error, "⚠ Provider unavailable · InvalidProviderCompletion · stopped after 2 attempts");
+    try expectRouteStatus(&hooks, 2, .terminal_provider_error, "⚠ Provider unavailable · invalid provider completion · stopped after 2 attempts");
 }
 
 test "processQueuedPrompt restarts an interrupted response until one completes" {

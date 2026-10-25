@@ -4805,7 +4805,7 @@ tmuxTest(
         FX_E2E_XAI_GROK_MODALITIES_URL: grok.modalitiesUrl,
       });
       await session.waitForComposer(TIMEOUT);
-      const failureVisible = session.waitForText("request failed: XaiGrokSseEventTooLarge", TIMEOUT);
+      const failureVisible = session.waitForText("request failed: reply too large to read", TIMEOUT);
       await session.sendText("Recover from a bounded Grok response.");
       await failureVisible;
       await session.sendText("Accept another prompt after recovery.");
@@ -4814,7 +4814,8 @@ tmuxTest(
       await session.waitForText("GROK_AFTER_LIMIT_OK", TIMEOUT);
 
       const scrollback = await session.captureFullScrollback();
-      expect(scrollback).toContain("XaiGrokSseEventTooLarge");
+      expect(scrollback).toContain("request failed: reply too large to read");
+      expect(scrollback).not.toContain("XaiGrokSseEventTooLarge");
       expect(grok.bodies).toHaveLength(3);
       expect(gateway.requests).toHaveLength(0);
       expect(readFileSync(stderrPath, "utf8")).toBe("");

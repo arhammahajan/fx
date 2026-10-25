@@ -2995,7 +2995,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         (value) => /stopped after 2\s+attempts/.test(value),
         "terminal failure after a retry",
       );
-      expect(scrollback).toContain("InvalidGatewaySseEvent");
+      expect(scrollback).toContain("unreadable reply");
+      expect(scrollback).not.toContain("InvalidGatewaySseEvent");
       expect(queuedGateway.requests).toHaveLength(2);
       await session!.waitForPane(
         (pane) => composerContains(pane, prompt),

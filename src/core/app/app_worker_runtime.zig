@@ -2797,7 +2797,7 @@ test "core.app_worker_runtime replaces a waiting status with its terminal attemp
 
     switch (app.shell.activityProjection()) {
         .turn_thinking => |thinking| try std.testing.expectEqualStrings(
-            "⚠ Provider unavailable · TestProviderSerializationFailed · stopped after 1 attempt",
+            "⚠ Provider unavailable · test provider serialization failed · stopped after 1 attempt",
             thinking.label,
         ),
         .none, .tool_slot => return error.TestUnexpectedResult,
