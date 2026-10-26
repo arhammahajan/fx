@@ -153,8 +153,6 @@ pub const State = struct {
         var arena: std.heap.ArenaAllocator = .init(std.heap.c_allocator);
         defer arena.deinit();
         const a = arena.allocator();
-        // The status line never shows sign-in state, so it doesn't wait for it.
-        const statuses = lease.host.runtime.statusesNow(a) catch return "";
         sink.mutex.lockUncancelable(io_mod.getIo());
         const news: ?[]const u8 = if (sink.news) |text|
             (if (now_ms - sink.news_at_ms < mcp_menu.news_ms) a.dupe(u8, text) catch null else null)
@@ -165,10 +163,13 @@ pub const State = struct {
         else
             null;
         sink.mutex.unlock(io_mod.getIo());
-        // After a prompt, and while servers start so the count shows once, not
-        // climbing, only a sign-in speaks up.
-        if (self.host_status_dismissed or
-            (self.host_started_ms != 0 and !mcp_menu.startupSettled(statuses, now_ms - self.host_started_ms)))
+        // After a prompt, only sign-in notices can use the slot; no server
+        // snapshot is needed.
+        if (self.host_status_dismissed)
+            return mcp_menu.statusLine(buf, &.{}, signing_in, news, 0);
+        const statuses = lease.host.runtime.statusesNow(a) catch return "";
+        // Wait for startup to settle so the attention count doesn't climb.
+        if (self.host_started_ms != 0 and !mcp_menu.startupSettled(statuses, now_ms - self.host_started_ms))
             return mcp_menu.statusLine(buf, &.{}, signing_in, news, 0);
         return mcp_menu.statusLine(buf, statuses, signing_in, news, lease.host.notes.len);
     }
