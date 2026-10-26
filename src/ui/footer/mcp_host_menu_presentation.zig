@@ -53,11 +53,19 @@ pub const Projection = struct {
         return l;
     }
 
-    /// The address's lines while the open server waits on a sign-in; none
+    /// The sign-in address while the open server waits for the browser; null
     /// once its tools load.
+    fn waitingAddress(p: Projection, r: menu.Row) ?[]const u8 {
+        const url = p.sign_in_url orelse return null;
+        if (url.len == 0 or menu.toolsFor(r, p.tools) == .ready) return null;
+        return url;
+    }
+
+    /// The address's own lines below the heading. A linkable address has
+    /// none: the heading's "here" links it. Any other is shown whole.
     fn waitingLines(p: Projection, r: menu.Row, width: u16) usize {
-        const url = p.sign_in_url orelse return 0;
-        if (url.len == 0 or menu.toolsFor(r, p.tools) == .ready) return 0;
+        const url = p.waitingAddress(r) orelse return 0;
+        if (linkable(url)) return 0;
         const w = addressWidth(width);
         return (url.len + w - 1) / w;
     }
@@ -95,6 +103,28 @@ fn serverRows(p: Projection, r: menu.Row, width: u16) usize {
 
 fn addressWidth(width: u16) usize {
     return @max(@as(usize, width) -| 4, 16);
+}
+
+/// The waiting sign-in's one line: its "here" links the whole address, so
+/// a long one never fills the screen. Narrow screens drop the lead first.
+fn clickHereRow(alloc: Allocator, url: []const u8, width: u16) !Row {
+    const leads = [_][]const u8{ "Waiting for the browser. Didn't open? Click ", "Didn't open? Click ", "Click " };
+    const lead = for (leads) |candidate| {
+        if (2 + candidate.len + "here.".len <= width) break candidate;
+    } else "";
+    var row: Row = .empty;
+    errdefer row.deinit(alloc);
+    try row.appendSlice(alloc, "  ");
+    try row.appendSlice(alloc, ui_render.dim_style);
+    try row.appendSlice(alloc, lead);
+    try row.appendSlice(alloc, ui_render.reset_style);
+    try row.appendSlice(alloc, "\x1b]8;id=fx-mcp-sign-in;");
+    try row.appendSlice(alloc, url);
+    try row.appendSlice(alloc, "\x1b\\\x1b[4mhere\x1b[24m\x1b]8;;\x1b\\");
+    try row.appendSlice(alloc, ui_render.dim_style);
+    try row.appendSlice(alloc, ".");
+    try row.appendSlice(alloc, ui_render.reset_style);
+    return row;
 }
 
 /// An address that can go in an OSC 8 link as it is: printable ASCII only,
@@ -291,24 +321,21 @@ fn serverLine(alloc: Allocator, arena: Allocator, p: Projection, r: menu.Row, l:
     }
     const after = at - cs.len;
     if (after == 0) return .empty;
-    if (after == 1 and l.waiting > 0) return row_text.composeTextRow(alloc, "Waiting for the browser. Didn't open? Go to:", width, ui_render.dim_style, 2);
+    if (after == 1) {
+        if (p.waitingAddress(r)) |url| {
+            if (linkable(url)) return clickHereRow(alloc, url, width);
+            return row_text.composeTextRow(alloc, "Waiting for the browser. Didn't open? Go to:", width, ui_render.dim_style, 2);
+        }
+    }
     if (after >= 2 and after < 2 + l.waiting) {
-        // The whole address, wrapped, never cut.
+        // An address a link can't carry is shown whole, wrapped, never cut.
         const url = p.sign_in_url orelse return .empty;
         const w = addressWidth(width);
         const from = @min((after - 2) * w, url.len);
         var row: Row = .empty;
         errdefer row.deinit(alloc);
         try row.appendSlice(alloc, "    ");
-        // One link on every row of it, so a click on any opens the whole address.
-        const linked = linkable(url);
-        if (linked) {
-            try row.appendSlice(alloc, "\x1b]8;id=fx-mcp-sign-in;");
-            try row.appendSlice(alloc, url);
-            try row.appendSlice(alloc, "\x1b\\\x1b[4m");
-        }
         try row_text.appendTerminalSafeSingleLine(alloc, &row, url[from..@min(from + w, url.len)], w);
-        if (linked) try row.appendSlice(alloc, "\x1b[24m\x1b]8;;\x1b\\");
         return row;
     }
     // From Log in until the address comes, the requests before it can take seconds.
@@ -746,7 +773,7 @@ test "Remove asks on its own row, at the same size" {
     try testing.expect(std.mem.find(u8, row.items, "\x1b[2J") == null);
 }
 
-test "a sign-in that waits shows its whole address on the server's screen" {
+test "a sign-in that waits links its address from one line" {
     var linear = testStatus("linear", .idle);
     linear.needs_login = true;
     const rows = [_]menu.Row{.{ .status = linear, .target = "https://mcp.linear.app/mcp" }};
@@ -754,42 +781,42 @@ test "a sign-in that waits shows its whole address on the server's screen" {
     var p: Projection = .{ .rows = &rows, .tools = .needs_login, .sign_in_url = url };
     menu.open(&p.state);
     _ = menu.press(&p.state, .{ .rows = &rows }, .enter);
-    const text = try render(p, 48);
+    const text = try render(p, 80);
     defer testing.allocator.free(text);
-    try testing.expect(std.mem.find(u8, text, "Waiting for the browser. Didn't open? Go to:") != null);
+    try testing.expect(std.mem.find(u8, text, "  Waiting for the browser. Didn't open? Click here.\n") != null);
     try testing.expect(std.mem.find(u8, text, "Its tools show here once you log in.") == null);
-    // 44 columns a line at width 48, every piece there, in order.
-    const first = std.mem.find(u8, text, "    " ++ url[0..44]).?;
-    try testing.expect(std.mem.find(u8, text[first..], "    " ++ url[44..]) != null);
-    // Title, three facts and a blank, two choices, a blank and the heading, two address lines.
-    try testing.expectEqual(@as(u16, 11), menuRowCount(p, 48, 40));
-    // No address, no extra lines.
+    try testing.expect(std.mem.find(u8, text, "https://linear.app/oauth") == null);
+    // Title, three facts and a blank, two choices, a blank and the heading:
+    // the address takes no lines of its own.
+    const count = menuRowCount(p, 80, 40);
+    try testing.expectEqual(@as(u16, 9), count);
     p.sign_in_url = null;
-    try testing.expectEqual(@as(u16, 9), menuRowCount(p, 48, 40));
+    try testing.expectEqual(@as(u16, 9), menuRowCount(p, 80, 40));
+    p.sign_in_url = url;
+
+    // "here" links the whole address, and narrow screens keep it.
+    for ([_]u16{ 80, 48, 24, 13 }) |width| {
+        var row = try composeRow(testing.allocator, p, menuRowCount(p, width, 40) - 1, width, menuRowCount(p, width, 40));
+        defer row.deinit(testing.allocator);
+        try testing.expect(std.mem.find(u8, row.items, "\x1b]8;id=fx-mcp-sign-in;" ++ url ++ "\x1b\\\x1b[4mhere\x1b[24m\x1b]8;;\x1b\\") != null);
+        try testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= width);
+    }
 }
 
-test "the waiting address is one link, on every row it wraps to" {
+test "an address a link can't carry is shown whole, without one" {
     var linear = testStatus("linear", .idle);
     linear.needs_login = true;
     const rows = [_]menu.Row{.{ .status = linear, .target = "https://mcp.linear.app/mcp" }};
-    const url = "https://linear.app/oauth/authorize?client_id=abc&state=0123456789abcdef0123456789&x=1";
-    var p: Projection = .{ .rows = &rows, .tools = .needs_login, .sign_in_url = url };
+    var p: Projection = .{ .rows = &rows, .tools = .needs_login };
     menu.open(&p.state);
     _ = menu.press(&p.state, .{ .rows = &rows }, .enter);
-    // The two address rows come last.
-    const count = menuRowCount(p, 48, 40);
-    inline for (.{ 2, 1 }, .{ url[0..44], url[44..] }) |back, piece| {
-        var row = try composeRow(testing.allocator, p, count - back, 48, count);
-        defer row.deinit(testing.allocator);
-        try testing.expect(std.mem.startsWith(u8, row.items, "    \x1b]8;id=fx-mcp-sign-in;" ++ url ++ "\x1b\\\x1b[4m"));
-        try testing.expect(std.mem.endsWith(u8, row.items, piece ++ "\x1b[24m\x1b]8;;\x1b\\"));
-        try testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= 48);
-    }
-
-    // An address that could end the sequence is shown, inert, without one.
     for ([_][]const u8{ "https://h/a\x1b\\\x1b]8;;evil", "https://h/a b", "https://h/\xc3\xa9" }) |odd| {
         p.sign_in_url = odd;
         const n = menuRowCount(p, 48, 40);
+        try testing.expectEqual(@as(u16, 10), n);
+        var heading = try composeRow(testing.allocator, p, n - 2, 48, n);
+        defer heading.deinit(testing.allocator);
+        try testing.expect(std.mem.find(u8, heading.items, "Didn't open? Go to:") != null);
         var row = try composeRow(testing.allocator, p, n - 1, 48, n);
         defer row.deinit(testing.allocator);
         try testing.expect(std.mem.find(u8, row.items, "\x1b]") == null);
@@ -876,7 +903,7 @@ test "a login under way says so until its address comes" {
     const waiting = try render(p, 80);
     defer testing.allocator.free(waiting);
     try testing.expect(std.mem.find(u8, waiting, "Signing in…") == null);
-    try testing.expect(std.mem.find(u8, waiting, "Waiting for the browser. Didn't open? Go to:") != null);
+    try testing.expect(std.mem.find(u8, waiting, "Waiting for the browser. Didn't open? Click here.") != null);
     // A server already signed in keeps its tools while it signs in again.
     var github = testStatus("github", .ready);
     github.signed_in = true;
