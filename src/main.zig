@@ -590,6 +590,7 @@ const App = struct {
 
     statusline_context: bool = false,
     statusline_session: bool = false,
+    statusline_usage: bool = true,
     /// Resolved `session_titles` preference: generate a model-written session
     /// title from the first prompt of a fresh session.
     session_title_generation: bool = true,
@@ -599,6 +600,9 @@ const App = struct {
     total_input_tokens: u64 = 0,
     total_output_tokens: u64 = 0,
     total_web_search_requests: u64 = 0,
+    /// What this session's main-agent requests cost, in US dollars, since fx
+    /// started or the session last changed. Kept in memory only.
+    session_cost_usd: f64 = 0,
 
     stream: StreamState = .{},
     metrics: Metrics = .{},

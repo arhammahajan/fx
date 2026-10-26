@@ -546,8 +546,10 @@ pub fn composeHintRow(
         danger_text
     else if (ctx.upgrade_status.len > 0)
         ctx.upgrade_status
+    else if (ctx.mcp_status.len > 0)
+        ctx.mcp_status
     else
-        ctx.mcp_status;
+        ctx.usage_status;
     const right_width = display_width.visibleWidth(right_text);
     const danger_visible = danger_text.len > 0 and right_text.ptr == danger_text.ptr;
     const left_width: u16 = if (!danger_visible and right_width > 0 and width_usize > right_width)
@@ -734,54 +736,14 @@ pub fn composeForkMenuHintRow(alloc: Allocator, width: u16, ctrl_c_pending: bool
     return row;
 }
 
-pub fn composeSettingsMenuHintRow(
-    alloc: Allocator,
-    width: u16,
-    ctrl_c_pending: bool,
-) !std.ArrayList(u8) {
-    if (ctrl_c_pending) {
-        var warning: std.ArrayList(u8) = .empty;
-        errdefer warning.deinit(alloc);
-        try warning.appendSlice(alloc, ui_render.statusline_style);
-        try row_text.appendClipped(alloc, &warning, "press ctrl+c again to exit", width);
-        try warning.appendSlice(alloc, ui_render.reset_style);
-        return warning;
-    }
-
-    const variants = [_][]const u8{
-        "↑↓ navigate     tab category     ←→ change     esc close",
-        "↑↓ navigate  tab category  ←→ change  esc close",
-        "↑↓ move  tab category  ←→ change  esc",
-        "tab category  ←→ change  esc",
-        "tab ←→ esc",
-    };
-    var hint = variants[variants.len - 1];
-    for (variants) |candidate| {
-        if (display_width.visibleWidth(candidate) <= width) {
-            hint = candidate;
-            break;
-        }
-    }
-
-    var row: std.ArrayList(u8) = .empty;
-    errdefer row.deinit(alloc);
-    try row.appendSlice(alloc, ui_render.dim_style);
-    try row_text.appendClipped(alloc, &row, hint, width);
-    try row.appendSlice(alloc, ui_render.reset_style);
-    return row;
-}
-
 pub fn composeCompactCommandMenuHintRow(
     alloc: Allocator,
     width: u16,
     menu: render_input.CompactCommandMenuProjection,
 ) !std.ArrayList(u8) {
     const variants = switch (menu) {
-        .statusline => [_][]const u8{
-            "↑↓ navigate     ←→ change     esc close",
-            "↑↓ move  ←→ change  esc",
-            "←→ esc",
-        },
+        // Shows the status line itself instead (`paint_plan.zig`).
+        .statusline => unreachable,
         .info_panel => |panel| if (panel.overflows) [_][]const u8{
             "↑↓ scroll     esc close",
             "↑↓ scroll  esc",

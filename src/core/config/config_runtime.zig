@@ -74,6 +74,7 @@ pub const Settings = struct {
     statusline_context: ?bool = null,
     statusline_session: ?bool = null,
     statusline_workspace: ?bool = null,
+    statusline_usage: ?bool = null,
     session_titles: ?bool = null,
     notification_turn_end: ?bool = null,
     notification_attention_required: ?bool = null,
@@ -1826,6 +1827,10 @@ fn parseProfileOnlyFields(
                 if (v != .bool) return error.InvalidStatusLineSessionType;
                 settings.statusline_session = v.bool;
             }
+            if (value.object.get("usage")) |v| {
+                if (v != .bool) return error.InvalidStatusLineUsageType;
+                settings.statusline_usage = v.bool;
+            }
             if (parse_workspace_statusline) {
                 if (value.object.get("workspace")) |v| {
                     if (v != .bool) return error.InvalidStatusLineWorkspaceType;
@@ -2008,6 +2013,7 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) !void
     if (incoming.statusline_context) |value| target.statusline_context = value;
     if (incoming.statusline_session) |value| target.statusline_session = value;
     if (incoming.statusline_workspace) |value| target.statusline_workspace = value;
+    if (incoming.statusline_usage) |value| target.statusline_usage = value;
     if (incoming.notification_turn_end) |value| target.notification_turn_end = value;
     if (incoming.notification_attention_required) |value| target.notification_attention_required = value;
     if (incoming.notification_max) |value| target.notification_max = value;
@@ -3820,6 +3826,13 @@ test "global statusline rejects malformed containers and fields" {
         parseSettingsJson(
             std.testing.allocator,
             "{\"statusLine\":{\"workspace\":1}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidStatusLineUsageType,
+        parseSettingsJson(
+            std.testing.allocator,
+            "{\"statusLine\":{\"usage\":1}}",
         ),
     );
 }

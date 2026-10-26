@@ -8711,6 +8711,9 @@ fn processQueuedPromptLoop(
                                     report_fn(deps.ctx, attempt_completion.usage);
                                 }
                             }
+                            if (deps.report_cost) |report_fn| {
+                                if (attempt_completion.cost_usd) |cost| report_fn(deps.ctx, cost);
+                            }
                             stream_ctx.drop_staged_response_language_candidate();
                             stream_result.deinit(arena);
                             stream_result_set = false;
@@ -9291,6 +9294,9 @@ fn processQueuedPromptLoop(
             if (completion.usage.input_tokens != null or completion.usage.output_tokens != null) {
                 report_fn(deps.ctx, completion.usage);
             }
+        }
+        if (deps.report_cost) |report_fn| {
+            if (completion.cost_usd) |cost| report_fn(deps.ctx, cost);
         }
 
         if (disposition == .completed and completion.tool_calls.len > 0) {

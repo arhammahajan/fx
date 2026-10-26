@@ -1463,12 +1463,19 @@ pub fn Runtime(comptime App: type) type {
             enableSubagentHostV2(app, v2);
         }
 
+        /// The status line's cost counts from zero for the session now open;
+        /// it is kept in memory, not saved with it.
+        fn resetSessionUsage(app: *App) void {
+            if (comptime @hasField(App, "session_cost_usd")) app.session_cost_usd = 0;
+        }
+
         pub fn beginFreshPersistedSession(app: *App) !void {
             closeWritableSession(app);
             // A fresh session starts with no usage, whether or not it persists.
             app.total_input_tokens = 0;
             app.total_output_tokens = 0;
             app.total_web_search_requests = 0;
+            resetSessionUsage(app);
             if (comptime runtime_profile.allows(App, .js_host_sessions)) {
                 try beginFreshJsHostSession(app);
             }
@@ -2193,6 +2200,7 @@ pub fn Runtime(comptime App: type) type {
             app.total_input_tokens = state.total_input_tokens;
             app.total_output_tokens = state.total_output_tokens;
             app.total_web_search_requests = 0;
+            resetSessionUsage(app);
 
             var historical_labels = HistoricalSessionLabels{ .workspace_root = app.workspace_root };
             defer historical_labels.deinit(app.alloc);

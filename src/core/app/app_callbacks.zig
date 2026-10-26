@@ -367,6 +367,7 @@ pub fn Bindings(comptime App: type) type {
                 .record_tool_call_rejected = agentRecordToolCallRejected,
                 .record_tool_call_failed = agentRecordToolCallFailed,
                 .report_usage = agentReportUsage,
+                .report_cost = agentReportCost,
                 .report_inner_tool_usage = agentReportInnerToolUsage,
                 .diff_marker_styles = .{
                     .added = ui_render.diff_added_marker_style,
@@ -1404,6 +1405,11 @@ pub fn Bindings(comptime App: type) type {
             const app: *App = @ptrCast(@alignCast(ctx));
             if (usage.input_tokens) |input| app.total_input_tokens = input;
             if (usage.output_tokens) |output| app.total_output_tokens = output;
+        }
+
+        fn agentReportCost(ctx: *anyopaque, cost_usd: f64) void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            if (comptime @hasField(App, "session_cost_usd")) app.session_cost_usd += cost_usd;
         }
 
         fn agentReportInnerToolUsage(ctx: *anyopaque, tool_name: []const u8, usage: types.ToolUsage) void {
