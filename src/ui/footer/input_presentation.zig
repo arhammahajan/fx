@@ -540,7 +540,7 @@ pub fn composeHintRow(
         esc_interrupt_hint
     else if (ctx.esc_clear_armed)
         "esc again to clear"
-    else if (question_hint != null)
+    else if (question_hint != null or ctx.ctrl_c_pending)
         ""
     else if (danger_text.len > 0)
         danger_text
@@ -1818,6 +1818,71 @@ test "compose hint row prioritizes red yolo warning with compact fallback" {
     defer suppressed.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.find(u8, suppressed.items, "esc again to clear") != null);
     try std.testing.expect(std.mem.find(u8, suppressed.items, "Full access") == null);
+}
+
+test "compose hint row keeps pending ctrl+c fully visible over ordinary notices at width 32" {
+    const alloc = std.testing.allocator;
+    const terminal = @import("../../core/terminal/engine.zig");
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+    var ctx = testRenderContext(&input);
+    ctx.ctrl_c_pending = true;
+    ctx.usage_status = "$0.90 · 12k tokens";
+    ctx.danger_status = "Full access enabled: fx permission checks disabled";
+    ctx.danger_status_compact = "Full access";
+
+    const Notice = enum { usage, mcp, upgrade };
+    for ([_]Notice{ .usage, .mcp, .upgrade }) |notice| {
+        ctx.mcp_status = if (notice == .mcp) "MCP reconnecting" else "";
+        ctx.upgrade_status = if (notice == .upgrade) "update ready: ctrl+g to reload" else "";
+        var row = try composeHintRow(alloc, false, ctx, 32);
+        defer row.deinit(alloc);
+        var grid = try terminal.Grid.init(alloc, 32, 2);
+        defer grid.deinit();
+        try grid.feed(row.items);
+        var visible: std.ArrayList(u8) = .empty;
+        defer visible.deinit(alloc);
+        try grid.rowTextTrimmed(1, &visible);
+        try std.testing.expectEqualStrings("press ctrl+c again to exit", visible.items);
+        try std.testing.expect(std.mem.find(u8, row.items, "$0.90") == null);
+        try std.testing.expect(std.mem.find(u8, row.items, "MCP reconnecting") == null);
+        try std.testing.expect(std.mem.find(u8, row.items, "update ready") == null);
+        try std.testing.expect(std.mem.find(u8, row.items, "Full access") == null);
+    }
+}
+
+test "compose hint row preserves question and armed escape priorities with pending ctrl+c" {
+    const alloc = std.testing.allocator;
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+    var ctx = testRenderContext(&input);
+    ctx.ctrl_c_pending = true;
+    ctx.usage_status = "$0.90 · 12k tokens";
+
+    ctx.esc_clear_armed = true;
+    var clear = try composeHintRow(alloc, false, ctx, 32);
+    defer clear.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, clear.items, "esc again to clear") != null);
+    try std.testing.expect(std.mem.find(u8, clear.items, "$0.90") == null);
+
+    ctx.esc_interrupt_armed = true;
+    var interrupt = try composeHintRow(alloc, false, ctx, 32);
+    defer interrupt.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, interrupt.items, "esc esc to interrupt") != null);
+    try std.testing.expect(std.mem.find(u8, interrupt.items, "esc again to clear") == null);
+    try std.testing.expect(std.mem.find(u8, interrupt.items, "$0.90") == null);
+
+    var prompt = question_prompt.QuestionPrompt{};
+    defer prompt.deinit(alloc);
+    try syncHintTestQuestion(&prompt);
+    ctx.question = prompt.projection();
+    ctx.esc_clear_armed = false;
+    ctx.esc_interrupt_armed = false;
+    var question = try composeHintRow(alloc, false, ctx, 32);
+    defer question.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, question.items, "enter answer · esc cancel") != null);
+    try std.testing.expect(std.mem.find(u8, question.items, "press ctrl+c") == null);
+    try std.testing.expect(std.mem.find(u8, question.items, "$0.90") == null);
 }
 
 test "compose hint row yields the yolo warning to a pending ctrl+c quit hint" {

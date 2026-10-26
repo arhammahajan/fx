@@ -1409,7 +1409,7 @@ pub fn Bindings(comptime App: type) type {
 
         fn agentReportCost(ctx: *anyopaque, cost_usd: f64) void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            if (comptime @hasField(App, "session_cost_usd")) app.session_cost_usd += cost_usd;
+            if (comptime @hasField(App, "session_persistence")) app.session_persistence.recordCost(cost_usd);
         }
 
         fn agentReportInnerToolUsage(ctx: *anyopaque, tool_name: []const u8, usage: types.ToolUsage) void {
@@ -2622,6 +2622,20 @@ test "interactive stream adapter queues byte-identical rendered spans" {
     try std.testing.expectEqual(@as(usize, 0), app.pacer.enqueue_count);
     try std.testing.expectEqual(@as(usize, 0), app.pacer.text.items.len);
     try std.testing.expectEqual(@as(usize, 0), app.pacer.flush_count);
+}
+
+test "cost callback accumulates every priced response without queue allocation" {
+    const CostApp = struct {
+        session_persistence: app_session_runtime.Persistence = .{},
+    };
+    var app: CostApp = .{};
+    defer app.session_persistence.deinit(std.testing.allocator);
+
+    // Includes a priced retry and the eventual completion, independently of
+    // whether the turn's presentation events can be allocated or delivered.
+    Bindings(CostApp).agentReportCost(&app, 0.125);
+    Bindings(CostApp).agentReportCost(&app, 0.375);
+    try std.testing.expectEqual(@as(f64, 0.5), app.session_persistence.sessionCost());
 }
 
 test "inner search tokens do not replace outer context counters" {

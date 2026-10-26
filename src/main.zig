@@ -600,9 +600,6 @@ const App = struct {
     total_input_tokens: u64 = 0,
     total_output_tokens: u64 = 0,
     total_web_search_requests: u64 = 0,
-    /// What this session's main-agent requests cost, in US dollars, since fx
-    /// started or the session last changed. Kept in memory only.
-    session_cost_usd: f64 = 0,
 
     stream: StreamState = .{},
     metrics: Metrics = .{},

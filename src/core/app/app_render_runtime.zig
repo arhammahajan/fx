@@ -887,7 +887,7 @@ pub fn Runtime(comptime App: type) type {
             return ui_render.buildUsageStatus(
                 &usage_status_buf,
                 app.statusline_usage,
-                app.session_cost_usd,
+                app.session_persistence.sessionCost(),
                 app.statusline_context,
                 app.total_input_tokens,
                 model_capabilities.resolveForApp(App, app, visible_model).context_window,
@@ -3850,7 +3850,6 @@ const CoordinatorTestApp = struct {
     effort: types.ReasoningEffort = .auto,
     statusline_context: bool = false,
     statusline_usage: bool = false,
-    session_cost_usd: f64 = 0,
     total_input_tokens: u64 = 0,
     intrinsic_fast_model: ?[]const u8 = null,
     gateway_metadata_model: ?[]const u8 = null,
@@ -4304,7 +4303,7 @@ test "core.app_render_runtime shows Opus 4.8's one million token context on the 
     try std.testing.expectEqualStrings("43k/1000k 4%", Runtime(CoordinatorTestApp).sessionUsageText(&app, model));
     // With Usage on, the cost comes first and the context still shows once.
     app.statusline_usage = true;
-    app.session_cost_usd = 0.9;
+    app.session_persistence.recordCost(0.9);
     try std.testing.expectEqualStrings("$0.90 · 43k/1000k 4%", Runtime(CoordinatorTestApp).sessionUsageText(&app, model));
     app.statusline_context = false;
     try std.testing.expectEqualStrings("$0.90 · 43k tokens", Runtime(CoordinatorTestApp).sessionUsageText(&app, model));
