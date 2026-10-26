@@ -1274,7 +1274,7 @@ describe("MCP login", () => {
     expect(await tui.captureFullScrollback()).not.toContain(ACCESS_INITIAL);
   }, 60_000);
 
-  test.skipIf(!tmuxAvailable())("while a sign-in waits, the server's screen says so and links its address", async () => {
+  test.skipIf(!tmuxAvailable())("while a sign-in waits, the server's screen says so and shows its whole address where links may not open", async () => {
     upstream = startModernMcpHttpFixture("json");
     auth = startAuthFixture(upstream.url);
     const root = createRoot(auth);
@@ -1288,12 +1288,12 @@ describe("MCP login", () => {
     await tui.waitForText("MCP servers  1", 10_000);
     await tui.sendKeys("Enter");
     await tui.waitForText("› Log in        /mcp login fixture", 15_000);
-    // No browser opens, so the sign-in waits, and the screen says what for in
-    // one line: "here" links the address, which takes no rows of its own.
+    // No browser opens, so the sign-in waits, and the screen says what for.
+    // tmux isn't a terminal fx knows opens links, so the address shows whole.
     await tui.sendKeys("Enter");
-    await tui.waitForText("Waiting for the browser. Didn't open? Click here.", 10_000);
+    await tui.waitForText("Waiting for the browser. Didn't open? Go to:", 10_000);
     const pane = await tui.capturePane();
-    expect(pane).not.toContain("/authorize?");
+    expect(pane).toContain("/authorize?");
     expect(pane).not.toContain("Its tools show here once you log in.");
     expect(auth.tokenExchanges).toBe(0);
   }, 60_000);
@@ -1310,7 +1310,8 @@ describe("MCP login", () => {
     gateway = startFakeGateway([], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
     tui = await TmuxSession.create({
       isolated: true, cwd: root.workspace, width: 100, height: 40,
-      env: { ...v2Env(root), FX_NO_OPEN_BROWSER: "1", FX_RECORD: tapePath, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
+      // A terminal fx knows opens links, so "here" links the address.
+      env: { ...v2Env(root), TERM_PROGRAM: "ghostty", FX_NO_OPEN_BROWSER: "1", FX_RECORD: tapePath, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
     });
     await tui.waitForComposer(15_000);
     await tui.sendText("/mcp");

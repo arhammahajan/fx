@@ -119,6 +119,7 @@ pub const explicitThemeName = theme_detection.explicitThemeName;
 pub const detectTheme = theme_detection.detectTheme;
 pub const parseOsc11Response = theme_protocol.parseOsc11Response;
 pub const truecolorSupportedForValues = theme_protocol.truecolorSupportedForValues;
+pub const hyperlinksSupportedForValues = theme_protocol.hyperlinksSupportedForValues;
 
 pub const InputLineView = struct {
     line: []const u8,
