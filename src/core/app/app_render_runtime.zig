@@ -771,6 +771,11 @@ pub fn Runtime(comptime App: type) type {
                     .tools = app.mcp.host_menu_tools,
                     .notes = app.mcp.host_menu_notes,
                     .sign_in_url = app.mcp.hostMenuSignInUrl(),
+                    // Read only while a sign-in waits, so it costs nothing else.
+                    .links = app.mcp.hostMenuSignInUrl() != null and ui_render.hyperlinksSupportedForValues(
+                        io_mod.getenv("TERM_PROGRAM"),
+                        io_mod.getenv("TERM"),
+                    ),
                 } else .{},
                 .help_menu = render_input.helpMenuProjection(
                     &app.input_runtime.help_menu,
