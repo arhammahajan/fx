@@ -92,6 +92,32 @@ pub fn truecolorSupportedForValues(colorterm: ?[]const u8, term_program: ?[]cons
     return true;
 }
 
+/// Whether the terminal turns OSC 8 into clickable links, from terminals
+/// known to. Unknown ones, tmux among them, count as no, so text that
+/// stands in for an address is only used where it opens.
+pub fn hyperlinksSupportedForValues(term_program: ?[]const u8, term: ?[]const u8) bool {
+    if (term_program) |value| {
+        for ([_][]const u8{ "ghostty", "iTerm.app", "WezTerm", "vscode" }) |known| {
+            if (std.mem.eql(u8, value, known)) return true;
+        }
+    }
+    if (term) |value| {
+        for ([_][]const u8{ "xterm-ghostty", "xterm-kitty", "wezterm" }) |known| {
+            if (std.mem.eql(u8, value, known)) return true;
+        }
+    }
+    return false;
+}
+
+test "hyperlinksSupportedForValues knows link terminals and doubts the rest" {
+    try std.testing.expect(hyperlinksSupportedForValues("ghostty", "xterm-ghostty"));
+    try std.testing.expect(hyperlinksSupportedForValues("iTerm.app", "xterm-256color"));
+    try std.testing.expect(hyperlinksSupportedForValues(null, "xterm-kitty"));
+    try std.testing.expect(!hyperlinksSupportedForValues("Apple_Terminal", "xterm-256color"));
+    try std.testing.expect(!hyperlinksSupportedForValues("tmux", "tmux-256color"));
+    try std.testing.expect(!hyperlinksSupportedForValues(null, null));
+}
+
 test "truecolorSupportedForValues honors COLORTERM over program name" {
     try std.testing.expect(truecolorSupportedForValues("truecolor", "Apple_Terminal"));
 }
