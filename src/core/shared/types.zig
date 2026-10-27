@@ -424,6 +424,11 @@ pub fn plainErrorText(raw: []const u8, buf: []u8) []const u8 {
         .{ "InvalidProviderFinishReason", "unreadable reply" },
         .{ "GatewaySseEventTooLarge", "reply too large to read" },
         .{ "XaiGrokSseEventTooLarge", "reply too large to read" },
+        // Storage faults read as fx says them on startup and in ACP.
+        .{ "AccessDenied", "permission denied" },
+        .{ "ReadOnlyFileSystem", "the disk is read-only" },
+        .{ "NoSpaceLeft", "the disk is full" },
+        .{ "FileTooBig", "a file-size limit was reached" },
     };
     inline for (pairs) |pair| {
         if (std.mem.eql(u8, raw, pair[0])) return pair[1];
@@ -789,6 +794,7 @@ test "model failure diagnostics read as plain words" {
         // A name fx knows has its own phrase.
         .{ .raw = "ReadFailed", .plain = "connection dropped" },
         .{ .raw = "TlsInitializationFailed", .plain = "couldn't make a secure connection" },
+        .{ .raw = "NoSpaceLeft", .plain = "the disk is full" },
         // Any other error name is split into words.
         .{ .raw = "InvalidProviderCompletion", .plain = "invalid provider completion" },
         .{ .raw = "HTTPRequestFailed", .plain = "http request failed" },
