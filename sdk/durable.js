@@ -2823,7 +2823,7 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
               let readAhead = null;
               if (retried) {
                 // Only the sender's read runs ahead. Admission still begins after
-                // the viewer's cursor and an abort check; until then a cancelled
+                // the viewer's stream position and an abort check; until then a cancelled
                 // prompt stores neither its input nor a targeted cancel.
                 const reading = aborted() ? null : created.session(sessionId).then(async (senderLog) => {
                   const entries = await senderLog.read();

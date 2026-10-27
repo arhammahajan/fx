@@ -5,8 +5,8 @@ EXTENDS Naturals
    storing the input that can produce new lines. Its read may overlap a log
    read. A failed stream lookup resolves to the empty start in the SDK and
    is represented by ViewerReady too. Queueing still follows persistence.
-   This model does not model leases or establish crash recovery; the adjacent
-   BackstopAdmission witness covers the rejected queue-before-log change. *)
+   This model checks the viewer boundary only; leases and crash recovery
+   remain covered by the existing durable-session models. *)
 CONSTANTS OverlapReads, WaitBeforeWrite
 VARIABLES viewerReady, logRead, stored, queued, accepted
 vars == <<viewerReady, logRead, stored, queued, accepted>>
