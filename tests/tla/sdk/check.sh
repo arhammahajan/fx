@@ -31,6 +31,14 @@ for candidate in "${JAVA_HOME:+$JAVA_HOME/bin/java}" /opt/homebrew/opt/openjdk/b
 done
 [ -n "$java" ] || { echo "no working Java runtime (set JAVA_HOME or brew install openjdk)" >&2; exit 2; }
 
+. ../lib/tlc.sh
+tlc_verdicts <<'CHECKS'
+ViewerAdmission ViewerAdmission-Serial-NoGate - -deadlock -workers 1
+ViewerAdmission ViewerAdmission-Serial-Gate - -deadlock -workers 1
+ViewerAdmission ViewerAdmission-Overlap-NoGate ViewerBeforeWrites -deadlock -workers 1
+ViewerAdmission ViewerAdmission-Overlap-Gate - -deadlock -workers 1
+CHECKS
+
 # A new private folder per run for logs and TLC state, so nothing planted in
 # the temp folder can redirect them. Logs print on failure, so it is removed.
 work="$(mktemp -d "${TMPDIR:-/tmp}/libfx-model-tlc.XXXXXX")"

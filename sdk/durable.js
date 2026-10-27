@@ -2748,7 +2748,7 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
       void resolved.catch(() => {});
       // With `inRequest`, a prompt runs here, in the request that took it,
       // where the durability allows (see `runInRequest`).
-      const send = async (message, { inRequest = false } = {}) => {
+      const send = async (message, { inRequest = false, readAhead = null } = {}) => {
         const { created, id: sessionId } = await resolved;
         const extra = {
           ...(seeded ? {} : { seed }),
@@ -2762,9 +2762,9 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
         // a turn runs or as whom (`tests/tla/sdk/TenantIsolation.tla`
         // OnlySentRuns), and a queue that ends with the process loses no
         // input.
-        const log = await created.session(sessionId);
-        const read = await log.read();
-        const newestSeen = log.newest?.();
+        const log = readAhead ? readAhead.log : await created.session(sessionId);
+        const read = readAhead ? readAhead.read : await log.read();
+        const newestSeen = readAhead ? readAhead.newestSeen : log.newest?.();
         const appended = await recordMessage(log, foldSessionLog(read), full);
         const queued = queuedMessage(full, created.store);
         const idempotencyKey = `${sessionId}:${message.type}:${message.messageId}`;
@@ -2812,25 +2812,31 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
             try {
               const read = input === undefined || ready === null || aborted() ? input : await ready();
               const message = { type, messageId, ...(input === undefined ? {} : { input: read }) };
-              const queue = () => {
+              const queue = (readAhead = null) => {
                 if (progress) progress.sent = true;
-                return send(message, { inRequest: type === "prompt" });
+                return send(message, { inRequest: type === "prompt", readAhead });
               };
               const { created, id: sessionId } = await resolved;
               const log = await created.session(sessionId);
               let attaching = type === "resume";
               let from = null;
-              // The viewer's start is read before the message is queued, so
-              // every line this message's own turn writes comes after it, and
-              // an end for this id before it can only be from a turn this id
-              // already ran.
-              if (retried) from = await log.ui.length();
+              let readAhead = null;
+              if (retried) {
+                // Only the sender's read runs ahead. Admission still begins after
+                // the viewer's cursor and an abort check; until then a cancelled
+                // prompt stores neither its input nor a targeted cancel.
+                const reading = aborted() ? null : created.session(sessionId).then(async (senderLog) => {
+                  const entries = await senderLog.read();
+                  return { log: senderLog, read: entries, newestSeen: senderLog.newest?.() };
+                });
+                if (reading) void reading.catch(() => {});
+                from = await log.ui.length();
+                if (reading && !aborted()) readAhead = await reading;
+              }
               if (retried && !aborted()) {
-                // The log, for that answer, is read alongside the one queue
-                // send.
                 const [state] = await Promise.all([
                   log.read().then(foldSessionLog),
-                  queue().then(() => accept.resolve({ messageId, sessionId })),
+                  queue(readAhead).then(() => accept.resolve({ messageId, sessionId })),
                 ]);
                 // One the log does not know yet is this send's own. When the
                 // log says it ran and nothing shows how, either this send's

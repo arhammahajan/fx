@@ -922,6 +922,91 @@ if (durabilityKind === "queue") {
 }
 
 if (durabilityKind === "queue") {
+  test("aborting during the viewer lookup stores nothing and leaves the message id reusable", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-viewer-abort-"));
+    dirs.push(dir);
+    const { durability, broker } = await queueWorldAt(dir, { queueLeases: true, runInRequest: true, maxDurationMs: 60_000 });
+    const stored = durability.world();
+    let enteredViewer, releaseViewer;
+    let firstLookup = true;
+    const atViewer = new Promise((resolve) => { enteredViewer = resolve; });
+    const gate = new Promise((resolve) => { releaseViewer = resolve; });
+    const writes = [];
+    const agent = createAgent({ durability: { ...durability, world: () => ({ ...stored,
+      streams: { ...stored.streams, getInfo: async (...args) => {
+        if (firstLookup) { firstLookup = false; enteredViewer(); await gate; }
+        return stored.streams.getInfo(...args);
+      } },
+      events: { ...stored.events, create: (...args) => { writes.push(args[1]); return stored.events.create(...args); } },
+    }) } });
+    try {
+      const session = agent.session();
+      const controller = new AbortController();
+      const first = session.prompt("withdrawn", { messageId: "reusable-id", signal: controller.signal });
+      await atViewer;
+      controller.abort();
+      releaseViewer();
+      assert.equal((await textOf(first)).result.stopReason, "cancelled");
+      await first.accepted;
+      assert.equal(writes.length, 0, "an abort before admission must store neither prompt nor targeted cancel");
+      assert.equal(broker.sent.length, 0);
+      const retry = session.prompt("retry-after-withdrawal", { messageId: "reusable-id" });
+      const { text, result } = await textOf(retry);
+      assert.equal(result.stopReason, "end_turn");
+      assert.notEqual(result.repeated, true);
+      assert.equal(text, "retry-after-withdrawal-0 retry-after-withdrawal-1 retry-after-withdrawal-2");
+    } finally {
+      releaseViewer();
+      await agent.close();
+    }
+  });
+
+  test("a retry's log read overlaps its viewer start, but writes and queueing wait for it", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-viewer-start-"));
+    dirs.push(dir);
+    const { durability, broker } = await queueWorldAt(dir, { queueLeases: true, runInRequest: true, maxDurationMs: 60_000 });
+    const stored = durability.world();
+    let releaseViewer, enteredRead;
+    let viewerFinished = false;
+    const gate = new Promise((resolve) => { releaseViewer = resolve; });
+    const readStarted = new Promise((resolve) => { enteredRead = resolve; });
+    let writesBeforeViewer = 0;
+    const agent = createAgent({ durability: {
+      ...durability,
+      world: () => ({ ...stored,
+        streams: { ...stored.streams, getInfo: async (...args) => {
+          await gate;
+          try { return await stored.streams.getInfo(...args); }
+          finally { viewerFinished = true; }
+        } },
+        events: { ...stored.events,
+          list: (...args) => { enteredRead(); return stored.events.list(...args); },
+          create: (...args) => { if (!viewerFinished) writesBeforeViewer += 1; return stored.events.create(...args); },
+        },
+      }),
+    } });
+    let timer;
+    try {
+      const turn = agent.session().prompt("overlap", { messageId: "viewer-overlap" });
+      await Promise.race([readStarted, new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error("log read waited for viewer start")), 1000);
+      })]);
+      clearTimeout(timer);
+      assert.equal(viewerFinished, false, "the viewer lookup is deliberately still pending");
+      assert.equal(writesBeforeViewer, 0);
+      assert.equal(broker.sent.length, 0, "the backstop still follows persistence");
+      releaseViewer();
+      const { text, result } = await textOf(turn);
+      assert.equal(result.stopReason, "end_turn");
+      assert.equal(text, "overlap-0 overlap-1 overlap-2");
+      assert.equal(writesBeforeViewer, 0, "no write outruns the viewer's start");
+    } finally {
+      clearTimeout(timer);
+      releaseViewer();
+      await agent.close();
+    }
+  });
+
   test("where the queue holds sessions, a prompt runs in the request that took it, and its queued message waits as a backstop", async () => {
     const internals = (agent) => agent[Symbol.for("libfx.durableInternals")];
     for (const [input, maxDurationMs] of [["nu", 60_000], ["xi3", 300]]) {

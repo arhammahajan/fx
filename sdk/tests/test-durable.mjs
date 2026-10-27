@@ -296,9 +296,11 @@ const listingsOf = (durability) => {
 // holds the next log read until `release`, and `onAppend`, `slowReads` and
 // `onUiWrite` watch or slow the rest.
 const probeLogs = (durability) => {
-  const probe = { armed: false, held: null, reached: null, slowReadsMs: 0, onAppend: null, onUiWrite: null };
-  probe.hold = () => {
+  const probe = { armed: false, held: null, reached: null, nextSession: false, targetLog: null, slowReadsMs: 0, onAppend: null, onUiWrite: null };
+  probe.hold = ({ nextSession = false } = {}) => {
     probe.armed = true;
+    probe.nextSession = nextSession;
+    probe.targetLog = null;
     let reached;
     probe.reached = new Promise((resolve) => { reached = resolve; });
     probe.held = new Promise((resolve) => { probe.release = resolve; });
@@ -315,10 +317,12 @@ const probeLogs = (durability) => {
           ...backend,
           async session(id) {
             const log = await backend.session(id);
+            const token = {};
+            if (probe.armed && probe.nextSession && probe.targetLog === null) probe.targetLog = token;
             return {
               ...log,
               async read() {
-                if (probe.armed) {
+                if (probe.armed && (!probe.nextSession || probe.targetLog === token)) {
                   probe.armed = false;
                   probe.arrive();
                   await probe.held;
@@ -927,8 +931,11 @@ if (durabilityKind === "memory") {
     const agent = createFxAgent(agentOptions(durability));
     const session = agent.session();
     assert.equal((await session.prompt("before").result).stopReason, "end_turn");
-    // The route's check of the log is held; the prompt is accepted anyway.
-    probe.hold();
+    // The previous worker can still be checking its end after result resolves.
+    // Hold the route's next log object, not that tail read or the sender's
+    // speculative read: acceptance must remain independent of the retry check.
+    await until(() => agent[Symbol.for("libfx.durableInternals")].liveWorkers() === 0, "the previous worker to finish");
+    probe.hold({ nextSession: true });
     const turn = session.prompt("first try", { messageId: "first-try" });
     await probe.reached;
     await Promise.race([
