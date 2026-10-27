@@ -3747,11 +3747,11 @@ const REAL_FULL_DISK = process.platform === "darwin";
 /// What each host says when it refuses, by cause.
 const GRID_SAYS: Record<"damaged" | "denied" | "busy" | "full", Record<GridHost, RegExp>> = {
   damaged: { ask: /InvalidSessionFormat/, app: /saved session is unreadable/, acp: /^Session could not be loaded$/ },
-  denied: { ask: /AccessDenied/, app: /permission denied/, acp: /permission denied/ },
+  denied: { ask: /AccessDenied/, app: /permission denied|AccessDenied/, acp: /permission denied/ },
   busy: { ask: /SessionBusy/, app: /another fx process may be using this session/, acp: /^Session is busy$/ },
   full: REAL_FULL_DISK
-    ? { ask: /NoSpaceLeft/, app: /the disk is full/, acp: /the disk is full/ }
-    : { ask: /FileTooBig/, app: /a file-size limit was reached/, acp: /a file-size limit was reached/ },
+    ? { ask: /NoSpaceLeft/, app: /NoSpaceLeft|the disk is full/, acp: /the disk is full/ }
+    : { ask: /FileTooBig/, app: /FileTooBig|a file-size limit was reached/, acp: /a file-size limit was reached/ },
 };
 
 /// A first reply over the blob limit, so every base session has a blob.
