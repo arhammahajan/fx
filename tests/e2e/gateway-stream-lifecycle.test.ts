@@ -5508,8 +5508,32 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     await new Promise<void>((resolve) => probe.close(() => resolve()));
     if (address === null || typeof address === "string") throw new Error("no loopback port");
     const port = address.port;
+    const serverPath = join(root.root, "service.py");
+    const logPath = join(root.root, "service.log");
+    // A bare socket server. http.server looks up the host name between bind
+    // and listen, which can outlast the call's timeout on macOS runners.
+    writeFileSync(
+      serverPath,
+      [
+        "import os, socket, sys",
+        "with open(sys.argv[2], 'w') as f: f.write(str(os.getpid()))",
+        "server = socket.socket()",
+        "server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)",
+        "server.bind(('127.0.0.1', int(sys.argv[1])))",
+        "server.listen()",
+        "while True:",
+        "    conn, _ = server.accept()",
+        "    try:",
+        "        if conn.recv(65536):",
+        "            conn.sendall(b'HTTP/1.1 200 OK\\r\\nContent-Length: 2\\r\\nConnection: close\\r\\n\\r\\nok')",
+        "    except OSError:",
+        "        pass",
+        "    conn.close()",
+        "",
+      ].join("\n"),
+    );
     const command = [
-      `setsid sh -c 'printf %s "$$" > ${JSON.stringify(pidPath)}; exec python3 -m http.server ${port} --bind 127.0.0.1' >${JSON.stringify(join(root.root, "service.log"))} 2>&1 &`,
+      `setsid python3 ${JSON.stringify(serverPath)} ${port} ${JSON.stringify(pidPath)} >${JSON.stringify(logPath)} 2>&1 &`,
       `until python3 -c 'import socket; socket.create_connection(("127.0.0.1", ${port}), 1).close()' 2>/dev/null; do sleep 0.1; done`,
       "printf SERVICE-READY",
     ].join("\n");
@@ -5557,8 +5581,12 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       await Bun.sleep(500);
       const response = await fetch(`http://127.0.0.1:${port}/`);
       expect(response.status).toBe(200);
-      await response.arrayBuffer();
+      expect(await response.text()).toBe("ok");
     } finally {
+      if (existsSync(logPath)) {
+        const serviceLog = readFileSync(logPath, "utf8");
+        if (serviceLog.length > 0) console.error(`service.log:\n${serviceLog}`);
+      }
       if (servicePid !== null && Number.isSafeInteger(servicePid) && servicePid > 0) {
         try {
           process.kill(servicePid, "SIGKILL");
