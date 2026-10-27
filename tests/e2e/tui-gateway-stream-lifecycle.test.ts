@@ -3009,7 +3009,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
-    "autonomous recovery does not render checkpointed partial output twice",
+    "a restarted answer replaces the half answer it broke off",
     async () => {
       const partialText = "Partial output before EOF.";
       const finalText = "Recovered final output once.";
@@ -3030,9 +3030,100 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const scrollback = await session!.captureFullScrollback();
 
       expect(queuedGateway.requests).toHaveLength(11);
-      expect(scrollback.split(partialText).length - 1).toBe(1);
+      // The new answer took the half answer's place, in scrollback too.
+      expect(scrollback).not.toContain(partialText);
       expect(scrollback.split(finalText).length - 1).toBe(1);
-      expect(scrollback).toContain("Response interrupted. Restarting.");
+      expect(scrollback).not.toContain("Restarted the answer");
+      expect(scrollback).not.toContain("Response interrupted");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "a restarted answer replaces a several-line half answer still on screen",
+    async () => {
+      const partialLines = Array.from({ length: 6 }, (_, index) => `On-screen half line ${index + 1}.`);
+      const finalText = "Recovered final output after a several-line half answer.";
+      const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
+        "fx-tui-recovery-medium-partial-",
+        [
+          partialEofResponse(partialLines.join("\n\n")),
+          fakeGatewayFinalText(finalText),
+        ],
+      );
+
+      await session!.sendText("Write a few lines that break off.");
+      await session!.waitForText(finalText, TIMEOUT);
+      await session!.waitForStableComposer(TIMEOUT);
+      const scrollback = await session!.captureFullScrollback();
+
+      expect(queuedGateway.requests).toHaveLength(2);
+      expect(scrollback).not.toContain("On-screen half line");
+      expect(scrollback.split(finalText).length - 1).toBe(1);
+      expect(scrollback).not.toContain("Restarted the answer");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "a half answer that scrolled into history stays and a short line marks the restart",
+    async () => {
+      const partialLines = Array.from({ length: 80 }, (_, index) => `Half answer line ${index + 1}.`);
+      const finalText = "Recovered final output after a tall half answer.";
+      const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
+        "fx-tui-recovery-tall-partial-",
+        [
+          partialEofResponse(partialLines.join("\n\n")),
+          fakeGatewayFinalText(finalText),
+        ],
+      );
+
+      await session!.sendText("Write a long answer that breaks off.");
+      await session!.waitForText(finalText, TIMEOUT);
+      await session!.waitForStableComposer(TIMEOUT);
+      const scrollback = await session!.captureFullScrollback();
+
+      expect(queuedGateway.requests).toHaveLength(2);
+      // Rows past the screen top are in the terminal's history, which fx
+      // cannot change, so the half answer stays, once, and a line marks the
+      // restart before the new answer.
+      expect(scrollback.split("Half answer line 1.").length - 1).toBe(1);
+      expect(scrollback.split("Half answer line 80.").length - 1).toBe(1);
+      expect(scrollback.split("↻ Restarted the answer").length - 1).toBe(1);
+      expect(scrollback.indexOf("Half answer line 80.")).toBeLessThan(scrollback.indexOf("↻ Restarted the answer"));
+      expect(scrollback.indexOf("↻ Restarted the answer")).toBeLessThan(scrollback.indexOf(finalText));
+      expect(scrollback.split(finalText).length - 1).toBe(1);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "a half answer with a finished code block stays and a short line marks the restart",
+    async () => {
+      const partialText = "Intro before the code.\n\n```js\nconst kept = 1;\n```\n\nText after the code";
+      const finalText = "Recovered final output after code.";
+      const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
+        "fx-tui-recovery-code-partial-",
+        [
+          partialEofResponse(partialText),
+          fakeGatewayFinalText(finalText),
+        ],
+      );
+
+      await session!.sendText("Write an answer with code that breaks off.");
+      await session!.waitForText(finalText, TIMEOUT);
+      await session!.waitForStableComposer(TIMEOUT);
+      const scrollback = await session!.captureFullScrollback();
+
+      expect(queuedGateway.requests).toHaveLength(2);
+      // The finished code block is final, so the half answer stays.
+      expect(scrollback.split("const kept = 1;").length - 1).toBe(1);
+      expect(scrollback.split("↻ Restarted the answer").length - 1).toBe(1);
+      expect(scrollback.indexOf("↻ Restarted the answer")).toBeLessThan(scrollback.indexOf(finalText));
+      expect(scrollback.split(finalText).length - 1).toBe(1);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     TIMEOUT * 2,
@@ -3173,7 +3264,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
-    "provider error after assistant output restarts a separate visible response",
+    "provider error after assistant output restarts the response in its place",
     async () => {
       const firstCatalogModel = "anthropic/claude-fable-5";
       const finalText = "A complete replacement response.";
@@ -3203,8 +3294,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const scrollback = await session!.captureFullScrollback();
 
       expect(queuedGateway.requests.length).toBe(2);
-      expect(scrollback.split("partial unsafe output").length - 1).toBe(1);
-      expect(scrollback).toContain(finalText);
+      // The restarted response took the broken-off one's place.
+      expect(scrollback).not.toContain("partial unsafe output");
+      expect(scrollback.split(finalText).length - 1).toBe(1);
       expect(scrollback).not.toContain("What should fx do?");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },

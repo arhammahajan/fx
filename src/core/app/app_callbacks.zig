@@ -1221,10 +1221,15 @@ pub fn Bindings(comptime App: type) type {
         fn agentPushText(ctx: *anyopaque, emission: agent_runtime.TextEmission) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             switch (emission) {
-                .assistant_started => {},
+                .assistant_started => try app_worker_runtime.Runtime(App).pushEvent(app, .{
+                    .assistant_presentation = .attempt_start,
+                }),
                 .assistant_source => {},
                 .assistant_rendered => |text| try app_worker_runtime.Runtime(App).pushText(app, text),
-                .assistant_restarted => |text| try app_worker_runtime.Runtime(App).pushText(app, text),
+                // pushEvent copies the payload into the queue's ownership.
+                .assistant_restarted => |text| try app_worker_runtime.Runtime(App).pushEvent(app, .{
+                    .assistant_presentation = .{ .attempt_restart = @constCast(text) },
+                }),
                 .operational => |text| try app_worker_runtime.Runtime(App).pushText(app, text),
             }
         }
@@ -1584,7 +1589,7 @@ const FakeWorker = struct {
             switch (event) {
                 .assistant_presentation => |presentation| switch (presentation) {
                     .table, .code_block => return error.TestSemanticPresentationPublicationFailure,
-                    .text, .thematic_rule => {},
+                    .text, .thematic_rule, .attempt_start, .attempt_restart => {},
                 },
                 else => {},
             }

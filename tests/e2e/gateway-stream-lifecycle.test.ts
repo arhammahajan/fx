@@ -10217,7 +10217,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           expect(retryPrompt.some(message => message.role === "assistant")).toBe(false);
           expect(retryPrompt.some(message => contentText(message.content) === fixture.streamedText)).toBe(false);
           if (fixture.name === "partial") {
-            expect(result.stderr).toContain("Response interrupted. Restarting.");
+            expect(result.stderr).toContain("↻ Restarted the answer");
           }
         }
         // The resend is the same request, with no word to the model that the
@@ -10296,7 +10296,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       });
       const json = parseAskJson(result.stdout);
 
-      expect(result.stderr).toContain("Response interrupted. Restarting.");
+      expect(result.stderr).toContain("↻ Restarted the answer");
       expect(result.stderr).not.toContain("HTTP 400");
       expect(result.code).toBe(0);
       expect(json.exit_code).toBe(0);
