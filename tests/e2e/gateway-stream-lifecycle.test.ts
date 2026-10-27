@@ -1153,7 +1153,7 @@ describe("gateway stream lifecycle", () => {
       expectOnlyLeadingSystemMessages(gateway.requests[0]!.body);
       expect(contentText(request.prompt[1]?.content)).toBe(WEB_SEARCH_GUIDANCE);
       expect(toolByName(oracleRequest, "shell")?.description).toBe(
-        "Run every command with shell.run. Fast commands complete in one call; commands still running after yield_time_ms return one owned session_id and remain available across turns. Use shell.interact with that exact session_id: omit chars to observe, or provide chars to send exact input and then observe. Use shell.stop only when termination is requested. output_delta is always terminal-safe; unsafe bytes are escaped while full_output_handle retains exact output, so do not run a separate command merely to test output safety or shell usability. Never detach with &, nohup, setsid, or double-forking. Each call starts a new shell with the user's startup files applied: their aliases, functions, and PATH are available, but cd, export, and alias changes do not carry over to the next call. In zsh, quote glob patterns meant for another program (for example '--include=*.zig') because unmatched globs are errors.",
+        "Run every command with shell.run. Fast commands complete in one call; commands still running after yield_time_ms return one owned session_id and remain available across turns. Use shell.interact with that exact session_id: omit chars to observe, or provide chars to send exact input and then observe. Use shell.stop only when termination is requested. output_delta is always terminal-safe; unsafe bytes are escaped while full_output_handle retains exact output, so do not run a separate command merely to test output safety or shell usability. Owned sessions end when fx exits; & and nohup jobs end with their command. To keep a service running, use `setsid <cmd> >log 2>&1 &` and check it is ready in that call. Each call starts a new shell with the user's startup files applied: their aliases, functions, and PATH are available, but cd, export, and alias changes do not carry over to the next call. In zsh, quote glob patterns meant for another program (for example '--include=*.zig') because unmatched globs are errors.",
       );
       expect(toolByName(oracleRequest, "skill")?.description).toContain(
         "the task clearly matches one",
@@ -5477,6 +5477,91 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         if (!isProcessAlive(pid)) continue;
         try {
           process.kill(pid, "SIGKILL");
+        } catch {}
+      }
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("a service started the way the shell description says keeps serving after fx ask exits", async () => {
+    const root = createFixtureRoot("shell-setsid-service");
+    const tracePath = join(root.root, "trace.log");
+    const pidPath = join(root.workspace, "service.pid");
+    const callId = "shell_setsid_service_start";
+    let path = process.env.PATH ?? "/usr/bin:/bin";
+    if (!Bun.which("setsid")) {
+      // macOS ships no setsid. This does what util-linux setsid does for a
+      // process that is not a process group leader.
+      const binDir = join(root.root, "bin");
+      mkdirSync(binDir, { recursive: true });
+      writeFileSync(
+        join(binDir, "setsid"),
+        "#!/bin/sh\nexec python3 -c 'import os,sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \"$@\"\n",
+        { mode: 0o755 },
+      );
+      path = `${binDir}:${path}`;
+    }
+    const probe = createServer();
+    await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", resolve));
+    const address = probe.address();
+    await new Promise<void>((resolve) => probe.close(() => resolve()));
+    if (address === null || typeof address === "string") throw new Error("no loopback port");
+    const port = address.port;
+    const command = [
+      `setsid sh -c 'printf %s "$$" > ${JSON.stringify(pidPath)}; exec python3 -m http.server ${port} --bind 127.0.0.1' >${JSON.stringify(join(root.root, "service.log"))} 2>&1 &`,
+      `until python3 -c 'import socket; socket.create_connection(("127.0.0.1", ${port}), 1).close()' 2>/dev/null; do sleep 0.1; done`,
+      "printf SERVICE-READY",
+    ].join("\n");
+    let step = 0;
+    let started: ShellResult | null = null;
+    let servicePid: number | null = null;
+    let gatewayObservationError: unknown;
+    const gateway = startGateway((body) => {
+      switch (step++) {
+        case 0:
+          return fakeShellRun(callId, command, { profile: "clean", timeout_ms: 15_000 });
+        case 1:
+          try {
+            started = shellResult(body, callId);
+          } catch (error) {
+            gatewayObservationError = error;
+          }
+          return fakeGatewayFinalText("The service is running.");
+        default:
+          return new Response("unexpected request", { status: 500 });
+      }
+    });
+
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--yolo", "--no-save", "Start the service and leave it running."],
+        {
+          cwd: root.workspace,
+          env: { ...fixtureEnv(root, gateway, tracePath), PATH: path },
+          timeoutMs: 25_000,
+        },
+      );
+      servicePid = Number.parseInt(readFileSync(pidPath, "utf8"), 10);
+
+      if (gatewayObservationError) throw gatewayObservationError;
+      expect(result.code).toBe(0);
+      expect(gateway.requestCount()).toBe(2);
+      expect(started).toMatchObject({
+        state: "completed",
+        exit_code: 0,
+        error: null,
+        output_delta: "SERVICE-READY",
+      });
+      // Connect only after fx has exited, as a later check of the machine would.
+      await Bun.sleep(500);
+      const response = await fetch(`http://127.0.0.1:${port}/`);
+      expect(response.status).toBe(200);
+      await response.arrayBuffer();
+    } finally {
+      if (servicePid !== null && Number.isSafeInteger(servicePid) && servicePid > 0) {
+        try {
+          process.kill(servicePid, "SIGKILL");
         } catch {}
       }
       gateway.stop();
