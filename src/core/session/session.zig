@@ -49,6 +49,25 @@ pub const interrupted_turn_context =
     "Do not continue this request unless the user explicitly asks to continue.\n" ++
     "</turn_aborted>";
 
+/// What the model reads in place of a user message when the app resumes a
+/// request a previous fx process left unfinished. The turn before it is the
+/// interrupted one, and a tool that was running there is answered as
+/// possibly run.
+pub const resumed_request_prompt =
+    "<session_resumed>\n" ++
+    "fx stopped before the previous turn finished, because it crashed or its window was closed. " ++
+    "A tool that was running may have partly run. Check what finished, rerun only what is safe to repeat, " ++
+    "and continue the previous request.\n" ++
+    "</session_resumed>";
+
+/// What the transcript shows in place of `resumed_request_prompt`, live and
+/// when the session is replayed.
+pub const resumed_request_notice: core_types.SemanticNotice = .{
+    .topic = "session",
+    .tone = .neutral,
+    .body = "Resuming the interrupted request",
+};
+
 pub fn projectSnapshotLocator(buffer: []u8, path: []const u8) ![]const u8 {
     if (!std.Io.Dir.path.isAbsolute(path)) return path;
     return std.mem.print(buffer, "images/{s}", .{std.Io.Dir.path.basename(path)});

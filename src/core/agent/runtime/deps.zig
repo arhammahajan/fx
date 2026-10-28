@@ -43,6 +43,9 @@ pub const TurnProgress = struct {
     /// The text of the message that issued `running_calls`, so a crash also
     /// leaves what fx already showed (D51).
     running_assistant: ?[]const u8 = null,
+    /// The recovery module's record for the send this write goes before,
+    /// saved in the same write (`tests/tla/recovery/Resume.tla`).
+    recovery_record: types.RecoveryRecordWrite = .keep,
 };
 
 /// Borrows checkpoint slices only for the call. A sink must synchronously copy
@@ -251,6 +254,12 @@ pub const AgentRuntimeDeps = struct {
     /// Called at every model-request boundary with the turn so far, so each
     /// completed piece is saved as it happens rather than at the turn's end.
     append_turn_piece: ?*const fn (ctx: *anyopaque, progress: TurnProgress) anyerror!void = null,
+    /// Saves or clears the recovery module's record in the open turn outside
+    /// the writes before and after each send, which carry it in
+    /// `TurnProgress.recovery_record`. Returns false when the turn has no
+    /// pieces on disk yet. Null on hosts that never resume a request, which
+    /// keep no record.
+    save_recovery_record: ?*const fn (ctx: *anyopaque, record: types.RecoveryRecordWrite) anyerror!bool = null,
     /// Saves the turn's prompt images in the session before its first
     /// request is built, so the note naming each saved file is true when
     /// that request is sent (D89). It sets `blob_path`, allocated with

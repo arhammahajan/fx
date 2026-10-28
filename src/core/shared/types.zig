@@ -2195,6 +2195,23 @@ pub const AssistantHistoryTurn = struct {
     provider_replay: ?ProviderReplay = null,
 };
 
+/// What a turn write does with the recovery module's record for the model
+/// request in flight (`src/core/recovery/recovery.zig` `Record`): leave it,
+/// save these bytes, or clear it because the request's response is complete.
+/// A model request a previous fx process left unfinished, which a turn
+/// resumes: the record its turn saved last, if any, and whether it was
+/// interrupted more than a day ago.
+pub const RecoveryResume = struct {
+    record: ?[32]u8 = null,
+    stale: bool = false,
+};
+
+pub const RecoveryRecordWrite = union(enum) {
+    keep,
+    save: [32]u8,
+    clear,
+};
+
 pub const InterruptedTerminalReason = enum {
     cancelled,
     failed,

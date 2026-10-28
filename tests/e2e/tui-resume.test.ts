@@ -25,10 +25,12 @@ import {
   fakeGatewaySerializedToolCall,
   fakeGatewaySse,
   fakeGatewayToolCall,
+  fakeShellRun,
   hasEmptyComposer,
   isEmptyComposerLine,
   isVolatileTokenStatusRow,
   paneExitMatches,
+  startDynamicFakeGateway,
   startFakeGateway,
   startUpgradeServer,
   TmuxSession,
@@ -7963,3 +7965,244 @@ test.skipIf(!tmuxAvailable())("resumed command rows reclip to live width after t
     rmSync(root, { recursive: true, force: true });
   }
 }, 60_000);
+
+// Auto-resume: a request fx was running when it died or its window closed
+// goes out again on the next `-c`, as `tests/tla/recovery/Resume.tla`
+// models it.
+
+const RESUME_NOTE = "<session_resumed>";
+
+function resumeFixture(prefix: string) {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), prefix)));
+  const home = join(root, "home");
+  const workspace = join(root, "workspace");
+  mkdirSync(join(home, ".fx"), { recursive: true });
+  mkdirSync(workspace);
+  writeFileSync(
+    join(home, ".fx", "settings.json"),
+    JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+  );
+  return { root, home, workspace: realpathSync(workspace) };
+}
+
+async function launchFx(
+  fixture: ReturnType<typeof resumeFixture>,
+  gateway: ReturnType<typeof startFakeGateway>,
+  args: string,
+  name: string,
+) {
+  const stderrPath = join(fixture.root, `${name}-stderr.log`);
+  writeFileSync(stderrPath, "");
+  const session = await TmuxSession.create({
+    cmd: `${FX_BIN} ${args}`.trim(),
+    cwd: fixture.workspace,
+    env: gatewayEnv(fixture.home, gateway),
+    stderrPath,
+    width: 100,
+    height: 32,
+  });
+  await session.waitForComposer(TIMEOUT);
+  return { session, stderrPath };
+}
+
+/// Kills fx the way the test names it and waits for the process to go.
+async function endFx(session: TmuxSession, signal: "SIGKILL" | "SIGHUP") {
+  const pid = session.processPid();
+  process.kill(pid, signal);
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    try {
+      process.kill(pid, 0);
+    } catch {
+      break;
+    }
+    await Bun.sleep(25);
+  }
+  await session.kill();
+}
+
+test.skipIf(!tmuxAvailable())(
+  "a request fx was killed during goes out again on the next -c",
+  async () => {
+    const fixture = resumeFixture("fx-auto-resume-kill-");
+    let reached: () => void = () => {};
+    const inFlight = new Promise<void>((resolve) => (reached = resolve));
+    const gateway = startDynamicFakeGateway(async (body) => {
+      if (body.includes(RESUME_NOTE)) return fakeGatewayFinalText("RESUMED_ANSWER_7310");
+      if (body.includes("Plan the trip.")) {
+        reached();
+        return new Promise<Response>(() => {});
+      }
+      return fakeGatewayFinalText("UNEXPECTED");
+    });
+    let active: TmuxSession | null = null;
+    try {
+      const first = await launchFx(fixture, gateway, "", "first");
+      active = first.session;
+      await active.sendText("Plan the trip.");
+      await inFlight;
+      await endFx(active, "SIGKILL");
+      active = null;
+
+      const before = gateway.requests.length;
+      const second = await launchFx(fixture, gateway, "-c", "second");
+      active = second.session;
+      const pane = await active.waitForText("RESUMED_ANSWER_7310", TIMEOUT);
+      expect(pane).toContain("Resuming the interrupted request");
+      // The note is for the model; the transcript never shows it.
+      expect(pane).not.toContain(RESUME_NOTE);
+      const resumed = gateway.requests.slice(before).find((request) => request.body.includes(RESUME_NOTE));
+      expect(resumed).toBeTruthy();
+      // The model sees the interrupted prompt before the note.
+      expect(resumed!.body).toContain("Plan the trip.");
+      await active.waitForComposer(TIMEOUT);
+      expect(readFileSync(second.stderrPath, "utf8")).toBe("");
+    } finally {
+      await active?.kill();
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 3,
+);
+
+/// A gateway that holds every request for `prompt` and its resumes, so each
+/// launch dies with a send in flight, and answers other requests.
+function holdingGateway(prompt: string) {
+  let notify: () => void = () => {};
+  let held = 0;
+  const gateway = startDynamicFakeGateway(async (body) => {
+    if (body.includes(prompt)) {
+      held += 1;
+      notify();
+      return new Promise<Response>(() => {});
+    }
+    return fakeGatewayFinalText("UNRELATED");
+  });
+  const heldAtLeast = async (count: number) => {
+    const deadline = Date.now() + TIMEOUT;
+    while (held < count) {
+      if (Date.now() > deadline) throw new Error(`expected ${count} held requests, saw ${held}`);
+      await new Promise<void>((resolve) => {
+        notify = resolve;
+        setTimeout(resolve, 100);
+      });
+    }
+  };
+  return { gateway, heldAtLeast, held: () => held };
+}
+
+test.skipIf(!tmuxAvailable())(
+  "a request that crashed fx twice asks first, and Esc there ends it for good",
+  async () => {
+    const fixture = resumeFixture("fx-auto-resume-loop-");
+    const { gateway, heldAtLeast, held } = holdingGateway("Crash me.");
+    let active: TmuxSession | null = null;
+    try {
+      active = (await launchFx(fixture, gateway, "", "first")).session;
+      await active.sendText("Crash me.");
+      await heldAtLeast(1);
+      await endFx(active, "SIGKILL");
+      // One crash resends on its own.
+      active = (await launchFx(fixture, gateway, "-c", "second")).session;
+      await heldAtLeast(2);
+      await endFx(active, "SIGKILL");
+
+      // The second crash with the send in flight asks before sending.
+      active = (await launchFx(fixture, gateway, "-c", "third")).session;
+      await active.waitForText("This request crashed fx twice", TIMEOUT);
+      await Bun.sleep(300);
+      expect(held()).toBe(2);
+      await active.sendKeys("Escape");
+      await active.waitForComposer(TIMEOUT);
+      await active.kill();
+
+      // Esc ended it: the next launch sends nothing.
+      const last = await launchFx(fixture, gateway, "-c", "fourth");
+      active = last.session;
+      await Bun.sleep(1_000);
+      expect(held()).toBe(2);
+      const replayed = await active.captureFullScrollback();
+      expect(replayed).not.toContain("Resuming the interrupted request · attempt");
+      // The earlier resumes replay as their line, never as fx's note.
+      expect(replayed).toContain("Resuming the interrupted request");
+      expect(replayed).not.toContain(RESUME_NOTE);
+      expect(readFileSync(last.stderrPath, "utf8")).toBe("");
+    } finally {
+      await active?.kill();
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 4,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "closing the window is not a crash: two closes in flight still resume without asking",
+  async () => {
+    const fixture = resumeFixture("fx-auto-resume-close-");
+    const { gateway, heldAtLeast } = holdingGateway("Keep going.");
+    let active: TmuxSession | null = null;
+    try {
+      active = (await launchFx(fixture, gateway, "", "first")).session;
+      await active.sendText("Keep going.");
+      await heldAtLeast(1);
+      await endFx(active, "SIGHUP");
+      active = (await launchFx(fixture, gateway, "-c", "second")).session;
+      await heldAtLeast(2);
+      await endFx(active, "SIGHUP");
+
+      const third = await launchFx(fixture, gateway, "-c", "third");
+      active = third.session;
+      await heldAtLeast(3);
+      expect(await active.capturePane()).not.toContain("crashed fx twice");
+      expect(readFileSync(third.stderrPath, "utf8")).toBe("");
+    } finally {
+      await active?.kill();
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 4,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "a crash while a tool runs resumes with that tool answered as possibly run",
+  async () => {
+    const fixture = resumeFixture("fx-auto-resume-tool-");
+    let toolStarted: () => void = () => {};
+    const running = new Promise<void>((resolve) => (toolStarted = resolve));
+    const gateway = startDynamicFakeGateway(async (body) => {
+      if (body.includes(RESUME_NOTE)) return fakeGatewayFinalText("TOOL_RESUMED_4402");
+      if (body.includes("Run the slow step.")) {
+        toolStarted();
+        return fakeShellRun("resume-slow-1", "sleep 30");
+      }
+      return fakeGatewayFinalText("UNRELATED");
+    });
+    let active: TmuxSession | null = null;
+    try {
+      active = (await launchFx(fixture, gateway, "", "first")).session;
+      await active.sendText("Run the slow step.");
+      await running;
+      await active.waitForText("sleep 30", TIMEOUT);
+      await endFx(active, "SIGKILL");
+
+      const before = gateway.requests.length;
+      const second = await launchFx(fixture, gateway, "-c", "second");
+      active = second.session;
+      await active.waitForText("TOOL_RESUMED_4402", TIMEOUT);
+      const resumed = gateway.requests.slice(before).find((request) => request.body.includes(RESUME_NOTE));
+      expect(resumed).toBeTruthy();
+      // The call that was running is answered as possibly run, so the model
+      // decides whether running it again is safe.
+      expect(resumed!.body).toContain("fx stopped while this tool was running");
+      expect(readFileSync(second.stderrPath, "utf8")).toBe("");
+    } finally {
+      await active?.kill();
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 3,
+);
