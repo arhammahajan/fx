@@ -6,9 +6,11 @@ import json
 import os
 import pathlib
 import tempfile
+import types
 import unittest
 from unittest import mock
 
+from scripts.pgso import macos
 from scripts.pgso.model import PgsoError
 from scripts.pgso.pipeline import PipelinePaths
 from scripts.pgso.profile_supplement import MappedProfile, ProfileSupplement
@@ -692,10 +694,11 @@ class PgsoQualificationTests(unittest.TestCase):
                 "scripts.pgso.qualify.build_external_o2_control",
                 return_value=external,
             ),
-            mock.patch(
-                "scripts.pgso.qualify.read_macos_minos",
-                return_value="15.0",
-            ) as read_minos,
+            mock.patch.object(
+                macos,
+                "read_control_identity",
+                return_value={"minimum_macos": "15.0"},
+            ) as read_identity,
             mock.patch(
                 "scripts.pgso.qualify.build_instrumented",
                 return_value=(raw_profile,),
@@ -704,11 +707,13 @@ class PgsoQualificationTests(unittest.TestCase):
             mock.patch("scripts.pgso.qualify.apply_profile"),
             mock.patch("scripts.pgso.qualify.link_candidate", return_value=candidate),
         ):
-            pair = build_benchmark_pair(object(), self.root, output, plan)
+            pair = build_benchmark_pair(
+                types.SimpleNamespace(platform=macos), self.root, output, plan,
+            )
 
         self.assertEqual(external, pair.control_binary)
-        self.assertEqual(external, read_minos.call_args.args[1])
-        self.assertEqual("15.0", instrument.call_args.args[2])
+        self.assertEqual(external, read_identity.call_args.args[1])
+        self.assertEqual({"minimum_macos": "15.0"}, instrument.call_args.args[2])
 
     def test_builds_all_profile_linked_benchmarks_before_candidate_link(self) -> None:
         paths = PipelinePaths.create(self.root / "run")
