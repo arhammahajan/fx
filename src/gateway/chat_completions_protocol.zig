@@ -167,7 +167,7 @@ fn validate_request(request: stream_provider.RequestData) Error!void {
     try request.validatePrompt();
     configured_provider.validate_model_id(request.model) catch return error.InvalidModel;
     const options = request.provider_options;
-    if (options.reasoning != null or options.fast or options.prompt_caching) return error.UnsupportedProviderOption;
+    if (options.fast or options.prompt_caching) return error.UnsupportedProviderOption;
     if (options.provider_order.len != 0) return error.UnsupportedProviderOption;
     if (request.response_format != null) return error.UnsupportedResponseFormat;
     // The vision tool runs through a separate provider request; inline image
@@ -603,6 +603,12 @@ fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provi
         }
     }
     if (request.max_output_tokens) |limit| try writer.print(",\"max_tokens\":{d}", .{limit});
+    if (request.provider_options.reasoning) |effort| {
+        if (effort.gatewayValue()) |value| {
+            try writer.writeAll(",\"reasoning_effort\":");
+            try std.json.Stringify.value(value, .{}, writer);
+        }
+    }
     try writer.writeByte('}');
 }
 
@@ -2003,11 +2009,26 @@ test "chat completions serializes user message images as content parts" {
     try std.testing.expect(std.mem.startsWith(u8, image_part.get("image_url").?.object.get("url").?.string, "data:image/png;base64,"));
 }
 
+test "chat completions effort serializes exact values and omits default" {
+    const alloc = std.testing.allocator;
+    for ([_]types.ReasoningEffort{ .auto, .literal("none"), .literal("minimal"), .literal("max") }) |effort| {
+        var request = test_request();
+        request.provider_options.reasoning = effort;
+        const body = try build_request(alloc, request, .{});
+        defer alloc.free(body);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+        defer parsed.deinit();
+        if (effort.isDefault()) {
+            try std.testing.expect(parsed.value.object.get("reasoning_effort") == null);
+        } else {
+            try std.testing.expectEqualStrings(effort.label(), parsed.value.object.get("reasoning_effort").?.string);
+        }
+    }
+}
+
 test "chat completions rejects unsupported requests and ambiguous selection" {
     const alloc = std.testing.allocator;
     var request = test_request();
-    request.provider_options.reasoning = .auto;
-    try std.testing.expectError(error.UnsupportedProviderOption, build_request(alloc, request, .{}));
     request.provider_options = .{ .fast = true };
     try std.testing.expectError(error.UnsupportedProviderOption, build_request(alloc, request, .{}));
     request.provider_options = .{ .prompt_caching = true };

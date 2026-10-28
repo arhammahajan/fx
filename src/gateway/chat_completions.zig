@@ -54,6 +54,14 @@ fn build(raw: ?*anyopaque, alloc: Allocator, request: streams.RequestData) ![]u8
 /// The request body for `definition`, omitting replay parts recorded for
 /// another endpoint. Caller owns the result.
 pub fn build_for(definition: *const definitions.Definition, alloc: Allocator, request: streams.RequestData) ![]u8 {
+    if (request.provider_options.reasoning) |effort| {
+        if (!effort.isDefault()) {
+            const metadata = definition.model(request.model) orelse return error.UnsupportedProviderOption;
+            for (metadata.reasoning_efforts) |supported| {
+                if (supported.eql(effort)) break;
+            } else return error.UnsupportedProviderOption;
+        }
+    }
     const identity = bound_identity(definition);
     for (request.messages) |message| if (message.provider_replay) |replay| {
         if (!replay.matches(.{ .provider = identity, .model = request.model })) {
@@ -227,6 +235,8 @@ fn metadata_entry(metadata: definitions.ModelMetadata) catalog.ModelCatalogEntry
         .id = @constCast(metadata.id),
         .model_type = @constCast("language"),
         .has_tool_use = metadata.supports_tool_use orelse false,
+        .has_reasoning = metadata.supports_reasoning orelse (metadata.reasoning_efforts.len != 0),
+        .reasoning_efforts = .fromOwnedSlice(@constCast(metadata.reasoning_efforts)),
         // Chat completions sends images as inline base64 content parts, so
         // vision support implies file input through the same path.
         .has_vision = vision,
@@ -252,9 +262,47 @@ fn fetch_catalog(raw: ?*anyopaque, alloc: Allocator, input: catalog.FetchInput) 
         errdefer alloc.free(entry.id);
         entry.model_type = try alloc.dupe(u8, entry.model_type);
         errdefer alloc.free(entry.model_type);
+        entry.reasoning_efforts = .empty;
+        errdefer entry.reasoning_efforts.deinit(alloc);
+        try entry.reasoning_efforts.appendSlice(alloc, metadata.reasoning_efforts);
         try entries.append(alloc, entry);
     }
     return .{ .catalog = entries };
+}
+
+test "configured effort catalog and request agree on each model's exact levels" {
+    const alloc = std.testing.allocator;
+    var registry = try definitions.Registry.parse_json(alloc,
+        \\{"local":{"protocol":"openai-chat-completions","base_url":"http://localhost:1234/v1","auth":{"type":"none"},"model_metadata":{"sparse":{"supports_reasoning":true,"reasoning_efforts":["low","max"]},"unknown":{"supports_reasoning":true}}}}
+    );
+    defer registry.deinit(alloc);
+    const definition = registry.get("local").?;
+    const provider = bundle(definition).model_catalog.?;
+    var fetched = try provider.fetch(alloc, .{ .endpoint = "unused" });
+    defer catalog.freeModelCatalog(alloc, &fetched.catalog);
+    const capabilities = provider.lookupCapabilities("sparse").?;
+    try std.testing.expect(capabilities.supports_reasoning);
+    try std.testing.expectEqual(@as(usize, 2), capabilities.reasoning_efforts.len);
+    try std.testing.expect(model_capabilities.reasoningEffortSupported(capabilities, .literal("max")));
+    try std.testing.expect(!model_capabilities.reasoningEffortSupported(capabilities, .literal("medium")));
+    try std.testing.expectEqual(@as(usize, 2), fetched.catalog.items[0].reasoning_efforts.items.len);
+    try std.testing.expectEqual(@as(usize, 0), provider.lookupCapabilities("unknown").?.reasoning_efforts.len);
+    var request: streams.RequestData = .{
+        .model = "sparse",
+        .instructions = &.{.{ .role = .system, .content = "instructions" }},
+        .messages = &.{.{ .role = .user, .content = "hello" }},
+        .tools = .{ .additional_functions = &.{} },
+        .tool_choice = .auto,
+        .provider_options = .{ .reasoning = .literal("max") },
+    };
+    const body = try build_for(definition, alloc, request);
+    defer alloc.free(body);
+    try std.testing.expect(std.mem.find(u8, body, "\"reasoning_effort\":\"max\"") != null);
+    request.provider_options.reasoning = .literal("medium");
+    try std.testing.expectError(error.UnsupportedProviderOption, build_for(definition, alloc, request));
+    request.model = "unknown";
+    request.provider_options.reasoning = .literal("low");
+    try std.testing.expectError(error.UnsupportedProviderOption, build_for(definition, alloc, request));
 }
 
 test "configured capability lookup matches catalog projection and preserves unknowns" {

@@ -1,6 +1,7 @@
 const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const types = @import("../shared/types.zig");
 const Allocator = std.mem.Allocator;
 
 const max_providers = 32;
@@ -46,6 +47,13 @@ pub const ModelMetadata = struct {
     max_output_tokens: ?u32 = null,
     supports_tool_use: ?bool = null,
     supports_vision: ?bool = null,
+    supports_reasoning: ?bool = null,
+    reasoning_efforts: []const types.ReasoningEffort = &.{},
+
+    fn deinit(self: ModelMetadata, alloc: Allocator) void {
+        alloc.free(self.id);
+        alloc.free(self.reasoning_efforts);
+    }
 };
 
 /// Registry owns all slices. Treat definitions as immutable while borrowed by
@@ -98,7 +106,7 @@ pub const Definition = struct {
             .bearer => |env| alloc.free(env),
         }
         if (self.reviewer_model) |id| alloc.free(id);
-        for (self.model_metadata) |metadata| alloc.free(metadata.id);
+        for (self.model_metadata) |metadata| metadata.deinit(alloc);
         alloc.free(self.model_metadata);
     }
 };
@@ -234,29 +242,50 @@ fn parse_metadata(alloc: Allocator, value: std.json.Value) ParseError![]const Mo
     const models = try alloc.alloc(ModelMetadata, value.object.count());
     var initialized: usize = 0;
     errdefer {
-        for (models[0..initialized]) |metadata| alloc.free(metadata.id);
+        for (models[0..initialized]) |metadata| metadata.deinit(alloc);
         alloc.free(models);
     }
     var iterator = value.object.iterator();
     while (iterator.next()) |entry| {
         try validate_model_id(entry.key_ptr.*);
         const metadata = entry.value_ptr.*;
-        try check_fields(metadata, &.{ "context_window", "max_output_tokens", "supports_tool_use", "supports_vision" });
+        try check_fields(metadata, &.{ "context_window", "max_output_tokens", "supports_tool_use", "supports_vision", "supports_reasoning", "reasoning_efforts" });
         const context = try positive_limit(metadata.object.get("context_window"));
         const output = try positive_limit(metadata.object.get("max_output_tokens"));
         if (context != null and output != null and output.? >= context.?) return error.InvalidModelMetadata;
         const tools = try optional_bool(metadata.object.get("supports_tool_use"));
         const vision = try optional_bool(metadata.object.get("supports_vision"));
+        const reasoning = try optional_bool(metadata.object.get("supports_reasoning"));
+        const efforts = try parse_efforts(alloc, metadata.object.get("reasoning_efforts"));
+        errdefer alloc.free(efforts);
+        if (reasoning == false and efforts.len != 0) return error.InvalidModelMetadata;
         models[initialized] = .{
             .id = try alloc.dupe(u8, entry.key_ptr.*),
             .context_window = context,
             .max_output_tokens = output,
             .supports_tool_use = tools,
             .supports_vision = vision,
+            .supports_reasoning = reasoning,
+            .reasoning_efforts = efforts,
         };
         initialized += 1;
     }
     return models;
+}
+
+fn parse_efforts(alloc: Allocator, value: ?std.json.Value) ParseError![]const types.ReasoningEffort {
+    const present = value orelse return &.{};
+    if (present != .array or present.array.items.len > types.ReasoningEffort.max_options) return error.InvalidModelMetadata;
+    const efforts = try alloc.alloc(types.ReasoningEffort, present.array.items.len);
+    errdefer alloc.free(efforts);
+    for (present.array.items, 0..) |item, index| {
+        if (item != .string) return error.InvalidModelMetadata;
+        const effort = types.ReasoningEffort.parse(item.string) orelse return error.InvalidModelMetadata;
+        if (effort.isDefault()) return error.InvalidModelMetadata;
+        for (efforts[0..index]) |previous| if (previous.eql(effort)) return error.InvalidModelMetadata;
+        efforts[index] = effort;
+    }
+    return efforts;
 }
 
 fn positive_limit(value: ?std.json.Value) ParseError!?u32 {
@@ -637,4 +666,38 @@ fn test_invalid_allocations(alloc: Allocator) !void {
 
 test "configured provider validation failures release earlier definitions and models" {
     try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, test_invalid_allocations, .{});
+}
+
+test "configured provider effort metadata preserves exact sparse model levels" {
+    const alloc = std.testing.allocator;
+    var registry = try Registry.parse_json(alloc,
+        \\{"local":{"protocol":"openai-chat-completions","base_url":"http://localhost:1234/v1","auth":{"type":"none"},"model_metadata":{"sparse":{"supports_reasoning":true,"reasoning_efforts":["none","minimal","max","future-tier"]},"unknown":{"supports_reasoning":true}}}}
+    );
+    defer registry.deinit(alloc);
+    const metadata = registry.get("local").?.model("sparse").?;
+    try std.testing.expectEqual(@as(usize, 4), metadata.reasoning_efforts.len);
+    try std.testing.expectEqualStrings("none", metadata.reasoning_efforts[0].label());
+    try std.testing.expectEqualStrings("future-tier", metadata.reasoning_efforts[3].label());
+    try std.testing.expectEqual(@as(usize, 0), registry.get("local").?.model("unknown").?.reasoning_efforts.len);
+}
+
+test "configured provider effort metadata rejects malformed and ambiguous levels" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ "null", "{}", "[1]", "[\"\"]", "[\"auto\"]", "[\"default\"]", "[\"low\",\"low\"]" }) |levels| {
+        const json = try std.mem.concat(alloc, u8, &.{ "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"model\":{\"reasoning_efforts\":", levels, "}}}}" });
+        defer alloc.free(json);
+        try std.testing.expectError(error.InvalidModelMetadata, Registry.parse_json(alloc, json));
+    }
+    const contradiction = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"model\":{\"supports_reasoning\":false,\"reasoning_efforts\":[\"low\"]}}}}";
+    try std.testing.expectError(error.InvalidModelMetadata, Registry.parse_json(alloc, contradiction));
+}
+
+fn test_effort_allocations(alloc: Allocator) !void {
+    const json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"first\":{\"reasoning_efforts\":[\"none\",\"high\"]},\"second\":{\"reasoning_efforts\":[\"low\",\"max\"]}}}}";
+    var registry = try Registry.parse_json(alloc, json);
+    defer registry.deinit(alloc);
+}
+
+test "configured provider effort metadata releases all allocations on failure" {
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, test_effort_allocations, .{});
 }
