@@ -13,6 +13,7 @@ const types = @import("../core/shared/types.zig");
 const atomic_value = @import("../core/mcp/atomic_value.zig");
 const json_comparison = @import("../core/shared/json_comparison.zig");
 const sse = @import("sse.zig");
+const json_depth = @import("json_depth.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
 
 pub fn isRetryableGatewayError(err: anyerror) bool {
@@ -3667,6 +3668,12 @@ fn consumeSseStreamTraced(
         data_event_count += 1;
 
         defer _ = event_arena.reset(.retain_capacity);
+        // fx serializes parts of an event, such as a tool input or provider
+        // metadata, and std.json.Stringify aborts past 256 levels.
+        if (json_depth.exceeds(json_text)) {
+            debug_trace.logf("sse", "event type=too_deep bytes={d} max_depth={d}", .{ json_text.len, json_depth.max_depth });
+            return error.InvalidGatewaySseEvent;
+        }
         const root = std.json.parseFromSliceLeaky(std.json.Value, event_arena.allocator(), json_text, .{}) catch |err| {
             if (err == error.OutOfMemory) return err;
             traceMalformedSseEvent(json_text.len);
@@ -4135,6 +4142,32 @@ test "provider framing assembles Gateway data fields" {
         defer deinitGatewayCompletion(std.testing.allocator, &completion);
         try std.testing.expectEqualStrings("CONTROL_PREFIX\nEXPECTED_FINAL", completion.content.?);
     }
+}
+
+test "provider framing rejects a Gateway event nested past the depth limit" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const path = try std.Io.Dir.path.join(alloc, &.{ root, "deep-sse.log" });
+    defer alloc.free(path);
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, path, "sse");
+    // A tool input 300 levels deep aborted fx when it was serialized.
+    const deep_input = text_utils.repeat("{\"a\":", 300) ++ "0" ++ text_utils.repeat("}", 300);
+    var reader = std.Io.Reader.fixed("data: {\"type\":\"tool-call\",\"toolCallId\":\"deep\",\"toolName\":\"read_file\",\"input\":" ++ deep_input ++ "}\n\n" ++
+        "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"tool-calls\"}}\n\n");
+    var cancelled = std.atomic.Value(bool).init(false);
+    const Noop = struct {
+        fn chunk(_: *anyopaque, _: []const u8) void {}
+    };
+    try std.testing.expectError(error.InvalidGatewaySseEvent, consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancelled));
+    debug_trace.shutdown();
+    const trace = try readTraceFileForTest(alloc, path);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "event type=too_deep") != null);
 }
 
 test "provider framing rejects malformed Gateway JSON" {
