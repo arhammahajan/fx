@@ -847,7 +847,7 @@ test "fx mcp approve saves the approval of a project server" {
     try std.testing.expectEqualStrings("fixture", choices.choices.approved[0]);
 }
 
-test "saving MCP config refuses a symlinked target" {
+test "saving MCP config replaces the target of a symlink" {
     if (@import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -863,13 +863,14 @@ test "saving MCP config refuses a symlinked target" {
     const path = try std.Io.Dir.path.join(alloc, &.{ std.Io.Dir.path.dirname(external_path).?, ".fx", "mcp.json" });
     defer alloc.free(path);
 
-    // The durable helper refuses a target that is not a plain private file, so
-    // a symlinked config fails the save rather than writing through the link.
-    try std.testing.expectError(error.DurablePathUnsafe, saveConfigsToPath(alloc, path, &.{}));
+    try saveConfigsToPath(alloc, path, &.{});
 
-    const untouched = try readFileForTest(alloc, external_path);
-    defer alloc.free(untouched);
-    try std.testing.expectEqualStrings(external, untouched);
+    const link_stat = try tmp.dir.statFile(io_mod.getIo(), "home/.fx/mcp.json", .{ .follow_symlinks = false });
+    try std.testing.expectEqual(std.Io.File.Kind.sym_link, link_stat.kind);
+
+    const replaced = try readFileForTest(alloc, external_path);
+    defer alloc.free(replaced);
+    try std.testing.expectEqualStrings("{\"mcp\":{}}", replaced);
 }
 
 test "a profile config fx can't read fails with an error named for the file" {

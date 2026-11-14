@@ -218,6 +218,21 @@ pub fn openExistingRegularFile(
     });
 }
 
+/// Opens an existing regular file, following a final symlink to its target.
+/// Hardlinks are rejected, and the caller owns the policy that allows the
+/// link. This serves user-edited configuration kept in a dotfiles repository.
+pub fn openExistingRegularFileFollowingLink(
+    dir: std.Io.Dir,
+    sub_path: []const u8,
+    mode: std.Io.Dir.OpenFileOptions.Mode,
+) !std.Io.File {
+    return openExistingRegularFileWithPolicy(dir, sub_path, .{
+        .mode = mode,
+        .final_symlink = .follow,
+        .hardlinks = .reject,
+    });
+}
+
 /// Opens an existing read-only regular file according to `final_symlink`.
 /// Hardlinks are accepted. Following a link does not authorize its target;
 /// the caller owns that policy and the returned file.
@@ -863,9 +878,97 @@ pub fn durableReplaceVerified(
     return durableReplaceVerifiedWithOps(alloc, dir, name, bytes, .{});
 }
 
+/// Replaces `name` durably, and when `name` is a symlink, replaces the file it
+/// points at instead of the link. The link stays in place, so configuration
+/// kept in a dotfiles repository survives a save. The caller opts in: private
+/// state that must stay inside `dir` keeps using `durableReplaceVerified`.
+pub fn durableReplaceVerifiedFollowingLink(
+    alloc: std.mem.Allocator,
+    dir: *VerifiedDir,
+    name: []const u8,
+    bytes: []const u8,
+) !void {
+    return durableReplaceVerifiedFollowingLinkWithOps(alloc, dir, name, bytes, .{});
+}
+
+pub fn durableReplaceVerifiedFollowingLinkWithOps(
+    alloc: std.mem.Allocator,
+    dir: *VerifiedDir,
+    name: []const u8,
+    bytes: []const u8,
+    ops: DurableOps,
+) !void {
+    return durableReplaceVerifiedWithLinkPolicy(alloc, dir, name, bytes, ops, .follow);
+}
+
 fn preRenameFailed(ops: DurableOps, cause: anyerror) error{DurableReplacePreRenameFailed} {
     if (ops.pre_rename_cause) |slot| slot.* = cause;
     return error.DurableReplacePreRenameFailed;
+}
+
+const ReplaceLinkPolicy = enum {
+    reject,
+    follow,
+};
+
+const ReplaceTarget = struct {
+    dir: std.Io.Dir,
+    name: []const u8,
+    /// Set when the target lives in another directory opened for this replace.
+    owned_dir: ?std.Io.Dir = null,
+    /// Set when `name` was resolved from a link and copied for the caller.
+    owned_name: ?[]u8 = null,
+
+    fn deinit(self: *ReplaceTarget, alloc: std.mem.Allocator) void {
+        if (self.owned_dir) |dir| dir.close(getIo());
+        if (self.owned_name) |name| alloc.free(name);
+        self.* = undefined;
+    }
+};
+
+fn resolveReplaceTarget(
+    alloc: std.mem.Allocator,
+    dir: *VerifiedDir,
+    name: []const u8,
+    link_policy: ReplaceLinkPolicy,
+    ops: DurableOps,
+) !ReplaceTarget {
+    if (link_policy == .reject) return .{ .dir = dir.dir, .name = name };
+
+    const stat = dir.dir.statFile(getIo(), name, .{
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return .{ .dir = dir.dir, .name = name },
+        error.SymLinkLoop, error.NotDir => return error.DurablePathUnsafe,
+        else => return preRenameFailed(ops, err),
+    };
+    if (stat.kind != .sym_link) return .{ .dir = dir.dir, .name = name };
+
+    if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
+        return error.DurablePathUnsafe;
+    } else {
+        const resolved = dirRealpathAlloc(alloc, dir.dir, name) catch |err| switch (err) {
+            error.SymLinkLoop, error.NotDir => return error.DurablePathUnsafe,
+            else => return preRenameFailed(ops, err),
+        };
+        defer alloc.free(resolved);
+
+        const parent = std.Io.Dir.path.dirname(resolved) orelse return error.DurablePathUnsafe;
+        const target_name = std.Io.Dir.path.basename(resolved);
+        if (target_name.len == 0) return error.DurablePathUnsafe;
+        var target_dir = std.Io.Dir.openDirAbsolute(getIo(), parent, .{ .iterate = true }) catch |err| {
+            return preRenameFailed(ops, err);
+        };
+        errdefer target_dir.close(getIo());
+        const owned_name = try alloc.dupe(u8, target_name);
+        errdefer alloc.free(owned_name);
+        return .{
+            .dir = target_dir,
+            .name = owned_name,
+            .owned_dir = target_dir,
+            .owned_name = owned_name,
+        };
+    }
 }
 
 pub fn durableReplaceVerifiedWithOps(
@@ -875,9 +978,23 @@ pub fn durableReplaceVerifiedWithOps(
     bytes: []const u8,
     ops: DurableOps,
 ) !void {
+    return durableReplaceVerifiedWithLinkPolicy(alloc, dir, name, bytes, ops, .reject);
+}
+
+fn durableReplaceVerifiedWithLinkPolicy(
+    alloc: std.mem.Allocator,
+    dir: *VerifiedDir,
+    name: []const u8,
+    bytes: []const u8,
+    ops: DurableOps,
+    link_policy: ReplaceLinkPolicy,
+) !void {
     e2eFailIfDurableMutationAttempted();
     try validateRelativeLeaf(name);
-    validateReplaceTarget(dir.dir, name) catch |err| switch (err) {
+    var target = try resolveReplaceTarget(alloc, dir, name, link_policy, ops);
+    defer target.deinit(alloc);
+
+    validateReplaceTarget(target.dir, target.name) catch |err| switch (err) {
         error.DurablePathUnsafe, error.AccessDenied => return err,
         else => return preRenameFailed(ops, err),
     };
@@ -885,13 +1002,13 @@ pub fn durableReplaceVerifiedWithOps(
     var random_bytes: [16]u8 = undefined;
     getIo().random(&random_bytes);
     const suffix = std.fmt.bytesToHex(random_bytes, .lower);
-    const temp_name = try alloc.print(".{s}.tmp.{s}", .{ name, suffix });
+    const temp_name = try alloc.print(".{s}.tmp.{s}", .{ target.name, suffix });
     defer alloc.free(temp_name);
 
     var temp_exists = false;
-    defer if (temp_exists) cleanupVerifiedTemp(dir.dir, temp_name);
+    defer if (temp_exists) cleanupVerifiedTemp(target.dir, temp_name);
 
-    var file = dir.dir.createFile(getIo(), temp_name, .{
+    var file = target.dir.createFile(getIo(), temp_name, .{
         .read = true,
         .truncate = false,
         .exclusive = true,
@@ -908,10 +1025,10 @@ pub fn durableReplaceVerifiedWithOps(
     };
     file.writeStreamingAll(getIo(), bytes) catch |err| return preRenameFailed(ops, err);
     ops.sync_file(ops.ctx, file) catch |err| return preRenameFailed(ops, err);
-    dir.dir.rename(temp_name, dir.dir, name, getIo()) catch |err| return preRenameFailed(ops, err);
+    target.dir.rename(temp_name, target.dir, target.name, getIo()) catch |err| return preRenameFailed(ops, err);
     temp_exists = false;
 
-    const final_stat = dir.dir.statFile(getIo(), name, .{ .follow_symlinks = false }) catch {
+    const final_stat = target.dir.statFile(getIo(), target.name, .{ .follow_symlinks = false }) catch {
         return error.DurableReplacePostRenameFailed;
     };
     if (final_stat.kind != .file or final_stat.nlink != 1 or
@@ -919,7 +1036,7 @@ pub fn durableReplaceVerifiedWithOps(
     {
         return error.DurableReplacePostRenameFailed;
     }
-    ops.sync_dir(ops.ctx, dir.dir) catch return error.DurableReplacePostRenameFailed;
+    ops.sync_dir(ops.ctx, target.dir) catch return error.DurableReplacePostRenameFailed;
 }
 
 fn openOrCreatePrivateLockFile(dir: *VerifiedDir, name: []const u8) !std.Io.File {
@@ -1759,6 +1876,35 @@ test "durable replace reports pre-rename failure without changing target" {
     const bytes = try readFileToEnd(alloc, &file, 16);
     defer alloc.free(bytes);
     try std.testing.expectEqualStrings("old", bytes);
+}
+
+test "durable replace follows a final symlink and keeps it" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(getIo(), "dotfiles");
+    try tmp.dir.createDirPath(getIo(), "state");
+    try writeTempFile(tmp.dir, "dotfiles/settings.json", "old");
+    try tmp.dir.symLink(getIo(), "../dotfiles/settings.json", "state/settings.json", .{ .is_directory = false });
+
+    var dir = VerifiedDir{ .dir = try tmp.dir.openDir(getIo(), "state", .{ .iterate = true, .follow_symlinks = false }) };
+    defer dir.close();
+
+    try durableReplaceVerifiedFollowingLink(alloc, &dir, "settings.json", "new");
+
+    const link_stat = try tmp.dir.statFile(getIo(), "state/settings.json", .{ .follow_symlinks = false });
+    try std.testing.expectEqual(std.Io.File.Kind.sym_link, link_stat.kind);
+    var file = try tmp.dir.openFile(getIo(), "dotfiles/settings.json", .{});
+    defer file.close(getIo());
+    const bytes = try readFileToEnd(alloc, &file, 16);
+    defer alloc.free(bytes);
+    try std.testing.expectEqualStrings("new", bytes);
+
+    // The strict helper still refuses the link, for private state.
+    try std.testing.expectError(
+        error.DurablePathUnsafe,
+        durableReplaceVerified(alloc, &dir, "settings.json", "strict"),
+    );
 }
 
 test "durable replace can record what stopped it before the rename" {

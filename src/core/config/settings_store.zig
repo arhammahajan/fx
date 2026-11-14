@@ -650,7 +650,7 @@ pub const Store = struct {
                 io_mod.DurableOps{ .ctx = self, .sync_dir = failStoreParentSync }
             else
                 io_mod.DurableOps{};
-            io_mod.durableReplaceVerifiedWithOps(
+            io_mod.durableReplaceVerifiedFollowingLinkWithOps(
                 alloc,
                 &self.durable_home.?,
                 "settings.json",
@@ -791,7 +791,7 @@ pub const Store = struct {
         const zio = io_mod.getIo();
         const open_mode: std.Io.Dir.OpenFileOptions.Mode =
             if (self.mode == .writable) .read_write else .read_only;
-        var file = io_mod.openExistingRegularFile(
+        var file = io_mod.openExistingRegularFileFollowingLink(
             self.durable_home.?.dir,
             "settings.json",
             open_mode,
@@ -3625,7 +3625,7 @@ test "second settings commit creates a sequenced private backup" {
     try std.testing.expectEqual(@as(usize, 1), backup_count);
 }
 
-test "symlinked settings primary is rejected without touching its target" {
+test "symlinked settings primary is read and replaced through its link" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3643,15 +3643,24 @@ test "symlinked settings primary is rejected without touching its target" {
     var store = try Store.initFromHome(alloc, home, .writable);
     defer store.deinit(alloc);
 
-    try std.testing.expectError(
-        error.DurablePathUnsafe,
-        store.applyUserPatch(alloc, .{ .fast_mode = true }),
-    );
+    var loaded = try store.loadPrimary(alloc);
+    defer loaded.deinit(alloc);
+    switch (loaded) {
+        .valid => |bytes| try std.testing.expectEqualStrings("{\"outside\":true}\n", bytes),
+        else => return error.TestExpectedError,
+    }
+
+    _ = try store.applyUserPatch(alloc, .{ .fast_mode = true });
+
+    const link_stat = try tmp.dir.statFile(io_mod.getIo(), "home/.fx/settings.json", .{ .follow_symlinks = false });
+    try std.testing.expectEqual(std.Io.File.Kind.sym_link, link_stat.kind);
+
     var outside = try tmp.dir.openFile(io_mod.getIo(), "outside.json", .{});
     defer outside.close(io_mod.getIo());
     const bytes = try io_mod.readFileToEnd(alloc, &outside, 128);
     defer alloc.free(bytes);
-    try std.testing.expectEqualStrings("{\"outside\":true}\n", bytes);
+    try std.testing.expect(std.mem.find(u8, bytes, "\"fast_mode\":true") != null);
+    try std.testing.expect(std.mem.find(u8, bytes, "\"outside\":true") != null);
 }
 
 test "symlinked durable home is rejected before reading settings" {

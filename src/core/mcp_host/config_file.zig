@@ -143,11 +143,12 @@ pub fn lockProfile(profile_path: []const u8) !io_mod.TimedAdvisoryLock {
     return io_mod.acquireTimedAdvisoryLock(&dir, "mcp.lock", profile_lock_deadline_ms);
 }
 
-/// Replaces the profile file durably, readable only by its owner.
+/// Replaces the profile file durably, readable only by its owner. A symlink
+/// stays a link, with its target replaced.
 pub fn replaceProfile(alloc: Allocator, profile_path: []const u8, text: []const u8) !void {
     var dir = try profileDir(profile_path);
     defer dir.close();
-    try io_mod.durableReplaceVerified(alloc, &dir, std.Io.Dir.path.basename(profile_path), text);
+    try io_mod.durableReplaceVerifiedFollowingLink(alloc, &dir, std.Io.Dir.path.basename(profile_path), text);
 }
 
 fn profileDir(profile_path: []const u8) !io_mod.VerifiedDir {
@@ -166,8 +167,9 @@ fn write(alloc: Allocator, file: File, path: []const u8, text: []const u8) !void
         .profile => try replaceProfile(alloc, path, text),
         .project => {
             // A link isn't replaced, which forks the file it points to, nor
-            // followed, which could write outside the project.
-            // The profile's own replace refuses one too.
+            // followed, which could write outside the project. The profile's
+            // own replace follows a link, because it belongs to the user's
+            // dotfiles rather than to a repository.
             if (std.Io.Dir.cwd().statFile(io_mod.getIo(), path, .{ .follow_symlinks = false })) |stat| {
                 if (stat.kind == .sym_link or stat.nlink > 1) return error.Linked;
             } else |err| if (err != error.FileNotFound) return err;
